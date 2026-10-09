@@ -298,6 +298,27 @@ pub enum Mode {
     ConfirmDelete(String),
     /// Suppression d'une session background : (id, nom).
     ConfirmRemoveSession(String, String),
+    /// Action à confirmer (terminer, arrêter, supprimer une entrée d'historique).
+    ConfirmAction(PendingAction),
+}
+
+/// Action potentiellement destructive, exécutée seulement après un `y`.
+pub enum PendingAction {
+    DeleteHistory(String),
+    CancelRun,
+    FinishTerm,
+    StopSession(String, String),
+}
+
+impl PendingAction {
+    pub fn question(&self) -> String {
+        match self {
+            Self::DeleteHistory(_) => tr("Supprimer ce run de l'historique ?", "Remove this run from history?").into(),
+            Self::CancelRun => tr("Annuler le run en cours ?", "Cancel the current run?").into(),
+            Self::FinishTerm => tr("Terminer la session en cours ?", "End the current session?").into(),
+            Self::StopSession(_, name) => tf!("Arrêter la session « {name} » ?", "Stop the session \"{name}\"?"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -960,6 +981,11 @@ impl App {
                 }
             }
             Mode::EditSeat(form) => self.key_seat_form(form, k),
+            Mode::ConfirmAction(a) => {
+                if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('o')) {
+                    self.run_action(a);
+                }
+            }
             Mode::ConfirmDeleteSeat(path, id, title) => {
                 if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('o')) {
                     match self.delete_seat(&path, &id) {
@@ -1068,11 +1094,7 @@ impl App {
                         KeyCode::Enter => self.open_history(),
                         KeyCode::Char('D') => {
                             if let Some(h) = self.history.get(self.hist_sel) {
-                                match store::delete(&self.root, &h.id) {
-                                    Ok(()) => self.status = tr("run supprimé de l'historique", "run removed from history").into(),
-                                    Err(e) => self.status = format!("erreur : {e:#}"),
-                                }
-                                self.reload();
+                                self.mode = Mode::ConfirmAction(PendingAction::DeleteHistory(h.id.clone()));
                             }
                         }
                         _ => {}
@@ -1082,14 +1104,13 @@ impl App {
                         r.sel = step(r.sel, r.nodes.len(), down);
                     }
                     if k.code == KeyCode::Char('s') && r.finished.is_none() {
-                        let _ = r.cancel.send(true);
-                        self.status = tr("annulation demandée…", "cancellation requested…").into();
+                        self.mode = Mode::ConfirmAction(PendingAction::CancelRun);
                     }
                 }
             }
             Tab::Terminal => match k.code {
                 KeyCode::Enter | KeyCode::Char('i') if self.term.is_some() => self.term_focus = true,
-                KeyCode::Char('x') => self.finish_term(),
+                KeyCode::Char('x') if self.term.is_some() => self.mode = Mode::ConfirmAction(PendingAction::FinishTerm),
                 _ => {}
             },
             Tab::Sessions => {
@@ -1107,8 +1128,7 @@ impl App {
                 match k.code {
                     KeyCode::Char('r') => self.refresh_sessions(),
                     KeyCode::Char('s') => {
-                        self.status = format!("arrêt de « {name} »…");
-                        self.session_action(id, tr("arrêtée", "stopped"), false);
+                        self.mode = Mode::ConfirmAction(PendingAction::StopSession(id, name));
                     }
                     KeyCode::Char('x') => self.mode = Mode::ConfirmRemoveSession(id, name),
                     KeyCode::Char('a') | KeyCode::Enter => self.attach_request = Some(id),
@@ -1317,6 +1337,29 @@ impl App {
         let rows = self.companies.get(self.comp_sel).and_then(|e| e.parsed.as_ref().ok()).map(|c| c.tree_rows().len()).unwrap_or(0);
         self.seat_sel = self.seat_sel.min(rows.saturating_sub(1));
         Ok(())
+    }
+
+    fn run_action(&mut self, a: PendingAction) {
+        match a {
+            PendingAction::DeleteHistory(id) => {
+                match store::delete(&self.root, &id) {
+                    Ok(()) => self.status = tr("run supprimé de l'historique", "run removed from history").into(),
+                    Err(e) => self.status = format!("erreur : {e:#}"),
+                }
+                self.reload();
+            }
+            PendingAction::CancelRun => {
+                if let Some(r) = &self.run {
+                    let _ = r.cancel.send(true);
+                    self.status = tr("annulation demandée…", "cancellation requested…").into();
+                }
+            }
+            PendingAction::FinishTerm => self.finish_term(),
+            PendingAction::StopSession(id, name) => {
+                self.status = format!("arrêt de « {name} »…");
+                self.session_action(id, tr("arrêtée", "stopped"), false);
+            }
+        }
     }
 
     fn key_confirm(&mut self, name: String, k: KeyEvent) {

@@ -358,6 +358,9 @@ fn run_interrompu_et_suppression_d_historique() {
     assert!(screen(&app).contains("terminé avec erreurs"), "un run interrompu s'affiche comme en erreur");
     press(&mut app, KeyCode::Char('h'));
     press(&mut app, KeyCode::Char('D'));
+    assert!(matches!(app.mode, Mode::ConfirmAction(_)));
+    assert!(!app.history.is_empty(), "rien n'est supprimé avant confirmation");
+    press(&mut app, KeyCode::Char('y'));
     assert!(app.history.is_empty());
     assert!(screen(&app).contains("Aucun run enregistré"));
 }
@@ -597,6 +600,11 @@ fn x_ferme_la_session_et_ramene_a_l_onglet_d_origine() {
     let (mut app, _rx) = term_app("sleep 30");
     app.term_focus = false;
     press(&mut app, KeyCode::Char('x'));
+    assert!(app.term.is_some(), "x demande d'abord confirmation");
+    press(&mut app, KeyCode::Char('n'));
+    assert!(app.term.is_some());
+    press(&mut app, KeyCode::Char('x'));
+    press(&mut app, KeyCode::Char('y'));
     assert!(app.term.is_none());
     assert_eq!(app.tab, Tab::Agents);
 }

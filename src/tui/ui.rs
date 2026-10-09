@@ -129,6 +129,15 @@ pub fn draw(f: &mut Frame, app: &App) {
                 area,
             );
         }
+        Mode::ConfirmAction(a) => {
+            let area = centered(f.area(), 60, 5);
+            f.render_widget(Clear, area);
+            f.render_widget(
+                Paragraph::new(format!("{}\n\n{}", a.question(), tr(" y = oui   autre touche = non", " y = yes   any other key = no")))
+                    .block(Block::bordered().title(tr(" Confirmation ", " Confirmation ")).border_style(Style::new().fg(Color::Red))),
+                area,
+            );
+        }
         Mode::Normal => {}
     }
 
@@ -163,7 +172,7 @@ fn help_text(app: &App) -> &'static str {
     match (&app.mode, app.tab) {
         (Mode::EditAgent(_), _) => "Tab champ suivant · ←→ choisir le modèle · Ctrl+S enregistrer · Esc annuler",
         (Mode::EditSeat(_), _) => "Tab champ suivant · ←→ choisir · Ctrl+S enregistrer · Esc annuler",
-        (Mode::ConfirmDelete(_) | Mode::ConfirmDeleteSeat(..) | Mode::ConfirmRemoveSession(..), _) => "y confirmer · autre touche annuler",
+        (Mode::ConfirmDelete(_) | Mode::ConfirmDeleteSeat(..) | Mode::ConfirmRemoveSession(..) | Mode::ConfirmAction(_), _) => "y confirmer · autre touche annuler",
         (_, Tab::Agents) => "↑↓ choisir · n créer avec l'assistant · N formulaire · e éditer · D supprimer · q quitter",
         (_, Tab::Company) => "↑↓ poste · a ajouter · e éditer · x retirer · n créer une entreprise · m cadrer une mission · t/T mission · Entrée ouvrir · r lancer · c/C entreprise · E éditer · q quitter",
         (_, Tab::Run) if app.show_history => "↑↓ choisir · Entrée ouvrir · D supprimer · h retour · Tab onglet · q quitter",
@@ -182,7 +191,7 @@ fn help_text_en(app: &App) -> &'static str {
     match (&app.mode, app.tab) {
         (Mode::EditAgent(_), _) => "Tab next field · ←→ pick model · Ctrl+S save · Esc cancel",
         (Mode::EditSeat(_), _) => "Tab next field · ←→ pick · Ctrl+S save · Esc cancel",
-        (Mode::ConfirmDelete(_) | Mode::ConfirmDeleteSeat(..) | Mode::ConfirmRemoveSession(..), _) => "y confirm · any other key cancels",
+        (Mode::ConfirmDelete(_) | Mode::ConfirmDeleteSeat(..) | Mode::ConfirmRemoveSession(..) | Mode::ConfirmAction(_), _) => "y confirm · any other key cancels",
         (_, Tab::Agents) => "↑↓ pick · n create with assistant · N form · e edit · D delete · q quit",
         (_, Tab::Company) => "↑↓ seat · a add · e edit · x remove · n new company · m frame a mission · t/T mission · Enter open · r run · c/C company · E edit · q quit",
         (_, Tab::Run) if app.show_history => "↑↓ pick · Enter open · D delete · h back · Tab tab · q quit",
