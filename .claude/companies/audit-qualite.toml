@@ -1,0 +1,47 @@
+name = "audit-qualite"
+max_calls = 30
+max_parallel = 2
+checkpoint = true
+
+[[seat]]
+id = "ceo"
+title = "CEO"
+agent = "audit-director"
+
+[[seat]]
+id = "cto"
+title = "CTO"
+agent = "quality-vp"
+reports_to = "ceo"
+expertise = "architecture, qualité du code, tests, dette technique"
+
+[[seat]]
+id = "cpo"
+title = "Head of Product & Documentation"
+agent = "product-vp"
+reports_to = "ceo"
+expertise = "cohérence fonctionnelle, expérience d'usage de la CLI, documentation"
+
+[[seat]]
+id = "reviewer"
+title = "Senior Code Reviewer"
+agent = "code-auditor"
+reports_to = "cto"
+expertise = "revue de code, bugs, dette technique, sécurité de base"
+
+[[seat]]
+id = "dev-fix"
+title = "Software Engineer"
+agent = "developer"
+reports_to = "cto"
+expertise = "corrections ciblées, refactorings, tests"
+builds = true
+allow_bash = ["cargo test", "cargo clippy"]
+
+[[seat]]
+id = "tech-writer"
+title = "Technical Writer"
+agent = "doc-writer"
+reports_to = "cpo"
+expertise = "README, documentation, docstrings"
+builds = true

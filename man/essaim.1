@@ -1,0 +1,138 @@
+.TH ESSAIM 1 "2026-10-09" "essaim" "Manuel d'utilisation"
+.SH NOM
+essaim \- concevoir et exécuter des équipes d'agents Claude Code, organisées en entreprise
+.SH SYNOPSIS
+.B essaim
+.br
+.B essaim init
+[\fB\-\-root\fR \fIdossier\fR]
+.br
+.B essaim agents
+[\fB\-\-root\fR \fIdossier\fR]
+.br
+.B essaim company show
+.I entreprise.toml
+.br
+.B essaim company check
+.I entreprise.toml
+[\fB\-\-root\fR \fIdossier\fR]
+.br
+.B essaim company run
+.I entreprise.toml
+(\fB\-\-brief\fR \fItexte\fR | \fB\-\-mission\fR \fIid\fR)
+[\fB\-\-yes\fR] [\fB\-\-root\fR \fIdossier\fR]
+.SH DESCRIPTION
+Un agent est un fichier
+.IR .claude/agents/<nom>.md .
+On les assemble en entreprise : un organigramme (boss, VP, managers, workers) qui exécute des missions.
+Une mission se déroule en trois temps : conception en cascade (chaque niveau découpe et délègue à ses subordonnés directs,
+puis les rapports remontent), plan consolidé à valider, réalisation (les postes marqués ⚒ modifient le projet, chacun dans son périmètre).
+.PP
+Tout passe par le CLI
+.BR claude (1)
+et ton abonnement : les clés API sont ignorées (retirées de chaque processus lancé) et les coûts affichés sont notionnels.
+.PP
+Sans argument, essaim ouvre l'interface en onglets dans le dossier courant, qui sert de racine du projet.
+Au premier lancement, il demande la langue (français ou English), puis la mémorise.
+.SH COMMANDES
+.TP
+.B init
+Crée des agents et une entreprise d'exemple, sans rien écraser.
+.TP
+.B agents
+Liste les agents (projet, puis \fI~/.claude/agents\fR).
+.TP
+.B company show
+Affiche l'organigramme (niveaux N, N\-1\&...) et l'estimation d'appels.
+.TP
+.B company check
+Valide l'organigramme.
+.TP
+.B company run
+Exécute une mission. \fB\-\-yes\fR valide le plan sans demander.
+.SH INTERFACE
+.SS Navigation
+.TP
+.BR Tab ", " Maj+Tab
+Onglet suivant, précédent.
+.TP
+.BR 1 " à " 5 ", " F1 " à " F5
+Va à l'onglet numéroté (les touches F fonctionnent aussi dans la session Claude).
+.TP
+.BR Alt+1 " à " Alt+5
+Idem (AZERTY : Alt+& é " ' ().
+.TP
+.B Ctrl+PgUp, Ctrl+PgDn
+Onglet précédent, suivant.
+.TP
+.B Ctrl+K
+Aide de l'onglet courant ; \fBm\fR bascule vers le manuel complet.
+.TP
+.B F10
+Réglages (langue).
+.TP
+.BR q ", " Ctrl+C
+Quitte et annule le run en cours.
+.SS Onglets
+.TP
+.B 1 Agents
+\fBn\fR crée avec l'assistant, \fBN\fR avec un formulaire, \fBe\fR édite, \fBD\fR supprime.
+.TP
+.B 2 Entreprise
+\fBn\fR crée une entreprise avec l'assistant ; \fBa\fR, \fBe\fR, \fBx\fR ajoutent, éditent, retirent un poste ;
+\fBm\fR cadre une mission avec le boss ; \fBt\fR/\fBT\fR choisissent la mission ; \fBEntrée\fR ouvre la mission choisie
+(brief, plan, rapport) ; \fBr\fR la lance ; \fBc\fR/\fBC\fR changent d'entreprise ; \fBE\fR édite le TOML.
+.TP
+.B 3 Run
+\fB\(ua \(da\fR choisissent un nœud ; \fBs\fR annule ; \fBh\fR ouvre l'historique.
+Au plan consolidé : \fBEntrée\fR lance la réalisation, \fBÉchap\fR arrête.
+.TP
+.B 4 Sessions
+Sessions background de Claude Code : \fBa\fR attache, \fBs\fR arrête, \fBx\fR supprime, \fBr\fR rafraîchit.
+.TP
+.B 5 Claude
+Un vrai Claude Code dans un terminal intégré. \fBCtrl+\e\fR rend les touches de navigation à essaim.
+.SH FICHIERS
+.TP
+.I .claude/agents/
+Un fichier .md par agent (format standard de Claude Code).
+.TP
+.I .claude/companies/
+Entreprises (TOML : postes, hiérarchie, périmètres).
+.TP
+.I .essaim/missions/
+Brief, conception.md et rapport.md de chaque mission.
+.TP
+.I .essaim/runs/
+Historique des runs.
+.TP
+.I ~/.config/essaim/settings.toml
+Réglages mémorisés (langue). Emplacement propre à la plateforme.
+.SH ENVIRONNEMENT
+.TP
+.BR VISUAL ", " EDITOR
+Éditeur ouvert par la touche \fBe\fR (vi par défaut).
+.TP
+.B ESSAIM_CONFIG_DIR
+Dossier de settings.toml, à la place de celui de la plateforme.
+.TP
+.B ESSAIM_CLAUDE_BIN
+Remplace la commande \fBclaude\fR (tests).
+.TP
+.B ANTHROPIC_API_KEY
+Ignorée : retirée de chaque processus lancé.
+.SH CODE DE SORTIE
+.TP
+.B 0
+Succès.
+.TP
+.B 1
+Un poste a échoué, ou la validation a échoué.
+.SH EXEMPLES
+.nf
+essaim init && essaim
+essaim company run .claude/companies/acme\-studio.toml \e
+      \-\-brief "Ajouter une page d'accueil"
+.fi
+.SH VOIR AUSSI
+.BR claude (1)

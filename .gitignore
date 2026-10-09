@@ -1,0 +1,7 @@
+/target
+.essaim-sandbox/
+# Données locales d'essaim (missions, runs, transcriptions) : jamais versionnées.
+.essaim/
+.essaim/
+.DS_Store
+*.swp

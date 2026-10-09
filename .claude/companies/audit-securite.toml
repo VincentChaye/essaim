@@ -1,0 +1,39 @@
+name = "audit-securite"
+max_calls = 20
+max_parallel = 2
+checkpoint = true
+
+[[seat]]
+id = "ciso"
+title = "CISO"
+agent = "security-chief"
+
+[[seat]]
+id = "appsec"
+title = "Head of Application Security"
+agent = "appsec-lead"
+reports_to = "ciso"
+expertise = "sécurité applicative, modèle de menace, priorisation des vulnérabilités, correctifs"
+
+[[seat]]
+id = "sec-code"
+title = "Security Analyst (Code)"
+agent = "security-auditor"
+reports_to = "appsec"
+expertise = "revue de code orientée sécurité, injections, unsafe, gestion des secrets, validation des entrées"
+
+[[seat]]
+id = "sec-supply"
+title = "Security Analyst (Supply Chain)"
+agent = "security-auditor"
+reports_to = "appsec"
+expertise = "dépendances, CI/CD (.github), scripts d'installation, configuration, permissions"
+
+[[seat]]
+id = "sec-fix"
+title = "Security Engineer"
+agent = "developer"
+reports_to = "appsec"
+expertise = "correctifs de sécurité ciblés, tests de non-régression"
+builds = true
+allow_bash = ["cargo test", "cargo clippy", "cargo audit"]
