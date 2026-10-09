@@ -23,6 +23,9 @@ pub struct Seat {
     pub id: String,
     pub title: String,
     pub agent: String,
+    /// Modèle imposé à ce poste (surcharge celui de l'agent) ; absent = modèle de l'agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Absent = racine (le boss).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reports_to: Option<String>,

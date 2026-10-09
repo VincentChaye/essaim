@@ -296,7 +296,7 @@ fn draw_seat_form(f: &mut Frame, form: &super::app::SeatForm) {
         let focused = form.focus == i;
         match field {
             Field::Text(b) => b.render(f, rows[i], &form.labels[i], focused),
-            Field::Choice { options, idx } => f.render_widget(choice_widget(options, *idx, focused, &form.labels[i], tr("(aucun : boss)", "(none: boss)")), rows[i]),
+            Field::Choice { options, idx } => f.render_widget(choice_widget(options, *idx, focused, &form.labels[i], if i == 3 { tr("(modèle de l'agent)", "(agent's model)") } else { tr("(aucun : boss)", "(none: boss)") }), rows[i]),
         }
     }
 }

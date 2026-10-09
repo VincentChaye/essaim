@@ -1275,7 +1275,7 @@ fn le_superieur_ne_peut_pas_etre_un_descendant() {
     press(&mut app, KeyCode::Down); // cto
     press(&mut app, KeyCode::Char('e'));
     let Mode::EditSeat(form) = &app.mode else { panic!() };
-    let Field::Choice { options, .. } = &form.fields[3] else { panic!() };
+    let Field::Choice { options, .. } = &form.fields[4] else { panic!() };
     assert_eq!(options, &vec!["ceo".to_string()]);
 }
 

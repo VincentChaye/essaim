@@ -306,7 +306,10 @@ impl Shared {
 
     fn spec(&self, i: usize, phase: Phase, kind: Kind, prompt: String, schema: Option<String>, kids: &[usize], sc: &[String]) -> RunSpec {
         let seat = &self.company.seats[i];
-        let agent = self.agents.iter().find(|a| a.name == seat.agent).expect("agent validé");
+        let mut agent = self.agents.iter().find(|a| a.name == seat.agent).expect("agent validé").clone();
+        if seat.model.is_some() {
+            agent.model = seat.model.clone();
+        }
         let mut agents = BTreeMap::new();
         agents.insert(agent.name.clone(), agent.to_cli_json());
         // Délégation et rapport : raisonnement pur. Conception : lecture seule.

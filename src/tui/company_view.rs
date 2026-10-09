@@ -150,7 +150,7 @@ fn seat_lines(company: &Company, i: usize, app: &App) -> Vec<Line<'static>> {
     let mut v = vec![
         kv(tr("Poste", "Seat"), &format!("{} ({})", s.title, company.level(i))),
         kv("Id", &s.id),
-        kv("Agent", &format!("{}{}", s.agent, agent.and_then(|a| a.model.as_deref()).map(|m| format!(" [{m}]")).unwrap_or_default())),
+        kv("Agent", &format!("{}{}", s.agent, s.model.as_deref().or(agent.and_then(|a| a.model.as_deref())).map(|m| format!(" [{m}]")).unwrap_or_default())),
     ];
     if agent.is_none() {
         v.push(Line::styled(tr("  ⚠ agent introuvable", "  ⚠ agent not found"), Style::new().fg(Color::Red)));
