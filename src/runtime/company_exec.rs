@@ -79,7 +79,7 @@ pub struct PhaseOutcome {
     pub ok: bool,
     /// Rapport du boss (plan consolidé en conception).
     pub report: String,
-    pub cost_usd: f64,
+    pub tokens: u64,
     pub calls: u32,
 }
 
@@ -93,7 +93,7 @@ pub struct MissionOutcome {
     pub realisation: Option<PhaseOutcome>,
     /// `Some(false)` : la réalisation a été refusée au point de contrôle.
     pub approved: Option<bool>,
-    pub cost_usd: f64,
+    pub tokens: u64,
     pub calls: u32,
 }
 
@@ -116,7 +116,7 @@ struct Shared {
     sem: Semaphore,
     /// Compteur d'appels partagé par toute la mission (plafond `max_calls`).
     calls: Arc<AtomicU32>,
-    cost: Mutex<f64>,
+    cost: Mutex<u64>,
 }
 
 struct SeatOut {
@@ -386,17 +386,17 @@ impl Shared {
         let res = (self.runner)(job, ctx, self.cancel.clone()).await;
         let _ = fwd.await;
 
-        let (status, cost) = match &res {
-            Ok(r) if !r.is_error => (NodeStatus::Succeeded, r.cost_usd),
-            Ok(r) => (NodeStatus::Failed(r.output.clone()), r.cost_usd),
+        let (status, used) = match &res {
+            Ok(r) if !r.is_error => (NodeStatus::Succeeded, r.tokens),
+            Ok(r) => (NodeStatus::Failed(r.output.clone()), r.tokens),
             Err(e) if self.cancelled() => {
                 let _ = e;
-                (NodeStatus::Cancelled, 0.0)
+                (NodeStatus::Cancelled, 0)
             }
-            Err(e) => (NodeStatus::Failed(e.to_string()), 0.0),
+            Err(e) => (NodeStatus::Failed(e.to_string()), 0),
         };
-        *self.cost.lock().unwrap() += cost;
-        let _ = self.tx.send(RunEvent::NodeFinished { id, status, cost_usd: cost });
+        *self.cost.lock().unwrap() += used;
+        let _ = self.tx.send(RunEvent::NodeFinished { id, status, tokens: used });
         res
     }
 
@@ -508,13 +508,13 @@ pub async fn run_phase(
         cancel,
         sem: Semaphore::new(company.max_parallel.max(1)),
         calls,
-        cost: Mutex::new(0.0),
+        cost: Mutex::new(0),
     });
     let root_scope = if phase == Phase::Realisation { vec!["**".to_string()] } else { vec![] };
     let out = run_seat(sh.clone(), root, phase, root_task.to_string(), root_scope).await;
     let cost = *sh.cost.lock().unwrap();
     let used = sh.calls.load(Ordering::SeqCst).min(company.max_calls).saturating_sub(before);
-    Ok(PhaseOutcome { ok: out.ok, report: out.text, cost_usd: cost, calls: used })
+    Ok(PhaseOutcome { ok: out.ok, report: out.text, tokens: cost, calls: used })
 }
 
 const CONCEPTION_TASK: &str = "Lead the design phase of the mission described in the brief: have each domain framed by the right lead.";
@@ -553,7 +553,7 @@ pub async fn run_mission(
 
     let resumed_plan = if opts.resume { opts.mission_dir.as_deref().and_then(missions::resumable_plan) } else { None };
     let conception = if let Some(plan) = resumed_plan {
-        PhaseOutcome { ok: true, report: plan, cost_usd: 0.0, calls: 0 }
+        PhaseOutcome { ok: true, report: plan, tokens: 0, calls: 0 }
     } else {
         if let Some(d) = &opts.mission_dir {
             missions::clear_conception_mark(d); // un run neuf invalide l'ancien plan
@@ -561,7 +561,7 @@ pub async fn run_mission(
         let c = match run_phase(company, agents, brief, Phase::Conception, CONCEPTION_TASK, opts, runner.clone(), tx.clone(), cancel.clone(), calls.clone()).await {
             Ok(c) => c,
             Err(e) => {
-                let _ = tx.send(RunEvent::RunFinished { ok: false, cost_usd: 0.0 });
+                let _ = tx.send(RunEvent::RunFinished { ok: false, tokens: 0 });
                 return Err(e);
             }
         };
@@ -577,7 +577,7 @@ pub async fn run_mission(
     let mut outcome = MissionOutcome {
         ok: conception.ok,
         report: conception.report.clone(),
-        cost_usd: conception.cost_usd,
+        tokens: conception.tokens,
         calls: conception.calls,
         conception: conception.clone(),
         realisation: None,
@@ -613,13 +613,13 @@ pub async fn run_mission(
                     save("rapport.md", &r.report);
                     outcome.ok = conception.ok && r.ok;
                     outcome.report = r.report.clone();
-                    outcome.cost_usd += r.cost_usd;
+                    outcome.tokens += r.tokens;
                     outcome.calls += r.calls;
                     outcome.realisation = Some(r);
                 }
                 Err(e) => {
                     outcome.ok = false;
-                    let _ = tx.send(RunEvent::RunFinished { ok: false, cost_usd: outcome.cost_usd });
+                    let _ = tx.send(RunEvent::RunFinished { ok: false, tokens: outcome.tokens });
                     return Err(e);
                 }
             }
@@ -628,7 +628,7 @@ pub async fn run_mission(
             outcome.ok = conception.ok;
         }
     }
-    let _ = tx.send(RunEvent::RunFinished { ok: outcome.ok, cost_usd: outcome.cost_usd });
+    let _ = tx.send(RunEvent::RunFinished { ok: outcome.ok, tokens: outcome.tokens });
     Ok(outcome)
 }
 
@@ -777,10 +777,10 @@ reports_to = "ciso"
                                 a
                             })
                             .collect();
-                        NodeResult { structured: Some(json!({"assignments": items})), output: "{}".into(), cost_usd: 0.01, ..Default::default() }
+                        NodeResult { structured: Some(json!({"assignments": items})), output: "{}".into(), tokens: 0, ..Default::default() }
                     }
-                    "work" => NodeResult { output: format!("travail({seat})"), cost_usd: 0.01, ..Default::default() },
-                    _ => NodeResult { output: format!("rapport({seat})"), cost_usd: 0.01, ..Default::default() },
+                    "work" => NodeResult { output: format!("travail({seat})"), tokens: 0, ..Default::default() },
+                    _ => NodeResult { output: format!("rapport({seat})"), tokens: 0, ..Default::default() },
                 })
             })
         })
@@ -861,7 +861,7 @@ reports_to = "ciso"
         // 4 postes internes × 2 appels + 3 feuilles = 11 (= estimation de conception).
         assert_eq!(p.started.lock().unwrap().len(), 11);
         assert_eq!(out.calls, 11);
-        assert!((out.cost_usd - 0.11).abs() < 1e-9, "{}", out.cost_usd);
+        assert_eq!(out.tokens, 0);
         assert!(out.realisation.is_none() && out.approved.is_none(), "pas de poste de réalisation");
         assert!(!evs.iter().any(|e| matches!(e, RunEvent::Checkpoint { .. })));
         assert!(matches!(evs.last(), Some(RunEvent::RunFinished { ok: true, .. })));

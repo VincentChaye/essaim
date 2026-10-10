@@ -1,0 +1,6 @@
+{"type":"system","subtype":"init","session_id":"sess-perf-0001","model":"claude-haiku-5-5","apiKeySource":"none"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Je lis le périmètre demandé avant de modifier quoi que ce soit."}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"src/runtime/scope.rs"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","is_error":false,"content":"fn normalize(p: &str) -> String {}"}]}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}
+{"type":"result","subtype":"success","is_error":false,"result":"pong","duration_ms":1234,"usage":{"input_tokens":120,"output_tokens":8,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}

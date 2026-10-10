@@ -1,4 +1,4 @@
-.TH ESSAIM 1 "2026-10-09" "essaim" "Manuel d'utilisation"
+.TH ESSAIM 1 "2026-10-10" "essaim" "Manuel d'utilisation"
 .SH NOM
 essaim \- concevoir et exécuter des équipes d'agents Claude Code, organisées en entreprise
 .SH SYNOPSIS
@@ -19,7 +19,7 @@ essaim \- concevoir et exécuter des équipes d'agents Claude Code, organisées 
 .br
 .B essaim company run
 .I entreprise.toml
-(\fB\-\-brief\fR \fItexte\fR | \fB\-\-mission\fR \fIid\fR)
+(\fB\-\-brief\fR \fItexte\fR | \fB\-\-brief\fR \fB@\fR\fIfichier\fR | \fB\-\-mission\fR \fIid\fR [\fB\-\-resume\fR])
 [\fB\-\-yes\fR] [\fB\-\-root\fR \fIdossier\fR]
 .SH DESCRIPTION
 Un agent est un fichier
@@ -49,7 +49,12 @@ Affiche l'organigramme (niveaux N, N\-1\&...) et l'estimation d'appels.
 Valide l'organigramme.
 .TP
 .B company run
-Exécute une mission. \fB\-\-yes\fR valide le plan sans demander.
+Exécute une mission. \fB\-\-brief\fR \fI@fichier\fR lit le brief dans un fichier ; \fB\-\-mission\fR \fIid\fR \fB\-\-resume\fR
+reprend une mission interrompue (une conception menée à terme n'est pas rejouée). \fB\-\-yes\fR valide sans demander.
+Sans \fB\-\-yes\fR, un plan consolidé demande \fB[o/N/e]\fR : \fBo\fR lance la réalisation, \fBe\fR modifie le plan avec le boss,
+toute autre réponse arrête.
+Si le point de contrôle est désactivé (\fBcheckpoint = false\fR dans le TOML), il n'y a ni invite ni pause : la réalisation démarre après la conception.
+Avertissement d'exécution dans ce cas : \fB[À CONFIRMER]\fR (texte et canal à fixer).
 .SH INTERFACE
 .SS Navigation
 .TP
@@ -60,7 +65,7 @@ Onglet suivant, précédent.
 Va à l'onglet numéroté (les touches F fonctionnent aussi dans la session Claude).
 .TP
 .BR Alt+1 " à " Alt+5
-Idem (AZERTY : Alt+& é " ' ().
+Idem (AZERTY : Alt+& é " ' ( ).
 .TP
 .B Ctrl+PgUp, Ctrl+PgDn
 Onglet précédent, suivant.
@@ -72,26 +77,33 @@ Aide de l'onglet courant ; \fBm\fR bascule vers le manuel complet.
 Réglages (langue).
 .TP
 .BR q ", " Ctrl+C
-Quitte et annule le run en cours.
+Quitte. Si un run est en cours, demande confirmation (\fBo\fR ou \fBy\fR) : le run est alors annulé.
 .SS Onglets
+Cinq onglets : 1 Agents, 2 Entreprise, 3 Run, 4 Sessions, 5 Claude.
 .TP
 .B 1 Agents
-\fBn\fR crée avec l'assistant, \fBN\fR avec un formulaire, \fBe\fR édite, \fBD\fR supprime.
+\fBn\fR crée avec l'assistant, \fBN\fR avec un formulaire, \fBD\fR supprime (confirmation).
+\fBe\fR ou \fBEntrée\fR ouvre le choix : \fB1\fR édition simple (formulaire ou \fB$EDITOR\fR), \fB2\fR avec le modèle.
 .TP
 .B 2 Entreprise
-\fBn\fR crée une entreprise avec l'assistant ; \fBa\fR, \fBe\fR, \fBx\fR ajoutent, éditent, retirent un poste ;
-\fBm\fR cadre une mission avec le boss ; \fBt\fR/\fBT\fR choisissent la mission ; \fBEntrée\fR ouvre la mission choisie
-(brief, plan, rapport) ; \fBr\fR la lance ; \fBc\fR/\fBC\fR changent d'entreprise ; \fBE\fR édite le TOML.
+Trois zones : Entreprises, Missions, organigramme. \fB\(<- \(->\fR passent de l'une à l'autre, \fB\(da\fR entre dans l'organigramme,
+\fBEntrée\fR entre dans la zone, \fBÉchap\fR en sort.
+Dans l'organigramme : \fBa\fR ajoute un poste, \fBe\fR l'édite, \fBx\fR le retire (confirmation).
+Dans la zone Missions : \fBEntrée\fR ou \fBo\fR ouvre la mission choisie (brief, plan, rapport) ; \fBEspace\fR déplie son résumé.
+Hors zone : \fBn\fR crée une entreprise avec l'assistant ; \fBm\fR cadre une mission avec le boss ;
+\fBr\fR la lance (reprend à la réalisation si la conception est menée à terme) ; \fBR\fR la relance depuis le début ;
+\fBt\fR/\fBT\fR choisissent la mission ; \fBc\fR/\fBC\fR changent d'entreprise.
 .TP
 .B 3 Run
-\fB\(ua \(da\fR choisissent un nœud ; \fBs\fR annule ; \fBh\fR ouvre l'historique.
-Au plan consolidé : \fBEntrée\fR lance la réalisation, \fBÉchap\fR arrête.
+\fB\(ua \(da\fR choisissent un nœud ; \fBs\fR annule le run en cours ; \fBh\fR ouvre l'historique (\fBEntrée\fR rouvre, \fBD\fR supprime).
+Au plan consolidé : \fBEntrée\fR lance la réalisation, \fBÉchap\fR arrête, \fBe\fR ouvre une conversation avec le boss pour modifier le plan.
 .TP
 .B 4 Sessions
-Sessions background de Claude Code : \fBa\fR attache, \fBs\fR arrête, \fBx\fR supprime, \fBr\fR rafraîchit.
+Sessions background de Claude Code : \fBa\fR ou \fBEntrée\fR attache, \fBs\fR arrête, \fBx\fR supprime (confirmation), \fBr\fR rafraîchit.
 .TP
 .B 5 Claude
 Un vrai Claude Code dans un terminal intégré. \fBCtrl+\e\fR rend les touches de navigation à essaim.
+\fBEntrée\fR ou \fBi\fR reprend la session, \fBx\fR la termine (confirmation).
 .SH FICHIERS
 .TP
 .I .claude/agents/
@@ -107,11 +119,11 @@ Brief, conception.md et rapport.md de chaque mission.
 Historique des runs.
 .TP
 .I ~/.config/essaim/settings.toml
-Réglages mémorisés (langue). Emplacement propre à la plateforme.
+Réglages mémorisés (langue). Emplacement propre à la plateforme ; \fBESSAIM_CONFIG_DIR\fR le remplace.
 .SH ENVIRONNEMENT
 .TP
 .BR VISUAL ", " EDITOR
-Éditeur ouvert par la touche \fBe\fR (vi par défaut).
+Éditeur ouvert par les touches d'édition (vi par défaut).
 .TP
 .B ESSAIM_CONFIG_DIR
 Dossier de settings.toml, à la place de celui de la plateforme.
@@ -119,20 +131,27 @@ Dossier de settings.toml, à la place de celui de la plateforme.
 .B ESSAIM_CLAUDE_BIN
 Remplace la commande \fBclaude\fR (tests).
 .TP
-.B ANTHROPIC_API_KEY
-Ignorée : retirée de chaque processus lancé.
+.B ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN
+Ignorées : retirées de chaque processus lancé.
+.TP
+.B CLAUDE_CODE_USE_*
+Toute variable dont le nom commence par \fBCLAUDE_CODE_USE_\fR (préfixe exact, en majuscules : BEDROCK, VERTEX, FOUNDRY…) est retirée de chaque processus lancé.
 .SH CODE DE SORTIE
 .TP
 .B 0
-Succès.
+Succès. Une réalisation refusée au point de contrôle sort aussi en \fB0\fR.
 .TP
 .B 1
-Un poste a échoué, ou la validation a échoué.
+Un nœud ou un poste a échoué, ou la validation a échoué, ou \fB\-\-yes\fR manque pour une mission de plus de 30 appels.
 .SH EXEMPLES
 .nf
 essaim init && essaim
+essaim company check .claude/companies/acme\-studio.toml
+printf '%s\en' "Ajouter une page d'accueil" > brief.md
 essaim company run .claude/companies/acme\-studio.toml \e
-      \-\-brief "Ajouter une page d'accueil"
+      \-\-brief @brief.md
+essaim company run .claude/companies/acme\-studio.toml \e
+      \-\-mission <id> \-\-resume
 .fi
 .SH VOIR AUSSI
 .BR claude (1)

@@ -1,0 +1,137 @@
+name = "performance-fiabilite"
+max_calls = 50
+max_parallel = 3
+checkpoint = true
+
+[[seat]]
+id = "ceo"
+title = "CEO"
+agent = "perf-director"
+expertise = "pilotage performance et fiabilité, arbitrage des priorités"
+
+[[seat]]
+id = "cto"
+title = "CTO"
+agent = "perf-architect"
+reports_to = "ceo"
+expertise = "architecture performante, optimisation algorithmique, anti-redondance du code"
+
+[[seat]]
+id = "head-perf"
+title = "Head of Performance Engineering"
+agent = "engineering-manager"
+reports_to = "cto"
+expertise = "profilage, complexité algorithmique, allocations, concurrence, optimisations ciblées"
+
+[[seat]]
+id = "perf-analyst"
+title = "Performance Engineer"
+agent = "perf-analyst"
+reports_to = "head-perf"
+expertise = "chemins critiques, complexité Big-O, clones et allocations inutiles, entrées/sorties"
+
+[[seat]]
+id = "dev-perf"
+title = "Backend Engineer (Optimisation)"
+agent = "developer"
+reports_to = "head-perf"
+expertise = "mise en oeuvre des optimisations, benchmarks, non-régression"
+builds = true
+allow_bash = [
+    "cargo build",
+    "cargo test",
+    "cargo bench",
+    "cargo clippy",
+]
+
+[[seat]]
+id = "mgr-refacto"
+title = "Engineering Manager, Code Health"
+agent = "engineering-manager"
+reports_to = "cto"
+expertise = "duplication, abstractions communes, découplage, dette technique"
+
+[[seat]]
+id = "dup-analyst"
+title = "Software Engineer, Code Health"
+agent = "redundancy-analyst"
+reports_to = "mgr-refacto"
+expertise = "code dupliqué, logique redondante, code mort, factorisation possible"
+
+[[seat]]
+id = "dev-refacto"
+title = "Backend Engineer (Refactoring)"
+agent = "developer"
+reports_to = "mgr-refacto"
+expertise = "factorisation et simplification sans régression"
+builds = true
+allow_bash = [
+    "cargo build",
+    "cargo test",
+    "cargo clippy",
+]
+
+[[seat]]
+id = "vp-quality"
+title = "VP Quality & Reliability"
+agent = "quality-vp"
+model = "opus"
+reports_to = "ceo"
+expertise = "fiabilité, tests, revue de code, sécurité"
+
+[[seat]]
+id = "reliability-eng"
+title = "Site Reliability Engineer"
+agent = "reliability-engineer"
+reports_to = "vp-quality"
+expertise = "gestion d'erreurs, panics, cas limites, concurrence, reprise après échec"
+
+[[seat]]
+id = "code-reviewer"
+title = "Senior Code Reviewer"
+agent = "code-auditor"
+reports_to = "vp-quality"
+expertise = "revue de code, bugs, dette technique"
+
+[[seat]]
+id = "sec-engineer"
+title = "Application Security Engineer"
+agent = "security-auditor"
+reports_to = "vp-quality"
+expertise = "vulnérabilités, dépendances, entrées non fiables"
+
+[[seat]]
+id = "dev-tests"
+title = "Test Engineer"
+agent = "developer"
+reports_to = "vp-quality"
+expertise = "tests de robustesse et de non-régression"
+builds = true
+allow_bash = [
+    "cargo build",
+    "cargo test",
+    "cargo clippy",
+]
+
+[[seat]]
+id = "vp-product"
+title = "VP Product"
+agent = "product-vp"
+model = "opus"
+reports_to = "ceo"
+expertise = "expérience utilisateur perçue, cohérence produit, documentation"
+
+[[seat]]
+id = "ux-designer"
+title = "UX Designer"
+agent = "ux-designer"
+reports_to = "vp-product"
+expertise = "réactivité perçue de la TUI, retours d'état, ergonomie clavier"
+
+[[seat]]
+id = "tech-writer"
+title = "Technical Writer"
+agent = "doc-writer"
+reports_to = "vp-product"
+expertise = "README et documentation à jour avec le comportement réel"
+builds = true

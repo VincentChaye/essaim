@@ -13,6 +13,8 @@ pub struct Mission {
     pub has_report: bool,
     /// Conception menée à terme mais pas de rapport : un run interrompu ou refusé, reprenable à la réalisation.
     pub resumable: bool,
+    /// Entreprise (fichier) qui a lancé la mission ; `None` tant qu'aucune ne l'a lancée.
+    pub company: Option<String>,
 }
 
 pub fn missions_dir(root: &Path) -> PathBuf {
@@ -68,12 +70,91 @@ pub fn list(root: &Path) -> Vec<Mission> {
                 has_conception: dir.join("conception.md").is_file(),
                 has_report: dir.join("rapport.md").is_file(),
                 resumable: !dir.join("rapport.md").is_file() && resumable_plan(&dir).is_some(),
+                company: std::fs::read_to_string(dir.join(COMPANY_FILE)).ok().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()),
                 dir,
             }
         })
         .collect();
     v.sort_by(|a, b| b.id.cmp(&a.id));
     v
+}
+
+/// Résumé concis d'une mission, tiré de ses fichiers : but, fichiers cités, résultat.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Summary {
+    pub goal: Vec<String>,
+    pub files: Vec<String>,
+    pub outcome: Vec<String>,
+}
+
+/// Lignes (puces nettoyées) de la première section dont le titre contient un des `titles`.
+fn section(md: &str, titles: &[&str], max: usize) -> Vec<String> {
+    let mut on = false;
+    let mut out = vec![];
+    for l in md.lines() {
+        let t = l.trim();
+        if t.starts_with('#') {
+            let h = t.trim_start_matches('#').trim().to_lowercase();
+            if on && !out.is_empty() {
+                break;
+            }
+            on = titles.iter().any(|x| h.contains(x));
+            continue;
+        }
+        if on && !t.is_empty() {
+            let c = t.trim_start_matches(['-', '*', ' ']).replace("**", "").replace('`', "");
+            out.push(c.chars().take(110).collect());
+            if out.len() >= max {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Chemins de fichiers cités dans le texte (`src/x.rs`, `Cargo.toml:12`…), sans doublon.
+fn files_in(md: &str, max: usize) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for w in md.split(|c: char| c.is_whitespace() || "`()[],;«»\"'*".contains(c)) {
+        let w = w.trim_end_matches(['.', ':']);
+        let w = match w.rsplit_once(':') {
+            Some((a, b)) if !b.is_empty() && b.chars().all(|c| c.is_ascii_digit() || c == '-') => a,
+            _ => w,
+        };
+        let ext = w.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+        let known = matches!(ext, "rs" | "md" | "toml" | "sh" | "json" | "yml" | "yaml" | "ts" | "tsx" | "js" | "py" | "css" | "html");
+        if known && w.len() > 3 && !w.contains("://") && !w.contains('*') && !w.starts_with("..") && !out.iter().any(|f| f == w) {
+            out.push(w.to_string());
+            if out.len() >= max {
+                break;
+            }
+        }
+    }
+    out
+}
+
+pub fn summarize(dir: &Path) -> Summary {
+    let read = |n: &str| std::fs::read_to_string(dir.join(n)).unwrap_or_default();
+    let (brief, plan, report) = (read("brief.md"), read("conception.md"), read("rapport.md"));
+    let mut goal = section(&brief, &["objectif", "but"], 1);
+    if goal.is_empty() {
+        goal = brief.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).take(1).map(|l| l.chars().take(110).collect()).collect();
+    }
+    let mut files = files_in(&report, 4);
+    if files.is_empty() {
+        files = files_in(&plan, 4);
+    }
+    let outcome = section(&report, &["conclusion", "synthèse", "résumé", "résultat"], 2);
+    Summary { goal, files, outcome }
+}
+
+const COMPANY_FILE: &str = "company";
+
+/// Rattache la mission à l'entreprise qui la réalise.
+pub fn set_company(dir: &Path, company_file: &str) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    write_private(&dir.join(COMPANY_FILE), company_file.as_bytes())?;
+    Ok(())
 }
 
 /// Marqueur « conception terminée sans échec ni annulation » : seule une conception marquée peut être reprise.
@@ -102,16 +183,93 @@ pub fn read_brief(m: &Mission) -> Result<String> {
 }
 
 pub fn write_output(dir: &Path, name: &str, text: &str) -> Result<()> {
-    anyhow::ensure!(matches!(name, "conception.md" | "rapport.md" | "brief.md"), "nom de livrable inattendu : {name}");
+    anyhow::ensure!(matches!(name, "conception.md" | "rapport.md" | "brief.md" | "compte-rendu.md"), "nom de livrable inattendu : {name}");
     std::fs::create_dir_all(dir)?;
     // Livrables = texte du projet et de la mission : réservés à l'utilisateur (0600).
     write_private(&dir.join(name), text.as_bytes())?;
     Ok(())
 }
 
+/// Une ligne du déroulé d'une mission (un appel `claude`).
+pub struct StepLine {
+    pub label: String,
+    pub agent: String,
+    pub status: String,
+    pub tokens: u64,
+}
+
+/// Données d'un compte rendu de fin de mission.
+pub struct ReportData<'a> {
+    pub title: &'a str,
+    pub company: &'a str,
+    pub date: &'a str,
+    pub ok: bool,
+    pub realised: bool,
+    pub tokens: u64,
+    pub steps: Vec<StepLine>,
+    /// Points d'attention : (libellé, message) des appels échoués ou ignorés.
+    pub issues: Vec<(String, String)>,
+    /// Rapport final du boss (rapport.md, sinon plan de conception).
+    pub final_report: &'a str,
+}
+
+/// Compte rendu Markdown de fin de mission (`compte-rendu.md`), lisible dans l'onglet Entreprise.
+pub fn compte_rendu(d: &ReportData, fr: bool) -> String {
+    let t = |a: &'static str, b: &'static str| if fr { a } else { b };
+    let verdict = match (d.ok, d.realised) {
+        (true, true) => t("✔ terminée", "✔ completed"),
+        (true, false) => t("✔ conception terminée, réalisation non lancée", "✔ design completed, realisation not started"),
+        (false, _) => t("✖ terminée avec des échecs ou interrompue", "✖ finished with failures or interrupted"),
+    };
+    let mut s = format!("# {} — {}\n\n", t("Compte rendu", "Report"), d.title);
+    s.push_str(&format!("- **{}** : {}\n- **{}** : {}\n- **{}** : {}\n- **Tokens** : {}\n- **{}** : {}\n\n", t("Entreprise", "Company"), d.company, t("Date", "Date"), d.date, t("Résultat", "Result"), verdict, d.tokens, t("Appels", "Calls"), d.steps.len()));
+    s.push_str(&format!("## {}\n\n", t("Ce qui a été fait", "What was done")));
+    if d.final_report.trim().is_empty() {
+        s.push_str(t("_Aucun rapport final n'a été produit._\n\n", "_No final report was produced._\n\n"));
+    } else {
+        s.push_str(d.final_report.trim());
+        s.push_str("\n\n");
+    }
+    s.push_str(&format!("## {}\n\n", t("Déroulé", "Timeline")));
+    if d.steps.is_empty() {
+        s.push_str(t("_Aucun appel._\n\n", "_No calls._\n\n"));
+    } else {
+        s.push_str(&format!("| {} | Agent | {} | Tokens |\n|---|---|---|---:|\n", t("Étape", "Step"), t("Résultat", "Result")));
+        for l in &d.steps {
+            s.push_str(&format!("| {} | {} | {} | {} |\n", l.label.replace('|', "/"), l.agent, l.status, l.tokens));
+        }
+        s.push('\n');
+    }
+    if !d.issues.is_empty() {
+        s.push_str(&format!("## {}\n\n", t("Points d'attention", "Points of attention")));
+        for (label, msg) in &d.issues {
+            let first = msg.lines().next().unwrap_or("").trim();
+            s.push_str(&format!("- **{label}** — {first}\n"));
+        }
+        s.push('\n');
+    }
+    s.push_str(&format!("## {}\n\n`brief.md` · `conception.md`{} · `compte-rendu.md`\n", t("Fichiers de la mission", "Mission files"), if d.realised { " · `rapport.md`" } else { "" }));
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compte_rendu_resume_la_mission() {
+        let d = ReportData {
+            title: "Site", company: "Acme", date: "01/01 10:00", ok: false, realised: true, tokens: 1234,
+            steps: vec![StepLine { label: "CEO · reports".into(), agent: "boss".into(), status: "✔".into(), tokens: 10 }],
+            issues: vec![("Dev · builds".into(), "boum\nsuite".into())],
+            final_report: "Tout est fait.",
+        };
+        let md = compte_rendu(&d, true);
+        assert!(md.starts_with("# Compte rendu — Site"));
+        assert!(md.contains("Tout est fait.") && md.contains("| CEO · reports | boss | ✔ | 10 |"));
+        assert!(md.contains("**Dev · builds** — boum") && !md.contains("suite"));
+        assert!(md.contains("`rapport.md`") && md.contains("**Tokens** : 1234"));
+    }
 
     fn tmp() -> PathBuf {
         std::env::temp_dir().join(format!("essaim-mis-{}", uuid::Uuid::new_v4()))
@@ -199,5 +357,20 @@ mod tests {
         let t = title_of(&"x".repeat(100));
         assert!(t.ends_with('…') && t.chars().count() == 61);
         assert_eq!(title_of("  \n  "), "(brief vide)");
+    }
+}
+
+#[cfg(test)]
+mod tests_company {
+    use super::*;
+
+    #[test]
+    fn mission_rattachee_a_son_entreprise() {
+        let root = std::env::temp_dir().join(format!("essaim-mis-{}", uuid::Uuid::new_v4()));
+        let dir = create(&root, "m1").unwrap();
+        write_output(&dir, "brief.md", "# Test").unwrap();
+        assert_eq!(list(&root)[0].company, None);
+        set_company(&dir, "a.toml").unwrap();
+        assert_eq!(list(&root)[0].company.as_deref(), Some("a.toml"));
     }
 }

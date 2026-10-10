@@ -31,13 +31,25 @@ pub fn is_safe(p: &str) -> bool {
     !t.is_empty() && !t.contains("..") && !t.contains(['~', '\\', ',', '(', ')']) && !p.chars().any(char::is_control)
 }
 
+/// Dossiers réservés à essaim, à git et à Claude Code : réservés à **toute profondeur** (`**/.claude`, `src/.git/hooks`).
+/// Comparaison insensible à la casse (macOS : `.CLAUDE` désigne `.claude`).
+const RESERVED_DIRS: &[&str] = &[".claude", ".git", ".essaim"];
+
 /// Chemins réservés à essaim, à git et à Claude Code (`.claude/settings*`, `.git/hooks`, `.essaim/`…) :
 /// un poste ⚒ qui y écrirait pourrait élargir ses propres permissions ou préparer du code exécuté plus tard.
-/// Conservateur : premier segment caché (`.xxx`) ou à motif de classe (`{`, `[`, `?`).
+/// Le prédicat examine **tous** les segments du chemin (E1) : un segment est réservé si
+/// - il est `{`, `[` ou `?` (motif de classe, qui peut désigner un segment caché) à n'importe quelle profondeur ;
+/// - il appartient à `RESERVED_DIRS` à n'importe quelle profondeur ;
+/// - il est caché (`.xxx`) et soit premier segment, soit à motif (`*`, `?`, `[`, `{`) : `.g*`, `.cl*`.
+/// Un fichier caché ordinaire plus profond (`src/.env.example`) n'est pas réservé.
 pub fn is_sensitive(p: &str) -> bool {
     let n = normalize(p);
-    let first = n.split('/').next().unwrap_or("");
-    first.starts_with('.') || first.contains(['{', '[', '?'])
+    n.split('/').enumerate().any(|(i, seg)| {
+        let lower = seg.to_ascii_lowercase();
+        seg.contains(['{', '[', '?'])
+            || RESERVED_DIRS.contains(&lower.as_str())
+            || (seg.starts_with('.') && (i == 0 || seg.contains('*')))
+    })
 }
 
 /// Dossier (ou fichier exact) auquel se rattache le motif : sa partie littérale.

@@ -287,3 +287,92 @@ mod tests {
         assert!(a.iter().any(|x| x.contains("no agent exists yet") && x.contains("not to reuse): none.")));
     }
 }
+
+/// `claude` arguments to modify an existing element with the user: a plan-mode conversation that
+/// rewrites `file` (the only file it may touch) after the user approves the change.
+pub fn edit_args(lang: Lang, what: &str, file: &str, agents: &[String]) -> Vec<String> {
+    let system = format!(
+        r###"You are essaim's editing assistant. Your only job: modify {what} with the user.
+
+The file is {file} (path relative to the current directory). Read it first.
+
+Steps, in order:
+1. Ask the user what they want to change if it is not clear (1 to 3 short questions, AskUserQuestion fits). Do not ask what you can reasonably decide alone.
+2. Propose the change as a short plan (before / after) for the user to approve or correct.
+3. Once approved, edit that file only, keeping its exact format and everything not concerned by the change. In a company file, seat agents must be among the existing agents: {agents}.
+4. Re-read the written file, then tell the user they can leave the session (/exit) to go back to essaim.
+
+Rules: create or modify no other file; never delete the file.
+
+{note}"###,
+        agents = if agents.is_empty() { "none".to_string() } else { agents.join(", ") },
+        note = lang_note(lang),
+    );
+    vec![
+        "--permission-mode".into(),
+        "plan".into(),
+        "--name".into(),
+        "essaim: edit".into(),
+        "--append-system-prompt".into(),
+        system,
+        "--".into(),
+        "I want to modify this element. Ask me what to change.".into(),
+    ]
+}
+
+/// `claude` arguments to discuss a finished mission's report with the user and turn it into actions.
+/// Plan mode: every write is approved by the user first. `companies`: (file name, org chart lines);
+/// `agents`: (name, description).
+pub fn debrief_args(lang: Lang, mission_dir: &str, followup_id: &str, agents: &[(String, String)], companies: &[(String, Vec<String>)]) -> Vec<String> {
+    let comps = if companies.is_empty() {
+        "(no company exists yet)".to_string()
+    } else {
+        companies.iter().map(|(f, o)| format!("- {f}\n{}", o.iter().map(|l| format!("    {l}")).collect::<Vec<_>>().join("\n"))).collect::<Vec<_>>().join("\n")
+    };
+    let ags = if agents.is_empty() { "(none)".to_string() } else { agents.iter().map(|(n, d)| format!("- {n}: {d}")).collect::<Vec<_>>().join("\n") };
+    let system = format!(
+        r###"You are essaim's debrief assistant. A mission just ended; help the user decide and set up what happens next.
+
+Mission folder: {dir} (paths relative to the current directory). Read, in this order: compte-rendu.md (the report), then rapport.md (final report of the boss), conception.md (the plan) and brief.md (the request) when they exist.
+
+Existing companies (file in .claude/companies/, then org chart):
+{comps}
+
+Existing agents:
+{ags}
+
+Steps, in order:
+1. Summarise in 4 to 6 lines what was done, what failed or is missing, and the open questions. Then ask the user what they think (AskUserQuestion fits).
+2. Discuss. Propose concrete actions, each short and checkable (follow-up mission, fix of a failure, change of an agent or of the org chart, manual task for the user).
+3. For every action that a team should carry out, decide WHO does it, with the user:
+   - propose the best-fitting EXISTING company and say why (its seats and expertise against the work), or the company that ran this mission when it fits;
+   - or, when none fits, propose CREATING a new company (say what domains it must cover and roughly how many seats), and let the user choose.
+4. Once the user approves, put the approved actions in place, nothing more:
+   - write the list to {dir}/actions.md (checklist, one line per action: [ ] what, who (company or person), why);
+   - a follow-up mission: write its brief to .essaim/missions/{followup}/brief.md (Markdown, first line "# <title>", then the goal, constraints and expected deliverables; use a different folder name for each extra brief), and assign the company by writing its file name (for example acme.toml, nothing else) to .essaim/missions/<same folder>/company;
+   - a new company: follow the "New company guide" below, write .claude/companies/<name>.toml and the agents it lacks, then assign it to the follow-up mission as above;
+   - changing an agent: edit .claude/agents/<name>.md. Changing an existing org chart: edit its file. Keep their exact format.
+5. Re-read what you wrote, then tell the user they can leave the session (/exit) to go back to essaim, where new briefs appear in the Missions list (launch with r from the Company tab).
+
+Rules: never modify compte-rendu.md, rapport.md, conception.md or brief.md of this mission; do not touch project source code; do not launch missions yourself; never create a company or an agent without the user's approval of the org chart.
+
+=== New company guide (only if a company must be created) ===
+{guide}
+
+{note}"###,
+        dir = mission_dir,
+        followup = followup_id,
+        guide = COMPANY_INSTRUCTIONS,
+        note = lang_note(lang),
+    );
+    vec![
+        "--permission-mode".into(),
+        "plan".into(),
+        "--name".into(),
+        "essaim: debrief".into(),
+        "--append-system-prompt".into(),
+        system,
+        "--".into(),
+        "The mission is finished. Read its report and let's discuss what to do next.".into(),
+    ]
+}

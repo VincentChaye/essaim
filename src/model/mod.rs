@@ -3,6 +3,7 @@ use std::path::Path;
 
 pub mod agent;
 pub mod company;
+pub mod ident;
 pub mod roles;
 
 /// Taille maximale d'un fichier de configuration du projet lu (agent, entreprise) : 1 Mio.

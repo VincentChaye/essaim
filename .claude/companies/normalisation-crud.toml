@@ -1,0 +1,76 @@
+name = "normalisation-crud"
+max_calls = 40
+max_parallel = 2
+checkpoint = true
+
+[[seat]]
+id = "ceo"
+title = "Directeur de la normalisation"
+agent = "crud-director"
+
+[[seat]]
+id = "cto"
+title = "CTO"
+agent = "crud-architect"
+reports_to = "ceo"
+expertise = "référentiel CRUD, architecture, mise en conformité du code"
+
+[[seat]]
+id = "dev-model"
+title = "Ingénieur Backend"
+agent = "developer"
+reports_to = "cto"
+expertise = "modèle, runtime, persistance (src/model, src/runtime)"
+builds = true
+allow_bash = ["cargo build", "cargo test", "cargo clippy"]
+
+[[seat]]
+id = "dev-tui"
+title = "Développeur TUI"
+agent = "developer"
+reports_to = "cto"
+expertise = "interface, confirmations, saisie (src/tui)"
+builds = true
+allow_bash = ["cargo build", "cargo test", "cargo clippy"]
+
+[[seat]]
+id = "vp-quality"
+title = "VP Qualité"
+agent = "quality-vp"
+reports_to = "ceo"
+expertise = "conformité aux conventions, stratégie de tests"
+
+[[seat]]
+id = "code-review"
+title = "Ingénieur Revue de code"
+agent = "code-auditor"
+reports_to = "vp-quality"
+expertise = "écarts aux conventions CRUD, tests manquants"
+
+[[seat]]
+id = "ciso"
+title = "RSSI"
+agent = "security-chief"
+reports_to = "ceo"
+expertise = "risques liés aux opérations CRUD"
+
+[[seat]]
+id = "sec-analyst"
+title = "Analyste Sécurité"
+agent = "security-auditor"
+reports_to = "ciso"
+expertise = "validation des entrées, suppressions, chemins, droits"
+
+[[seat]]
+id = "vp-product"
+title = "VP Produit"
+agent = "product-vp"
+reports_to = "ceo"
+expertise = "cohérence d'usage, documentation"
+
+[[seat]]
+id = "tech-writer"
+title = "Rédacteur Technique"
+agent = "doc-writer"
+reports_to = "vp-product"
+expertise = "règles d'utilisation CRUD"

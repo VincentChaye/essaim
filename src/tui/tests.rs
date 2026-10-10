@@ -107,6 +107,7 @@ fn renommage_supprime_l_ancien_fichier() {
     let i = app.agents.iter().position(|a| a.name == "ancien").unwrap();
     app.agent_sel = i;
     press(&mut app, KeyCode::Char('e'));
+    press(&mut app, KeyCode::Char('1')); // édition simple
     for _ in 0..6 {
         press(&mut app, KeyCode::Backspace);
     }
@@ -123,12 +124,18 @@ fn suppression_avec_confirmation() {
     let mut app = new_app(&root);
     app.agent_sel = app.agents.iter().position(|a| a.name == "poete").unwrap();
     press(&mut app, KeyCode::Char('D'));
-    assert!(screen(&app).contains("Supprimer"));
-    press(&mut app, KeyCode::Char('x')); // refus
+    assert!(screen(&app).contains("Supprimer l'agent « poete » ? (o/n)"));
+    press(&mut app, KeyCode::Char('x')); // refus : rien ne part
     assert!(root.join(".claude/agents/poete.md").exists());
+    assert_eq!(app.status, "Annulé.");
     press(&mut app, KeyCode::Char('D'));
-    press(&mut app, KeyCode::Char('y'));
+    press(&mut app, KeyCode::Esc); // Échap annule aussi
+    assert!(root.join(".claude/agents/poete.md").exists());
+    assert_eq!(app.status, "Annulé.");
+    press(&mut app, KeyCode::Char('D'));
+    press(&mut app, KeyCode::Char('o'));
     assert!(!root.join(".claude/agents/poete.md").exists());
+    assert!(app.status.contains("supprimé"), "{}", app.status);
 }
 
 #[test]
@@ -141,7 +148,7 @@ fn affichage_d_un_run() {
         name: "demo".into(),
         nodes: ["a", "b"].map(|id| NodeView::new(id, "poete")).into(),
         sel: 0,
-        cost: 0.0,
+        tokens: 0,
         finished: None,
         cancel,
     });
@@ -154,9 +161,9 @@ fn affichage_d_un_run() {
     assert!(s.contains("bonjour") && s.contains("monde"));
     assert!(s.contains("outil : Read"));
 
-    app.on_run_event(RunEvent::NodeFinished { id: "a".into(), status: NodeStatus::Failed("boum".into()), cost_usd: 0.01 });
-    app.on_run_event(RunEvent::NodeFinished { id: "b".into(), status: NodeStatus::Skipped("dépendance a non réussie".into()), cost_usd: 0.0 });
-    app.on_run_event(RunEvent::RunFinished { ok: false, cost_usd: 0.01 });
+    app.on_run_event(RunEvent::NodeFinished { id: "a".into(), status: NodeStatus::Failed("boum".into()), tokens: 0 });
+    app.on_run_event(RunEvent::NodeFinished { id: "b".into(), status: NodeStatus::Skipped("dépendance a non réussie".into()), tokens: 0 });
+    app.on_run_event(RunEvent::RunFinished { ok: false, tokens: 0 });
     let s = screen(&app);
     assert!(s.contains("terminé avec erreurs"));
     assert!(s.contains("✖") && s.contains("⊘"));
@@ -173,11 +180,52 @@ fn navigation_onglets_et_quitter_annule_le_run() {
     press(&mut app, KeyCode::BackTab);
     press(&mut app, KeyCode::BackTab);
     assert_eq!(app.tab, Tab::Terminal);
+    // Sans run en cours, q quitte sans confirmation.
+    let mut sans_run = new_app(&root);
+    press(&mut sans_run, KeyCode::Char('q'));
+    assert!(sans_run.quit);
+
     let (cancel, rx) = tokio::sync::watch::channel(false);
-    app.run = Some(RunView { name: "x".into(), nodes: vec![], sel: 0, cost: 0.0, finished: None, cancel });
+    app.run = Some(RunView { name: "x".into(), nodes: vec![], sel: 0, tokens: 0, finished: None, cancel });
     press(&mut app, KeyCode::Char('q'));
+    assert!(!app.quit && matches!(app.mode, Mode::ConfirmAction(PendingAction::QuitRun(_))), "run en cours : confirmation");
+    assert!(screen(&app).contains("Quitter et annuler le run « x »"));
+    press(&mut app, KeyCode::Char('n'));
+    assert!(!app.quit && !*rx.borrow(), "refus : le run continue");
+    assert_eq!(app.status, "Annulé.");
+    press(&mut app, KeyCode::Char('q'));
+    press(&mut app, KeyCode::Char('o'));
     assert!(app.quit);
     assert!(*rx.borrow(), "le run en cours est annulé à la sortie");
+}
+
+#[test]
+fn ctrl_c_pendant_un_run_demande_confirmation() {
+    let root = tmp_root();
+    let mut app = new_app(&root);
+    let (cancel, rx) = tokio::sync::watch::channel(false);
+    app.run = Some(RunView { name: "x".into(), nodes: vec![], sel: 0, tokens: 0, finished: None, cancel });
+    app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(!app.quit && matches!(app.mode, Mode::ConfirmAction(_)));
+    press(&mut app, KeyCode::Esc);
+    assert!(!app.quit && !*rx.borrow() && app.status == "Annulé.");
+}
+
+#[test]
+fn annulation_du_run_demande_confirmation() {
+    let root = tmp_root();
+    let mut app = new_app(&root);
+    let (cancel, rx) = tokio::sync::watch::channel(false);
+    app.run = Some(RunView { name: "coupe".into(), nodes: vec![], sel: 0, tokens: 0, finished: None, cancel });
+    app.tab = Tab::Run;
+    press(&mut app, KeyCode::Char('s'));
+    assert!(screen(&app).contains("Annuler le run « coupe » ? (o/n)"));
+    press(&mut app, KeyCode::Char('n'));
+    assert!(!*rx.borrow(), "refus : rien n'est annulé");
+    press(&mut app, KeyCode::Char('s'));
+    press(&mut app, KeyCode::Char('o'));
+    assert!(*rx.borrow(), "accepté : le run reçoit l'annulation");
+    assert_eq!(app.status, "annulation demandée…");
 }
 
 #[test]
@@ -266,11 +314,31 @@ fn attacher_et_supprimer_une_session() {
     press(&mut app, KeyCode::Char('a'));
     assert_eq!(app.attach_request.as_deref(), Some("aaa11111"));
     press(&mut app, KeyCode::Char('x'));
-    assert!(matches!(app.mode, Mode::ConfirmRemoveSession(..)));
-    assert!(screen(&app).contains("Supprimer la session"));
+    assert!(matches!(app.mode, Mode::ConfirmAction(PendingAction::RemoveSession(..))));
+    assert!(screen(&app).contains("Supprimer la session « essaim-x » ? (o/n)"));
     press(&mut app, KeyCode::Char('n')); // refus : rien ne part
     assert!(matches!(app.mode, Mode::Normal));
-    assert!(app.status.is_empty());
+    assert_eq!(app.status, "Annulé.");
+    assert_eq!(app.sessions.len(), 1, "la session reste listée");
+}
+
+#[test]
+fn arret_de_session_demande_confirmation_puis_l_execute() {
+    let root = tmp_root();
+    let mut app = new_app(&root);
+    press(&mut app, KeyCode::Char('4'));
+    app.on_event(AppEvent::Sessions { list: Some(vec![fake_session("aaa11111", "essaim-x", "working")]), error: None });
+    press(&mut app, KeyCode::Char('s'));
+    assert!(screen(&app).contains("Arrêter la session « essaim-x » ? (o/n)"));
+    press(&mut app, KeyCode::Char('n'));
+    assert_eq!(app.status, "Annulé.");
+    assert!(matches!(app.mode, Mode::Normal));
+    press(&mut app, KeyCode::Char('s'));
+    press(&mut app, KeyCode::Char('o'));
+    // Sans runtime asynchrone (test synchrone), l'action est signalée et non silencieuse.
+    assert!(matches!(app.mode, Mode::Normal));
+    assert_ne!(app.status, "Annulé.");
+    assert!(!app.status.is_empty(), "l'action ne doit pas échouer en silence");
 }
 
 #[test]
@@ -287,7 +355,7 @@ fn run_view(names: &[&str]) -> RunView {
         name: "demo".into(),
         nodes: names.iter().map(|id| NodeView::new(id, "poete")).collect(),
         sel: 0,
-        cost: 0.0,
+        tokens: 0,
         finished: None,
         cancel,
     }
@@ -302,10 +370,10 @@ fn le_run_est_enregistre_a_la_fin_et_visible_dans_l_historique() {
     app.run_started_ms = 5000;
     app.tab = Tab::Run;
     app.on_run_event(RunEvent::Node { id: "a".into(), event: ClaudeEvent::Text("salut".into()) });
-    app.on_run_event(RunEvent::NodeFinished { id: "a".into(), status: NodeStatus::Succeeded, cost_usd: 0.02 });
-    app.on_run_event(RunEvent::NodeFinished { id: "b".into(), status: NodeStatus::Failed("boum".into()), cost_usd: 0.0 });
+    app.on_run_event(RunEvent::NodeFinished { id: "a".into(), status: NodeStatus::Succeeded, tokens: 0 });
+    app.on_run_event(RunEvent::NodeFinished { id: "b".into(), status: NodeStatus::Failed("boum".into()), tokens: 0 });
     assert!(app.history.is_empty(), "rien d'écrit avant la fin du run");
-    app.on_run_event(RunEvent::RunFinished { ok: false, cost_usd: 0.02 });
+    app.on_run_event(RunEvent::RunFinished { ok: false, tokens: 0 });
     assert_eq!(app.history.len(), 1);
     assert_eq!(app.history[0].finished, Some(false));
 
@@ -323,8 +391,8 @@ fn rouvrir_un_run_passe() {
     app.run_id = Some(crate::runtime::store::new_id(7000));
     app.tab = Tab::Run;
     app.on_run_event(RunEvent::Node { id: "a".into(), event: ClaudeEvent::Text("journal du nœud a".into()) });
-    app.on_run_event(RunEvent::NodeFinished { id: "a".into(), status: NodeStatus::Succeeded, cost_usd: 0.0 });
-    app.on_run_event(RunEvent::RunFinished { ok: true, cost_usd: 0.0 });
+    app.on_run_event(RunEvent::NodeFinished { id: "a".into(), status: NodeStatus::Succeeded, tokens: 0 });
+    app.on_run_event(RunEvent::RunFinished { ok: true, tokens: 0 });
 
     // Nouvelle session de l'outil : l'historique vient du disque.
     let mut app2 = new_app(&root);
@@ -346,8 +414,8 @@ fn run_interrompu_et_suppression_d_historique() {
         pipeline: "coupe".into(),
         started_ms: 9000,
         finished: None,
-        cost_usd: 0.0,
-        nodes: vec![crate::runtime::store::NodeRecord { id: "a".into(), agent: "x".into(), label: String::new(), depth: 0, status: None, cost: 0.0, log: vec![] }],
+        tokens: 0,
+        nodes: vec![crate::runtime::store::NodeRecord { id: "a".into(), agent: "x".into(), label: String::new(), depth: 0, status: None, tokens: 0, log: vec![] }],
     };
     crate::runtime::store::save(&root, &rec).unwrap();
     let mut app = new_app(&root);
@@ -359,7 +427,12 @@ fn run_interrompu_et_suppression_d_historique() {
     press(&mut app, KeyCode::Char('h'));
     press(&mut app, KeyCode::Char('D'));
     assert!(matches!(app.mode, Mode::ConfirmAction(_)));
+    assert!(screen(&app).contains("Supprimer le run « coupe » ? (o/n)"));
     assert!(!app.history.is_empty(), "rien n'est supprimé avant confirmation");
+    press(&mut app, KeyCode::Char('n'));
+    assert_eq!(app.status, "Annulé.");
+    assert_eq!(app.history.len(), 1, "refus : l'historique est intact");
+    press(&mut app, KeyCode::Char('D'));
     press(&mut app, KeyCode::Char('y'));
     assert!(app.history.is_empty());
     assert!(screen(&app).contains("Aucun run enregistré"));
@@ -371,7 +444,7 @@ fn historique_refuse_pendant_un_run() {
     let mut app = new_app(&root);
     app.run = Some(run_view(&["a"])); // finished = None → en cours
     app.tab = Tab::Run;
-    app.history = vec![crate::runtime::store::RunRecord { id: "1".into(), pipeline: "p".into(), started_ms: 1, finished: Some(true), cost_usd: 0.0, nodes: vec![] }];
+    app.history = vec![crate::runtime::store::RunRecord { id: "1".into(), pipeline: "p".into(), started_ms: 1, finished: Some(true), tokens: 0, nodes: vec![] }];
     press(&mut app, KeyCode::Char('h'));
     press(&mut app, KeyCode::Enter);
     assert!(app.status.contains("en cours"));
@@ -438,6 +511,7 @@ fn modele_personnalise_conserve_a_l_edition() {
     let mut app = new_app(&root);
     app.agent_sel = app.agents.iter().position(|a| a.name == "perso").unwrap();
     press(&mut app, KeyCode::Char('e'));
+    press(&mut app, KeyCode::Char('1')); // édition simple
     let (opts, idx) = model_field(&app);
     assert_eq!(opts.last().unwrap(), "claude-opus-5-5");
     assert_eq!(opts[idx], "claude-opus-5-5");
@@ -712,6 +786,10 @@ fn onglet_entreprise_arbre_niveaux_et_validation() {
 fn detail_du_poste_selectionne() {
     let mut app = company_app();
     press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Esc); // on arrive dans la liste des entreprises : retour au graphe
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter); // entre dans la zone organigramme
     assert!(screen(&app).contains("Poste : CEO (N)"));
     press(&mut app, KeyCode::Char('j'));
     let s = screen(&app);
@@ -719,8 +797,8 @@ fn detail_du_poste_selectionne() {
     assert!(s.contains("architecture"));
     press(&mut app, KeyCode::Char('j'));
     let s = screen(&app);
-    assert!(s.contains("Poste : Backend Engineer (N-2)") && s.contains("peut modifier"), "{s}");
-    assert!(s.contains("cargo test"));
+    assert!(s.contains("Poste : Backend Engineer (N-2)") && s.contains("modifie le projet"), "{s}");
+    assert!(s.contains("cargo test"), "{s}");
 }
 
 #[test]
@@ -747,12 +825,18 @@ fn entreprise_vide_et_edition_du_toml() {
     let mut app = new_app(&root);
     press(&mut app, KeyCode::Char('2'));
     assert!(screen(&app).contains("Aucune entreprise"));
-    press(&mut app, KeyCode::Char('E'));
+    press(&mut app, KeyCode::Char('e'));
     assert!(app.editor_request.is_none(), "rien à éditer");
 
     let mut app = company_app();
     press(&mut app, KeyCode::Char('2'));
-    press(&mut app, KeyCode::Char('E'));
+    press(&mut app, KeyCode::Char('e'));
+    assert!(app.editor_request.is_none(), "hors zone, rien ne s'édite");
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Left);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('e'));
+    press(&mut app, KeyCode::Char('1')); // édition simple
     assert!(app.editor_request.as_ref().unwrap().ends_with("acme.toml"));
 }
 
@@ -760,6 +844,10 @@ fn entreprise_vide_et_edition_du_toml() {
 fn la_selection_de_poste_reste_dans_l_arbre() {
     let mut app = company_app();
     press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Esc); // on arrive dans la liste des entreprises : retour au graphe
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter); // entre dans la zone organigramme
     for _ in 0..10 {
         press(&mut app, KeyCode::Down);
     }
@@ -768,6 +856,43 @@ fn la_selection_de_poste_reste_dans_l_arbre() {
         press(&mut app, KeyCode::Up);
     }
     assert_eq!(app.seat_sel, 0);
+}
+
+#[test]
+fn navigation_dans_le_graphe_par_niveau_et_branche() {
+    let mut app = company_app();
+    let extra = "\n[[seat]]\nid = \"cfo\"\ntitle = \"CFO\"\nagent = \"poete\"\nreports_to = \"ceo\"\n\n[[seat]]\nid = \"acc\"\ntitle = \"Accountant\"\nagent = \"poete\"\nreports_to = \"cfo\"\n";
+    std::fs::write(app.root.join(".claude/companies/acme.toml"), format!("{ACME}{extra}")).unwrap();
+    app.reload();
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Esc); // on arrive dans la liste des entreprises : retour au graphe
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter); // entre dans la zone organigramme
+    // Ordre préfixe : ceo, cto, dev, cfo, acc.
+    assert_eq!(app.seat_sel, 0);
+    press(&mut app, KeyCode::Down); // ceo → cto
+    assert_eq!(app.seat_sel, 1);
+    press(&mut app, KeyCode::Right); // cto → cfo (même niveau)
+    assert_eq!(app.seat_sel, 3);
+    press(&mut app, KeyCode::Right);
+    assert_eq!(app.seat_sel, 3, "pas de voisin à droite");
+    press(&mut app, KeyCode::Down); // cfo → acc
+    assert_eq!(app.seat_sel, 4);
+    press(&mut app, KeyCode::Left); // acc ↔ dev : même niveau, autre branche
+    assert_eq!(app.seat_sel, 2);
+    press(&mut app, KeyCode::Up); // dev → cto
+    assert_eq!(app.seat_sel, 1);
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.seat_sel, 0, "le boss n'a pas de supérieur");
+    let s = screen(&app);
+    assert!(s.contains("CFO") && s.contains("Accountant"), "{s}");
+    // Ajout depuis le graphe : `a` sous le poste sélectionné, le nouveau poste est sélectionné ensuite.
+    press(&mut app, KeyCode::Right);
+    assert_eq!(app.seat_sel, 0, "le boss n'a pas de voisin");
+    press(&mut app, KeyCode::Char('a'));
+    assert!(matches!(app.mode, Mode::EditSeat(_)));
 }
 
 #[test]
@@ -807,8 +932,8 @@ fn run_d_entreprise_noeuds_dynamiques_indentes_et_persistes() {
     app.on_run_event(label("cto/conception/delegate", "CTO · délègue", 1));
     assert_eq!(app.run.as_ref().unwrap().nodes.len(), 3);
 
-    app.on_run_event(RunEvent::NodeFinished { id: "ceo/conception/delegate".into(), status: NodeStatus::Succeeded, cost_usd: 0.01 });
-    app.on_run_event(RunEvent::RunFinished { ok: true, cost_usd: 0.01 });
+    app.on_run_event(RunEvent::NodeFinished { id: "ceo/conception/delegate".into(), status: NodeStatus::Succeeded, tokens: 0 });
+    app.on_run_event(RunEvent::RunFinished { ok: true, tokens: 0 });
     let rec = &app.history[0];
     assert_eq!(rec.nodes[1].label, "CTO · délègue");
     assert_eq!(rec.nodes[2].depth, 2);
@@ -1126,7 +1251,7 @@ fn e_ouvre_la_revision_du_plan_et_le_plan_modifie_est_relu() {
 #[test]
 fn le_point_de_controle_disparait_si_le_run_se_termine() {
     let (mut app, _rx) = checkpoint_app();
-    app.on_run_event(RunEvent::RunFinished { ok: false, cost_usd: 0.0 });
+    app.on_run_event(RunEvent::RunFinished { ok: false, tokens: 0 });
     assert!(app.checkpoint.is_none(), "run annulé pendant l'attente");
     press(&mut app, KeyCode::Char('q'));
     assert!(app.quit, "les touches reviennent à la normale");
@@ -1213,6 +1338,10 @@ fn agent_illisible_signale_meme_sans_entreprise() {
 fn formulaire_de_poste_ajout_sous_le_poste_selectionne() {
     let mut app = company_app();
     press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Esc); // on arrive dans la liste des entreprises : retour au graphe
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter); // entre dans la zone organigramme
     press(&mut app, KeyCode::Down); // cto
     press(&mut app, KeyCode::Char('a'));
     assert!(matches!(app.mode, Mode::EditSeat(_)));
@@ -1235,6 +1364,10 @@ fn formulaire_de_poste_ajout_sous_le_poste_selectionne() {
 fn formulaire_de_poste_refuse_un_id_invalide_et_garde_le_formulaire() {
     let mut app = company_app();
     press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Esc); // on arrive dans la liste des entreprises : retour au graphe
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Char('a'));
     type_str(&mut app, "a b");
     press(&mut app, KeyCode::Enter);
@@ -1242,7 +1375,9 @@ fn formulaire_de_poste_refuse_un_id_invalide_et_garde_le_formulaire() {
     ctrl_s(&mut app);
     assert!(matches!(app.mode, Mode::EditSeat(_)));
     assert!(app.status.contains("id de poste invalide"), "{}", app.status);
-    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Esc); // des changements seraient perdus : vérification
+    assert!(matches!(app.mode, Mode::EditSeat(_)));
+    press(&mut app, KeyCode::Char('o'));
     assert!(matches!(app.mode, Mode::Normal));
     let c = Company::load(&app.root.join(".claude/companies/acme.toml")).unwrap();
     assert_eq!(c.seats.len(), 3);
@@ -1252,8 +1387,13 @@ fn formulaire_de_poste_refuse_un_id_invalide_et_garde_le_formulaire() {
 fn formulaire_de_poste_renommer_met_a_jour_les_subordonnes() {
     let mut app = company_app();
     press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Esc); // on arrive dans la liste des entreprises : retour au graphe
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter); // entre dans la zone organigramme
     press(&mut app, KeyCode::Down); // cto
     press(&mut app, KeyCode::Char('e'));
+    press(&mut app, KeyCode::Char('1')); // édition simple
     assert!(screen(&app).contains("Éditer le poste"));
     for _ in 0..3 {
         press(&mut app, KeyCode::Backspace);
@@ -1272,8 +1412,13 @@ fn formulaire_de_poste_renommer_met_a_jour_les_subordonnes() {
 fn le_superieur_ne_peut_pas_etre_un_descendant() {
     let mut app = company_app();
     press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Esc); // on arrive dans la liste des entreprises : retour au graphe
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter); // entre dans la zone organigramme
     press(&mut app, KeyCode::Down); // cto
     press(&mut app, KeyCode::Char('e'));
+    press(&mut app, KeyCode::Char('1')); // édition simple
     let Mode::EditSeat(form) = &app.mode else { panic!() };
     let Field::Choice { options, .. } = &form.fields[4] else { panic!() };
     assert_eq!(options, &vec!["ceo".to_string()]);
@@ -1283,6 +1428,10 @@ fn le_superieur_ne_peut_pas_etre_un_descendant() {
 fn retirer_un_poste_fait_remonter_ses_subordonnes() {
     let mut app = company_app();
     press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Esc); // on arrive dans la liste des entreprises : retour au graphe
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter); // entre dans la zone organigramme
     press(&mut app, KeyCode::Down); // cto
     press(&mut app, KeyCode::Char('x'));
     assert!(screen(&app).contains("Supprimer le poste"));
@@ -1299,10 +1448,116 @@ fn retirer_un_poste_fait_remonter_ses_subordonnes() {
 fn le_boss_avec_subordonnes_ne_se_retire_pas() {
     let mut app = company_app();
     press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Esc); // on arrive dans la liste des entreprises : retour au graphe
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Char('x'));
     press(&mut app, KeyCode::Char('y'));
     assert!(app.status.contains("boss"), "{}", app.status);
     assert_eq!(Company::load(&app.root.join(".claude/companies/acme.toml")).unwrap().seats.len(), 3);
+}
+
+#[test]
+fn suppression_de_poste_refusee_puis_acceptee() {
+    let mut app = company_app();
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Esc); // on arrive dans la liste des entreprises : retour au graphe
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let row = {
+        let c = app.companies[0].parsed.as_ref().unwrap();
+        c.tree_rows().iter().position(|r| c.seats[r.idx].id == "dev").unwrap()
+    };
+    app.seat_sel = row;
+    press(&mut app, KeyCode::Char('x'));
+    assert!(screen(&app).contains("Supprimer le poste « Backend Engineer » ? (o/n)"));
+    press(&mut app, KeyCode::Char('n'));
+    assert_eq!(app.status, "Annulé.");
+    assert_eq!(Company::load(&app.root.join(".claude/companies/acme.toml")).unwrap().seats.len(), 3);
+    press(&mut app, KeyCode::Char('x'));
+    press(&mut app, KeyCode::Char('o'));
+    let c = Company::load(&app.root.join(".claude/companies/acme.toml")).unwrap();
+    assert_eq!(c.seats.len(), 2);
+    assert!(c.index_of("dev").is_none());
+    assert!(app.status.contains("supprimé"), "{}", app.status);
+}
+
+#[test]
+fn suppression_d_agent_liste_les_postes_qui_l_utilisent() {
+    let mut app = company_app();
+    app.agent_sel = app.agents.iter().position(|a| a.name == "poete").unwrap();
+    press(&mut app, KeyCode::Char('D'));
+    let s = screen(&app);
+    assert!(s.contains("Postes utilisant cet agent") && s.contains("acme · cto") && s.contains("acme · dev"), "{s}");
+    press(&mut app, KeyCode::Char('n'));
+    assert!(app.root.join(".claude/agents/poete.md").exists());
+    assert_eq!(app.status, "Annulé.");
+}
+
+#[test]
+fn renommage_d_agent_met_a_jour_les_postes() {
+    let mut app = company_app();
+    app.agent_sel = app.agents.iter().position(|a| a.name == "poete").unwrap();
+    press(&mut app, KeyCode::Char('e'));
+    press(&mut app, KeyCode::Char('1')); // édition simple
+    for _ in 0..5 {
+        press(&mut app, KeyCode::Backspace);
+    }
+    type_str(&mut app, "poesie");
+    app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    assert!(app.root.join(".claude/agents/poesie.md").exists());
+    assert!(app.status.contains("postes mis à jour") && app.status.contains("acme · cto"), "{}", app.status);
+    assert!(app.seats_using_agent("poete").is_empty());
+    assert!(app.seats_using_agent("poesie").len() >= 2, "les liaisons suivent le nouveau nom");
+    let c = app.companies[0].parsed.as_ref().unwrap();
+    assert!(c.validate(&app.agents.iter().map(|a| a.name.clone()).collect::<Vec<_>>()).is_ok(), "organigramme toujours valide");
+}
+
+#[test]
+fn relance_qui_ecraserait_le_plan_demande_confirmation() {
+    let root = tmp_root();
+    let dir = crate::runtime::missions::create(&root, &crate::runtime::missions::new_id(1)).unwrap();
+    crate::runtime::missions::write_output(&dir, "brief.md", "# Chantier\nfaire X").unwrap();
+    crate::runtime::missions::write_output(&dir, "conception.md", "plan").unwrap();
+    crate::runtime::missions::write_output(&dir, "rapport.md", "fin").unwrap();
+    write_agent(&root, "boss");
+    write_agent(&root, "poete");
+    std::fs::create_dir_all(root.join(".claude/companies")).unwrap();
+    std::fs::write(root.join(".claude/companies/acme.toml"), ACME).unwrap();
+    let mut app = new_app(&root);
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Char('R'));
+    assert!(matches!(app.mode, Mode::ConfirmAction(PendingAction::StartMission(..))));
+    assert!(screen(&app).contains("Relancer « Chantier » depuis le début ?"));
+    press(&mut app, KeyCode::Char('n'));
+    assert_eq!(app.status, "Annulé.");
+    assert!(app.run.is_none(), "refus : aucun run, le plan et le rapport restent");
+    assert!(dir.join("rapport.md").exists());
+}
+
+#[test]
+fn point_de_controle_ne_repond_que_sur_l_onglet_run() {
+    let (mut app, mut rx) = checkpoint_app();
+    // Sur l'onglet Run, un chiffre nu reste au point de contrôle ; F2 (raccourci global) quitte l'onglet.
+    press(&mut app, KeyCode::Char('2'));
+    assert_eq!(app.tab, Tab::Run);
+    press(&mut app, KeyCode::F(2));
+    assert_eq!(app.tab, Tab::Company);
+    assert!(!screen(&app).contains("Plan consolidé"), "le plan n'est affiché que sur l'onglet Run");
+    press(&mut app, KeyCode::Enter); // sur l'onglet Entreprise, Entrée n'arbitre pas le plan
+    assert!(app.checkpoint.is_some() && rx.try_recv().is_err());
+    press(&mut app, KeyCode::F(3));
+    assert!(screen(&app).contains("Plan consolidé"));
+}
+
+#[test]
+fn session_claude_deja_ouverte_renvoie_vers_l_onglet_5() {
+    let (mut app, _rx) = term_app("sleep 30");
+    app.assistant_request = Some((AssistantKind::Agent, vec!["x".into()]));
+    app.launch_pending();
+    assert!(app.status.contains("onglet 5"), "{}", app.status);
 }
 
 #[test]
@@ -1313,9 +1568,18 @@ fn ouvrir_une_ancienne_mission() {
     crate::runtime::missions::write_output(&dir, "rapport.md", "tout est fait").unwrap();
     let mut app = new_app(&root);
     press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Enter); // entre dans la zone missions
     press(&mut app, KeyCode::Enter);
     let s = screen(&app);
     assert!(s.contains("Vieux chantier") && s.contains("faire X") && s.contains("tout est fait"));
+    press(&mut app, KeyCode::Char('d')); // discuter du compte rendu
+    assert!(app.mission_view.is_none());
+    let (kind, args) = app.assistant_request.take().expect("session de debrief demandée");
+    assert!(matches!(kind, AssistantKind::Debrief));
+    assert!(args.iter().any(|a| a.contains("compte-rendu.md") && a.contains("actions.md")) && args.contains(&"plan".to_string()));
+    assert!(args.iter().any(|a| a.contains("EXISTING company") && a.contains("New company guide") && a.contains("acme.toml")));
+    press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Esc);
     assert!(app.mission_view.is_none());
 }
@@ -1425,4 +1689,317 @@ fn pump_until(app: &mut App, rx: &mut mpsc::UnboundedReceiver<AppEvent>, what: &
 
 fn ctrl_s(app: &mut App) {
     app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    press(app, KeyCode::Char('o')); // vérification avant d'enregistrer
+}
+
+#[test]
+fn zones_entreprise_entrer_et_sortir() {
+    use super::app::CompZone;
+    let mut app = company_app();
+    press(&mut app, KeyCode::Char('2'));
+    assert_eq!((app.zone, app.zone_in), (CompZone::Companies, true), "on arrive directement dans la liste des entreprises");
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Left);
+    assert_eq!(app.zone, CompZone::Companies);
+    press(&mut app, KeyCode::Right);
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.zone, CompZone::Graph);
+    // Hors zone, les flèches ne déplacent pas la sélection du graphe.
+    assert_eq!(app.seat_sel, 0);
+    press(&mut app, KeyCode::Enter);
+    assert!(app.zone_in);
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.seat_sel, 1);
+    assert_eq!(app.zone, CompZone::Graph);
+    press(&mut app, KeyCode::Esc);
+    assert!(!app.zone_in);
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.zone, CompZone::Missions);
+}
+
+
+#[test]
+fn resume_depliable_dune_mission() {
+    let mut app = company_app();
+    write_brief(&app.root, "0000000000001-aaaa", "# Accueil\n## Objectif\nRefaire l'accueil\n## Contexte\nx\n");
+    let dir = crate::runtime::missions::dir_of(&app.root, "0000000000001-aaaa");
+    crate::runtime::missions::write_output(&dir, "rapport.md", "# Rapport\n## Conclusion\nPage livrée.\n## Réalisé\n- `src/tui/ui.rs:12` modifié\n- README.md").unwrap();
+    app.reload();
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Enter);
+    assert!(!screen(&app).contains("Refaire l'accueil"), "replié par défaut");
+    press(&mut app, KeyCode::Right);
+    let s = screen(&app);
+    assert!(s.contains("Refaire l'accueil") && s.contains("src/tui/ui.rs") && s.contains("README.md") && s.contains("Page livrée"), "{s}");
+    press(&mut app, KeyCode::Left);
+    assert!(!screen(&app).contains("Refaire l'accueil"));
+    press(&mut app, KeyCode::Char(' '));
+    assert!(screen(&app).contains("Refaire l'accueil"), "Espace bascule");
+}
+
+fn screen_size(app: &App, w: u16, h: u16) -> String {
+    let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+    t.draw(|f| draw(f, app)).unwrap();
+    let buf = t.backend().buffer().clone();
+    (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>()).collect::<Vec<_>>().join("\n")
+}
+
+#[test]
+fn formulaire_de_poste_defile_dans_un_petit_terminal() {
+    let mut app = company_app();
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Esc); // on arrive dans la liste des entreprises : retour au graphe
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Down); // cto
+    press(&mut app, KeyCode::Char('e'));
+    press(&mut app, KeyCode::Char('1')); // édition simple
+    // Terminal bas : 4 champs visibles au plus, le dernier (commandes) est hors écran au départ.
+    let s = screen_size(&app, 100, 16);
+    assert!(s.contains("Éditer le poste") && s.contains("Id (lettres"), "{s}");
+    assert!(!s.contains("Commandes shell autorisées"), "{s}");
+    // ↓ jusqu'au dernier champ : il devient visible, le premier disparaît, la barre est dessinée.
+    for _ in 0..7 {
+        press(&mut app, KeyCode::Down);
+    }
+    let Mode::EditSeat(form) = &app.mode else { panic!() };
+    assert_eq!(form.focus, 7);
+    assert!(screen_size(&app, 100, 16).contains("Valider les changements"), "boutons toujours visibles");
+    let s = screen_size(&app, 100, 16);
+    assert!(s.contains("Commandes shell autorisées"), "{s}");
+    assert!(!s.contains("Id (lettres"), "{s}");
+    assert!(s.contains('█') || s.contains('║') || s.contains('▐'), "barre de défilement absente : {s}");
+    // Les boutons sont les deux derniers arrêts : ↓ n'ira pas plus loin que Annuler.
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    let Mode::EditSeat(form) = &app.mode else { panic!() };
+    assert_eq!(form.focus, 9);
+    // Annuler sans changement : ferme sans demander.
+    press(&mut app, KeyCode::Enter);
+    assert!(matches!(app.mode, Mode::Normal), "{}", app.status);
+}
+
+#[test]
+fn formulaire_de_poste_boutons_valider_et_annuler_demandent_verification() {
+    let open = || {
+        let mut app = company_app();
+        press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Esc); // on arrive dans la liste des entreprises : retour au graphe
+    press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Down); // cto
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Char('1')); // édition simple
+        app
+    };
+    let to_buttons = |app: &mut App| {
+        for _ in 0..7 {
+            press(app, KeyCode::Down);
+        }
+    };
+    let title = |app: &App| Company::load(&app.root.join(".claude/companies/acme.toml")).unwrap().seats.iter().find(|s| s.id == "cto").unwrap().title.clone();
+
+    // Valider : demande, « autre touche » revient au formulaire sans rien écrire.
+    let mut app = open();
+    let before = title(&app);
+    press(&mut app, KeyCode::Down); // intitulé
+    type_str(&mut app, "!");
+    to_buttons(&mut app);
+    press(&mut app, KeyCode::Enter);
+    let Mode::EditSeat(form) = &app.mode else { panic!() };
+    assert_eq!(form.confirm, Some(true));
+    assert!(screen_size(&app, 100, 30).contains("Enregistrer ces changements ?"));
+    press(&mut app, KeyCode::Char('n'));
+    assert!(matches!(app.mode, Mode::EditSeat(_)));
+    assert_eq!(title(&app), before, "rien d'écrit sans confirmation");
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('o'));
+    assert!(matches!(app.mode, Mode::Normal), "{}", app.status);
+    assert_eq!(title(&app), format!("{before}!"));
+
+    // Annuler : demande aussi, « o » abandonne.
+    let mut app = open();
+    let before = title(&app);
+    press(&mut app, KeyCode::Down);
+    type_str(&mut app, "!");
+    to_buttons(&mut app);
+    press(&mut app, KeyCode::Right); // Valider → Annuler
+    press(&mut app, KeyCode::Enter);
+    assert!(screen_size(&app, 100, 30).contains("Abandonner les changements ?"));
+    press(&mut app, KeyCode::Char('o'));
+    assert!(matches!(app.mode, Mode::Normal));
+    assert_eq!(title(&app), before);
+
+    // Échap avec des changements demande aussi ; sans changement, ferme directement.
+    let mut app = open();
+    press(&mut app, KeyCode::Esc);
+    assert!(matches!(app.mode, Mode::Normal));
+}
+
+
+#[test]
+fn e_propose_edition_simple_ou_avec_le_modele() {
+    let mut app = company_app();
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Esc); // on arrive dans la liste des entreprises : retour au graphe
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('e'));
+    assert!(matches!(app.mode, Mode::ChooseEdit(_)), "le choix s'affiche");
+    assert!(screen(&app).contains("Avec le modèle"));
+    // Échap annule.
+    press(&mut app, KeyCode::Esc);
+    assert!(matches!(app.mode, Mode::Normal));
+    // 2 : conversation avec le modèle sur le fichier de l'entreprise.
+    press(&mut app, KeyCode::Char('e'));
+    press(&mut app, KeyCode::Right);
+    press(&mut app, KeyCode::Enter);
+    let (kind, args) = app.assistant_request.take().expect("conversation demandée");
+    assert_eq!(kind, AssistantKind::Edit);
+    assert!(args.iter().any(|a| a.contains("acme.toml")));
+    assert!(args.contains(&"plan".to_string()));
+    // 1 : le formulaire de poste.
+    press(&mut app, KeyCode::Char('e'));
+    press(&mut app, KeyCode::Char('1'));
+    assert!(matches!(app.mode, Mode::EditSeat(_)));
+}
+
+// ─── Étape A : tests de caractérisation ───────────────────────────────────────
+// Un test `characterize_*` fige le comportement ACTUEL. Quand il documente un bug, il réussit tant que le bug existe ;
+// après correctif (étape B), son assertion est basculée vers le comportement attendu, indiqué en commentaire.
+
+/// E1 : la portée d'écriture n'exclut pas `.claude` ni `.git/hooks` à n'importe quelle profondeur.
+#[test]
+fn characterize_e1_portee_n_exclut_pas_claude_ni_git_hooks_profonds() {
+    use crate::runtime::scope::{is_sensitive, write_rules};
+    let motif = |s: &str| vec![s.to_string()];
+    // Comportement actuel, attendu après correctif : aucune règle d'écriture pour `**/.claude` (réservé à toute profondeur).
+    assert_eq!(write_rules(&motif("**/.claude/**")), vec!["Edit(**/.claude/**)", "Write(**/.claude/**)"]);
+    // Comportement actuel, attendu après correctif : `src/.git/hooks/**` est réservé comme `.git/hooks/**`.
+    assert!(!is_sensitive("src/.git/hooks/pre-commit"));
+    assert!(!write_rules(&motif("src/.git/hooks/**")).is_empty());
+}
+
+/// R2 : un résultat `claude` dont `is_error` est absent du JSON est traité comme un succès.
+#[test]
+fn characterize_r2_resultat_sans_is_error_compte_comme_succes() {
+    use crate::runtime::claude_proc::parse_line;
+    // Comportement actuel, attendu après correctif : un sous-type d'erreur (`error_max_turns`) donne `is_error: true`.
+    let evs = parse_line(r#"{"type":"result","subtype":"error_max_turns","result":""}"#).unwrap();
+    assert!(matches!(&evs[0], ClaudeEvent::Result { is_error: false, .. }), "{evs:?}");
+}
+
+/// R1 : une ligne stream-json invalide est ignorée sans aucun événement d'erreur.
+#[tokio::test]
+async fn characterize_r1_ligne_stream_invalide_ignoree_en_silence() {
+    use crate::runtime::claude_proc::{ClaudeProc, RunSpec};
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c").arg(r#"echo 'pas du json {'; echo '{"type":"result","result":"fin","is_error":false}'"#);
+    let spec = RunSpec { cwd: std::env::temp_dir(), ..Default::default() };
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut p = ClaudeProc::spawn_with(cmd, &spec, tx).unwrap();
+    let mut recus = vec![];
+    while let Some(e) = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await.unwrap() {
+        recus.push(e);
+    }
+    p.wait().await.unwrap();
+    // Comportement actuel, attendu après correctif : un événement d'erreur signale la ligne invalide avant le résultat.
+    assert_eq!(recus.len(), 1, "{recus:?}");
+    assert!(matches!(&recus[0], ClaudeEvent::Result { text, .. } if text == "fin"));
+}
+
+/// M1 : un identifiant de mission dupliqué ne provoque ni boucle ni erreur de parcours (délai maximal 5 s).
+#[test]
+fn characterize_m1_id_mission_duplique_sans_boucle() {
+    use crate::runtime::missions::{create, list, new_id, write_output};
+    let root = tmp_root();
+    let id = new_id(42);
+    let d1 = create(&root, &id).unwrap();
+    write_output(&d1, "brief.md", "# Premier").unwrap();
+    // Comportement actuel : `create` sur un identifiant existant réussit (écrasement silencieux possible).
+    // Attendu après correctif : erreur, ou identifiant unique généré.
+    let d2 = create(&root, &id).unwrap();
+    write_output(&d2, "brief.md", "# Second").unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let racine = root.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(list(&racine).len());
+    });
+    let n = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("list() ne termine pas");
+    assert_eq!(n, 1, "une seule mission visible pour un id dupliqué");
+}
+
+/// ident : `write_atomic` ne met pas les permissions 0600 (contrairement à `store::write_private`).
+#[cfg(unix)]
+#[test]
+fn characterize_ident_write_atomic_ne_met_pas_0600() {
+    use crate::model::ident::write_atomic;
+    use std::os::unix::fs::PermissionsExt;
+    let root = tmp_root();
+    let f = root.join("identite.toml");
+    write_atomic(&f, "x = 1\n").unwrap();
+    let mode = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
+    // Comportement actuel (umask courant, ex. 0644), attendu après correctif : 0600 pour un fichier d'identité.
+    assert_ne!(mode, 0o600, "mode actuel {mode:o}");
+    assert!(mode & 0o044 != 0, "mode {mode:o} (un umask 077 rendrait ce test sans objet)");
+}
+
+/// E07 : un agent identifié par `name` est résolu vers le premier fichier trié, et non vers `<name>.md` écrit par `save`.
+#[test]
+fn characterize_e07_agent_par_name_resolu_vers_mauvais_fichier() {
+    use crate::model::agent::load_all;
+    let root = tmp_root();
+    let dir = root.join(".claude/agents");
+    let fm = |prompt: &str| format!("---\nname: cible\ndescription: d\nmodel: haiku\n---\n\n{prompt}\n");
+    std::fs::write(dir.join("a-fichier.md"), fm("PROMPT-ANCIEN")).unwrap();
+    std::fs::write(dir.join("cible.md"), fm("PROMPT-ECRIT-PAR-SAVE")).unwrap();
+    let agents = load_all(&root);
+    let a = agents.iter().find(|a| a.name == "cible").expect("agent « cible » chargé");
+    // Comportement actuel, attendu après correctif : `cible.md` (fichier écrit par `save`) prime, ou le doublon est signalé.
+    assert!(a.prompt.contains("PROMPT-ANCIEN"), "prompt chargé : {:?}", a.prompt);
+}
+
+/// R4 (HYPOTHÈSE) : `ClaudeProc::kill` ne tue que le processus direct ; un sous-processus survit à l'annulation.
+/// Faux `claude` placé en tête du PATH : il lance `sleep 60` en arrière-plan puis attend.
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "HYPOTHÈSE R4 : vérifie la survie d'un sous-processus après annulation"]
+async fn characterize_r4_descendants_survivent_a_l_annulation() {
+    use crate::runtime::claude_proc::{ClaudeProc, RunSpec};
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp_root();
+    let script = dir.join("claude");
+    let pidfile = dir.join("pid");
+    let corps = "#!/bin/sh\nsleep 60 &\necho $! > \"$ESSAIM_TEST_PIDFILE\"\necho '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"model\":\"m\",\"apiKeySource\":\"none\"}'\nwait\n";
+    std::fs::write(&script, corps).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default());
+    let mut cmd = tokio::process::Command::new("claude");
+    cmd.env("PATH", path).env("ESSAIM_TEST_PIDFILE", &pidfile);
+    let spec = RunSpec { cwd: dir.clone(), ..Default::default() };
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut p = ClaudeProc::spawn_with(cmd, &spec, tx).unwrap();
+    let mut pid = String::new();
+    for _ in 0..100 {
+        if let Ok(s) = std::fs::read_to_string(&pidfile) {
+            if !s.trim().is_empty() {
+                pid = s.trim().to_string();
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(!pid.is_empty(), "pid du sous-processus non écrit");
+    p.kill().await.unwrap();
+    p.wait().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let vivant = std::process::Command::new("kill").args(["-0", &pid]).status().map(|s| s.success()).unwrap_or(false);
+    let _ = std::process::Command::new("kill").arg(&pid).status(); // nettoyage
+    eprintln!("[R4] sous-processus {pid} : {}", if vivant { "CONFIRMÉE (survit à l'annulation)" } else { "INFIRMÉE" });
+    assert!(vivant, "sous-processus {pid} tué par l'annulation : hypothèse R4 infirmée");
 }

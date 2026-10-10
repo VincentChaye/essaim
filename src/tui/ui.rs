@@ -1,13 +1,13 @@
 use super::settings::{Lang, tr};
 use crate::tf;
-use super::app::{App, form_labels, Field, Mode, NodeState, RunView, Tab};
+use super::app::{App, form_labels, Field, Mode, NodeState, PendingAction, RunView, Tab};
 use crate::runtime::executor::NodeStatus;
 use crate::runtime::sessions::{Phase, Session};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Tabs, Wrap};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -79,12 +79,12 @@ pub fn draw(f: &mut Frame, app: &App) {
         f.render_widget(Clear, area);
         let block = Block::bordered()
             .title(tf!(" Mission · {} ", " Mission · {} ", v.title))
-            .title_bottom(tr(" ↑↓ défiler · espace/b page · g début · Échap : fermer ", " ↑↓ scroll · space/b page · g top · Esc: close "))
+            .title_bottom(tr(" d discuter du compte rendu avec le modèle · ↑↓ défiler · espace/b page · Échap : fermer ", " d discuss the report with the model · ↑↓ scroll · space/b page · Esc: close "))
             .border_style(Style::new().fg(Color::Cyan));
-        f.render_widget(Paragraph::new(v.text.clone()).wrap(Wrap { trim: false }).scroll((v.scroll, 0)).block(block), area);
+        f.render_widget(Paragraph::new(v.text.clone()).scroll((v.scroll, 0)).block(block), area);
     }
 
-    if let Some(cp) = app.checkpoint.as_ref().filter(|_| app.tab != Tab::Terminal) {
+    if let Some(cp) = app.checkpoint.as_ref().filter(|_| app.tab == Tab::Run) {
         let area = centered(f.area(), 88, (f.area().height * 8 / 10).max(10));
         f.render_widget(Clear, area);
         let block = Block::bordered()
@@ -101,40 +101,40 @@ pub fn draw(f: &mut Frame, app: &App) {
     match &app.mode {
         Mode::EditAgent(form) => draw_form(f, form),
         Mode::EditSeat(form) => draw_seat_form(f, form),
-        Mode::ConfirmDeleteSeat(_, _, title) => {
-            let area = centered(f.area(), 60, 5);
+        Mode::ChooseEdit(c) => {
+            let area = centered(f.area(), 70, 8);
             f.render_widget(Clear, area);
-            f.render_widget(
-                Paragraph::new(tf!("Supprimer le poste « {title} » ? Ses subordonnés remontent d'un cran.\n\n y = oui   autre touche = non", "Delete the seat \"{title}\"? Its subordinates move up one level.\n\n y = yes   any other key = no"))
-                    .wrap(Wrap { trim: false })
-                    .block(Block::bordered().title(tr(" Confirmation ", " Confirmation ")).border_style(Style::new().fg(Color::Red))),
-                area,
-            );
-        }
-        Mode::ConfirmDelete(name) => {
-            let area = centered(f.area(), 50, 5);
-            f.render_widget(Clear, area);
-            f.render_widget(
-                Paragraph::new(tf!("Supprimer l'agent « {name} » ?\n\n y = oui   autre touche = non", "Delete the agent \"{name}\"?\n\n y = yes   any other key = no"))
-                    .block(Block::bordered().title(tr(" Confirmation ", " Confirmation ")).border_style(Style::new().fg(Color::Red))),
-                area,
-            );
-        }
-        Mode::ConfirmRemoveSession(_, name) => {
-            let area = centered(f.area(), 60, 5);
-            f.render_widget(Clear, area);
-            f.render_widget(
-                Paragraph::new(tf!("Supprimer la session « {name} » et son historique ?\n\n y = oui   autre touche = non", "Delete the session \"{name}\" and its history?\n\n y = yes   any other key = no"))
-                    .block(Block::bordered().title(tr(" Confirmation ", " Confirmation ")).border_style(Style::new().fg(Color::Red))),
-                area,
-            );
+            let btn = |i: usize, text: &str| {
+                let st = if c.sel == i { Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD) } else { Style::new() };
+                Span::styled(format!("[ {text} ]"), st)
+            };
+            let lines = vec![
+                Line::from(tf!("Modifier {} :", "Edit {}:", c.label)),
+                Line::raw(""),
+                Line::from(vec![btn(0, tr("1 Édition simple", "1 Simple edit")), Span::raw("   "), btn(1, tr("2 Avec le modèle", "2 With the model"))]).centered(),
+                Line::raw(""),
+                Line::from(Span::styled(
+                    tr("simple : formulaire ou $EDITOR · modèle : conversation avec Claude (mode plan)", "simple: form or $EDITOR · model: conversation with Claude (plan mode)"),
+                    Style::new().fg(Color::DarkGray),
+                )),
+                Line::from(tr("←→ choisir · Entrée valider · Échap annuler", "←→ pick · Enter confirm · Esc cancel")),
+            ];
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::bordered().title(tr(" Mode d'édition ", " Edit mode ")).border_style(Style::new().fg(Color::Cyan))), area);
         }
         Mode::ConfirmAction(a) => {
-            let area = centered(f.area(), 60, 5);
+            let users = match a {
+                PendingAction::DeleteAgent(name) => app.seats_using_agent(name),
+                _ => vec![],
+            };
+            let mut text = format!("{}\n", a.question());
+            if let Some(d) = a.detail(&users) {
+                text.push_str(&format!("{d}\n"));
+            }
+            text.push_str(tr("\no = oui · autre touche = non", "\ny = yes · any other key = no"));
+            let area = centered(f.area(), 70, 7);
             f.render_widget(Clear, area);
             f.render_widget(
-                Paragraph::new(format!("{}\n\n{}", a.question(), tr(" y = oui   autre touche = non", " y = yes   any other key = no")))
-                    .block(Block::bordered().title(tr(" Confirmation ", " Confirmation ")).border_style(Style::new().fg(Color::Red))),
+                Paragraph::new(text).wrap(Wrap { trim: false }).block(Block::bordered().title(tr(" Confirmation ", " Confirmation ")).border_style(Style::new().fg(Color::Red))),
                 area,
             );
         }
@@ -171,17 +171,18 @@ fn help_text(app: &App) -> &'static str {
     }
     match (&app.mode, app.tab) {
         (Mode::EditAgent(_), _) => "Tab champ suivant · ←→ choisir le modèle · Ctrl+S enregistrer · Esc annuler",
-        (Mode::EditSeat(_), _) => "Tab champ suivant · ←→ choisir · Ctrl+S enregistrer · Esc annuler",
-        (Mode::ConfirmDelete(_) | Mode::ConfirmDeleteSeat(..) | Mode::ConfirmRemoveSession(..) | Mode::ConfirmAction(_), _) => "y confirmer · autre touche annuler",
+        (Mode::EditSeat(_), _) => "↑↓/Tab changer de champ · ←→ choisir · Entrée sur un bouton · Ctrl+S enregistrer · Esc annuler",
+        (Mode::ChooseEdit(_), _) => "←→ choisir · 1 simple · 2 avec le modèle · Entrée valider · Échap annuler",
+        (Mode::ConfirmAction(_), _) => "o confirmer · autre touche (n, Échap) annuler",
         (_, Tab::Agents) => "↑↓ choisir · n créer avec l'assistant · N formulaire · e éditer · D supprimer · q quitter",
-        (_, Tab::Company) => "↑↓ poste · a ajouter · e éditer · x retirer · n créer une entreprise · m cadrer une mission · t/T mission · Entrée ouvrir · r lancer · c/C entreprise · E éditer · q quitter",
+        (_, Tab::Company) => "←↑↓→ zones · Entrée entrer · Échap sortir · dans une zone : e éditer (a ajouter · x retirer dans l'organigramme) · r lancer · Ctrl+K toutes les touches",
         (_, Tab::Run) if app.show_history => "↑↓ choisir · Entrée ouvrir · D supprimer · h retour · Tab onglet · q quitter",
         (_, Tab::Run) => "↑↓ nœud · s annuler le run · h historique · Tab onglet · q quitter",
         (_, Tab::Terminal) => match &app.term {
             None => "n dans Agents ou Entreprise ouvre un assistant ici · Tab onglet · q quitter",
             Some(t) if t.exited => "session terminée — appuyez sur une touche pour fermer",
             Some(_) if app.term_focus => "F1-F5 / Alt+1-5 / Ctrl+PgUp-PgDn : changer d'onglet · Ctrl+\\ : touches de navigation",
-            Some(_) => "Entrée reprendre la session · x fermer · Tab / F1-F5 onglet · q quitter",
+            Some(_) => "Entrée reprendre la session · x terminer · Tab / F1-F5 onglet · q quitter",
         },
         (_, Tab::Sessions) => "↑↓ choisir · a attacher · s arrêter · x supprimer · r rafraîchir · Tab onglet · q quitter",
     }
@@ -190,17 +191,18 @@ fn help_text(app: &App) -> &'static str {
 fn help_text_en(app: &App) -> &'static str {
     match (&app.mode, app.tab) {
         (Mode::EditAgent(_), _) => "Tab next field · ←→ pick model · Ctrl+S save · Esc cancel",
-        (Mode::EditSeat(_), _) => "Tab next field · ←→ pick · Ctrl+S save · Esc cancel",
-        (Mode::ConfirmDelete(_) | Mode::ConfirmDeleteSeat(..) | Mode::ConfirmRemoveSession(..) | Mode::ConfirmAction(_), _) => "y confirm · any other key cancels",
+        (Mode::EditSeat(_), _) => "↑↓/Tab change field · ←→ pick · Enter on a button · Ctrl+S save · Esc cancel",
+        (Mode::ChooseEdit(_), _) => "←→ pick · 1 simple · 2 with the model · Enter confirm · Esc cancel",
+        (Mode::ConfirmAction(_), _) => "y confirm · any other key (n, Esc) cancels",
         (_, Tab::Agents) => "↑↓ pick · n create with assistant · N form · e edit · D delete · q quit",
-        (_, Tab::Company) => "↑↓ seat · a add · e edit · x remove · n new company · m frame a mission · t/T mission · Enter open · r run · c/C company · E edit · q quit",
+        (_, Tab::Company) => "←↑↓→ zones · Enter enter · Esc leave · in a zone: e edit (a add · x remove in the org chart) · r run · Ctrl+K all keys",
         (_, Tab::Run) if app.show_history => "↑↓ pick · Enter open · D delete · h back · Tab tab · q quit",
         (_, Tab::Run) => "↑↓ node · s cancel run · h history · Tab tab · q quit",
         (_, Tab::Terminal) => match &app.term {
             None => "n in Agents or Company opens an assistant here · Tab tab · q quit",
             Some(t) if t.exited => "session ended — press any key to close",
             Some(_) if app.term_focus => "F1-F5 / Alt+1-5 / Ctrl+PgUp-PgDn: switch tab · Ctrl+\\: navigation keys",
-            Some(_) => "Enter resume session · x close · Tab / F1-F5 tab · q quit",
+            Some(_) => "Enter resume session · x end · Tab / F1-F5 tab · q quit",
         },
         (_, Tab::Sessions) => "↑↓ pick · a attach · s stop · x delete · r refresh · Tab tab · q quit",
     }
@@ -242,7 +244,8 @@ fn draw_agents(f: &mut Frame, area: Rect, app: &App) {
             v
         }
     };
-    f.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }).block(Block::bordered().title(tr(" Détail ", " Details "))), right);
+    let block = Block::bordered().title(tr(" Détail ", " Details "));
+    f.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }).block(block), right);
 }
 
 fn field_line(k: &str, v: &str) -> Line<'static> {
@@ -285,20 +288,47 @@ fn choice_widget<'a>(options: &[String], idx: usize, focused: bool, title: &'a s
 }
 
 fn draw_seat_form(f: &mut Frame, form: &super::app::SeatForm) {
-    let area = centered(f.area(), 80, (form.fields.len() as u16 * 3 + 2).min(f.area().height));
+    // Champs (3 lignes chacun) + pied : boutons et ligne de vérification.
+    let area = centered(f.area(), 80, (form.fields.len() as u16 * 3 + 2 + 3).min(f.area().height));
     f.render_widget(Clear, area);
     let title = if form.original.is_some() { tr(" Éditer le poste ", " Edit seat ") } else { tr(" Nouveau poste ", " New seat ") };
     let outer = Block::bordered().title(title).border_style(Style::new().fg(Color::Cyan));
-    let inner = outer.inner(area);
+    let full = outer.inner(area);
     f.render_widget(outer, area);
-    let rows = Layout::vertical(vec![Constraint::Length(3); form.fields.len()]).split(inner);
-    for (i, field) in form.fields.iter().enumerate() {
+    let [inner, footer] = Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).areas(full);
+    // Fenêtre défilante : le champ ciblé reste visible, une barre à droite indique la position.
+    let total = form.fields.len();
+    let visible = ((inner.height / 3) as usize).clamp(1, total);
+    let focus_field = form.focus.min(total - 1);
+    let first = (focus_field + 1).saturating_sub(visible).min(total - visible);
+    let body = Rect { width: inner.width.saturating_sub(1), ..inner };
+    let rows = Layout::vertical(vec![Constraint::Length(3); visible]).split(body);
+    for (slot, i) in (first..first + visible).enumerate() {
         let focused = form.focus == i;
-        match field {
-            Field::Text(b) => b.render(f, rows[i], &form.labels[i], focused),
-            Field::Choice { options, idx } => f.render_widget(choice_widget(options, *idx, focused, &form.labels[i], if i == 3 { tr("(modèle de l'agent)", "(agent's model)") } else { tr("(aucun : boss)", "(none: boss)") }), rows[i]),
+        match &form.fields[i] {
+            Field::Text(b) => b.render(f, rows[slot], &form.labels[i], focused),
+            Field::Choice { options, idx } => f.render_widget(choice_widget(options, *idx, focused, &form.labels[i], if i == 3 { tr("(modèle de l'agent)", "(agent's model)") } else { tr("(aucun : boss)", "(none: boss)") }), rows[slot]),
         }
     }
+    if visible < total {
+        let mut state = ScrollbarState::new(total - visible + 1).position(first);
+        f.render_stateful_widget(Scrollbar::new(ScrollbarOrientation::VerticalRight), inner, &mut state);
+    }
+    let btn = |label: &str, at: usize, color: Color| {
+        let st = if form.focus == at { Style::new().fg(Color::Black).bg(color).add_modifier(Modifier::BOLD) } else { Style::new().fg(color) };
+        Span::styled(format!(" [ {label} ] "), st)
+    };
+    let buttons = Line::from(vec![
+        btn(tr("Valider les changements", "Apply changes"), total, Color::Green),
+        Span::raw("  "),
+        btn(tr("Annuler", "Cancel"), total + 1, Color::Red),
+    ]);
+    let ask = match form.confirm {
+        Some(true) => Line::styled(tr("Enregistrer ces changements ? o = oui · autre touche = revenir", "Save these changes? o = yes · any other key = back"), Style::new().fg(Color::Yellow)),
+        Some(false) => Line::styled(tr("Abandonner les changements ? o = oui · autre touche = revenir", "Discard the changes? o = yes · any other key = back"), Style::new().fg(Color::Yellow)),
+        None => Line::raw(""),
+    };
+    f.render_widget(Paragraph::new(vec![Line::raw(""), buttons.centered(), ask.centered()]), footer);
 }
 
 fn status_span(state: &NodeState, tick: u64) -> Span<'static> {
@@ -345,7 +375,7 @@ fn draw_history(f: &mut Frame, area: Rect, app: &App) {
                 field_line(tr("Mission", "Mission"), &h.pipeline),
                 field_line("Date", &h.started_label()),
                 field_line(tr("Résultat", "Result"), etat),
-                field_line(tr("Coût notionnel", "Notional cost"), &format!("{:.4} $", h.cost_usd)),
+                field_line("Tokens", &h.tokens.to_string()),
                 Line::raw(""),
             ];
             for n in &h.nodes {
@@ -358,11 +388,12 @@ fn draw_history(f: &mut Frame, area: Rect, app: &App) {
                 v.push(Line::from(vec![Span::styled(icon, Style::new().fg(color)), Span::raw(format!(" {}{} [{}]", "  ".repeat(n.depth), if n.label.is_empty() { &n.id } else { &n.label }, n.agent))]));
             }
             v.push(Line::raw(""));
-            v.push(Line::styled(tr("Entrée : ouvrir le détail et les journaux", "Enter: open details and logs"), Style::new().fg(Color::DarkGray)));
+            v.push(Line::styled(tr("Entrée  le détail et les journaux", "Enter (left pane, once inside): open details and logs"), Style::new().fg(Color::DarkGray)));
             v
         }
     };
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::bordered().title(tr(" Aperçu ", " Preview "))), right);
+    let block = Block::bordered().title(tr(" Aperçu ", " Preview "));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block), right);
 }
 
 fn draw_run(f: &mut Frame, area: Rect, app: &App) {
@@ -383,12 +414,12 @@ fn draw_run(f: &mut Frame, area: Rect, app: &App) {
         Some(true) => (tr("terminé ✔", "done ✔").to_string(), Color::Green),
         Some(false) => (tr("terminé avec erreurs ✖", "done with errors ✖").to_string(), Color::Red),
     };
-    let cost: f64 = if run.finished.is_some() { run.cost } else { run.nodes.iter().map(|n| n.cost).sum() };
+    let tokens: u64 = if run.finished.is_some() { run.tokens } else { run.nodes.iter().map(|n| n.tokens).sum() };
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(format!("{} — ", run.name), Style::new().add_modifier(Modifier::BOLD)),
             Span::styled(label, Style::new().fg(color)),
-            Span::raw(tf!("   coût notionnel {cost:.4} $ (abonnement, non facturé)", "   notional cost {cost:.4} $ (subscription, not billed)")),
+            Span::raw(tf!("   {tokens} tokens", "   {tokens} tokens")),
         ]))
         .block(Block::bordered().title(" Run ")),
         head,
@@ -397,7 +428,7 @@ fn draw_run(f: &mut Frame, area: Rect, app: &App) {
     // Un run d'entreprise a des libellés indentés plus longs : colonne des nœuds élargie.
     let left_pct = if run.nodes.iter().any(|n| n.depth > 0) { 46 } else { 30 };
     let [left, right] = Layout::horizontal([Constraint::Percentage(left_pct), Constraint::Percentage(100 - left_pct)]).areas(main);
-    draw_nodes(f, left, run, app.tick);
+    draw_nodes(f, left, run, app);
     let log_block = Block::bordered().title(format!(" Journal : {} ", run.nodes.get(run.sel).map(|n| n.label.as_str()).unwrap_or("-")));
     let inner = log_block.inner(right);
     let lines: Vec<Line> = run.nodes.get(run.sel).map(|n| n.log.iter().map(|l| Line::raw(l.clone())).collect()).unwrap_or_default();
@@ -405,14 +436,8 @@ fn draw_run(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll, 0)).block(log_block), right);
 }
 
-/// Défilement pour suivre la fin d'un journal : on compte les lignes après retour à la ligne.
-fn tail_scroll(lines: &[Line], inner: Rect) -> u16 {
-    let w = inner.width.max(1) as usize;
-    let total: usize = lines.iter().map(|l| (l.width().max(1) + w - 1) / w).sum();
-    total.saturating_sub(inner.height as usize) as u16
-}
-
-fn draw_nodes(f: &mut Frame, area: Rect, run: &RunView, tick: u64) {
+fn draw_nodes(f: &mut Frame, area: Rect, run: &RunView, app: &App) {
+    let tick = app.tick;
     let items: Vec<ListItem> = run
         .nodes
         .iter()
@@ -449,6 +474,13 @@ fn phase_span(s: &Session, tick: u64) -> Span<'static> {
         Phase::Failed(_) => Span::styled("✖", Style::new().fg(Color::Red)),
         Phase::Other(_) => Span::styled("?", Style::new().fg(Color::Yellow)),
     }
+}
+
+/// Défilement pour suivre la fin d'un journal : on compte les lignes après retour à la ligne.
+fn tail_scroll(lines: &[Line], inner: Rect) -> u16 {
+    let w = inner.width.max(1) as usize;
+    let total: usize = lines.iter().map(|l| (l.width().max(1) + w - 1) / w).sum();
+    total.saturating_sub(inner.height as usize) as u16
 }
 
 fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {

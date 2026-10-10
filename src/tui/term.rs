@@ -95,12 +95,12 @@ impl TermSession {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         let reply = {
-                            let mut g = p.lock().unwrap();
+                            let mut g = p.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             g.process(&buf[..n]);
                             std::mem::take(&mut g.callbacks_mut().out)
                         };
                         if !reply.is_empty() {
-                            let mut w = reply_writer.lock().unwrap();
+                            let mut w = reply_writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             let _ = w.write_all(&reply);
                             let _ = w.flush();
                         }
@@ -133,7 +133,7 @@ impl TermSession {
 
     pub fn send(&mut self, bytes: &[u8]) {
         if !self.exited {
-            let mut w = self.writer.lock().unwrap();
+            let mut w = self.writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let _ = w.write_all(bytes);
             let _ = w.flush();
         }
@@ -146,7 +146,7 @@ impl TermSession {
         }
         self.size = (rows, cols);
         let _ = self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
-        self.parser.lock().unwrap().screen_mut().set_size(rows, cols);
+        self.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner).screen_mut().set_size(rows, cols);
     }
 
     pub fn size(&self) -> (u16, u16) {
@@ -168,7 +168,7 @@ impl TermSession {
     }
 
     pub fn with_screen<R>(&self, f: impl FnOnce(&vt100::Screen) -> R) -> R {
-        f(self.parser.lock().unwrap().screen())
+        f(self.parser.lock().unwrap_or_else(std::sync::PoisonError::into_inner).screen())
     }
 
     pub fn app_cursor(&self) -> bool {

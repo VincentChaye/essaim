@@ -4,9 +4,10 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 /// Événement normalisé issu du flux `--output-format stream-json`.
 #[derive(Debug, Clone, PartialEq)]
@@ -23,7 +24,7 @@ pub enum ClaudeEvent {
     Result {
         text: String,
         is_error: bool,
-        cost_usd: f64,
+        tokens: u64,
         duration_ms: u64,
         /// Sortie structurée (avec `--json-schema`), déjà validée par `claude`.
         structured: Option<Value>,
@@ -66,15 +67,20 @@ pub fn parse_line(line: &str) -> Result<Vec<ClaudeEvent>> {
                     .iter()
                     .filter(|b| b["type"] == "tool_result")
                     .map(|b| ClaudeEvent::ToolResult {
-                        is_error: b["is_error"].as_bool().unwrap_or(false),
+                        // `is_error` absent = résultat douteux : jamais un succès implicite (R2/R5).
+                        is_error: b["is_error"].as_bool().unwrap_or(true),
                     })
                     .collect()
             })
             .unwrap_or_default(),
         Some("result") => vec![ClaudeEvent::Result {
             text: s(&v["result"]),
-            is_error: v["is_error"].as_bool().unwrap_or(false),
-            cost_usd: v["total_cost_usd"].as_f64().unwrap_or(0.0),
+            // Absent = échec (R2) : un résultat sans statut explicite n'est jamais compté comme un succès.
+            is_error: v["is_error"].as_bool().unwrap_or(true),
+            tokens:["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"]
+                .iter()
+                .map(|k| v["usage"][*k].as_u64().unwrap_or(0))
+                .sum(),
             duration_ms: v["duration_ms"].as_u64().unwrap_or(0),
             structured: Some(v["structured_output"].clone()).filter(|x| !x.is_null()),
         }],
@@ -194,7 +200,8 @@ impl RunSpec {
             a.extend(["--permission-mode".into(), m.clone()]);
         }
         if !self.agents.is_empty() {
-            a.extend(["--agents".into(), serde_json::to_string(&self.agents).unwrap()]);
+            // Sérialisation infaillible (`BTreeMap<String, Value>`) ; repli vide = `claude` refuse l'option (échec visible).
+            a.extend(["--agents".into(), serde_json::to_string(&self.agents).unwrap_or_default()]);
         }
         if let Some(n) = &self.agent {
             a.extend(["--agent".into(), n.clone()]);
@@ -231,26 +238,82 @@ impl RunSpec {
 
 }
 
+/// Plafond de la sortie d'erreur conservée (octets). Au-delà, le reste est lu et jeté : le processus ne se bloque pas.
+pub const STDERR_CAP: usize = 16 * 1024;
+
+/// Lit `reader` jusqu'à la fin et ne garde que `cap` octets. Si la sortie est tronquée, le texte le dit
+/// (troncature journalisée dans le texte d'erreur, sans canal supplémentaire).
+async fn read_capped<R: AsyncRead + Unpin>(mut reader: R, cap: usize) -> String {
+    let mut kept: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let chunk = buf.get(..n).unwrap_or_default();
+                let room = cap.saturating_sub(kept.len());
+                if chunk.len() > room {
+                    truncated = true;
+                }
+                kept.extend_from_slice(chunk.get(..room.min(chunk.len())).unwrap_or_default());
+            }
+            // Erreur de lecture de stderr : fin de la capture. Sans effet sur le résultat (stdout reste la source).
+            Err(_) => break,
+        }
+    }
+    let mut text = String::from_utf8_lossy(&kept).into_owned();
+    if truncated {
+        text.push_str(&format!("\n[… sortie d'erreur tronquée à {cap} octets]"));
+    }
+    text
+}
+
+/// Envoie SIGKILL au groupe de processus `pid` (le processus lancé avec `process_group(0)` en est le chef).
+/// Sans crate `libc` : commande `kill -KILL -- -<pgid>`. Échec ignoré : le processus peut déjà être terminé,
+/// et `Child::kill` reste le repli direct.
+#[cfg(unix)]
+async fn kill_group(pid: u32) {
+    let _ = Command::new("kill")
+        .args(["-KILL", "--"])
+        .arg(format!("-{pid}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+}
+
+#[cfg(not(unix))]
+async fn kill_group(_pid: u32) {}
+
 pub struct ClaudeProc {
     child: Child,
+    /// Tâche de lecture de stderr (bornée) ; récupérée une fois le processus terminé.
+    /// `allow(dead_code)` TEMPORAIRE : consommée par `executor::run_local` (étape c), hors périmètre de ce poste.
+    #[allow(dead_code)]
+    stderr: Option<JoinHandle<String>>,
 }
 
 impl ClaudeProc {
     /// Lance `claude` et pousse chaque événement dans `tx`. Le canal se ferme à la fin du flux.
     /// Si la session annonce une clé API (`apiKeySource` différent de `none`), émet un `Result` en erreur
-    /// et arrête le processus (commande `kill`).
+    /// et arrête le processus (groupe, voir `kill`).
     /// `cmd` est normalement `claude_command()` ; un autre programme sert aux tests.
+    /// Le processus est lancé dans son propre groupe (`process_group(0)`, unix) : `kill` atteint ses sous-processus.
     pub fn spawn_with(mut cmd: Command, spec: &RunSpec, tx: mpsc::UnboundedSender<ClaudeEvent>) -> Result<Self> {
+        #[cfg(unix)]
+        cmd.process_group(0);
         let mut child = cmd
             .args(spec.args())
             .current_dir(&spec.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .context("cannot launch `claude` (is it in the PATH?)")?;
         let stdout = child.stdout.take().context("stdout indisponible")?;
+        let stderr = child.stderr.take().map(|e| tokio::spawn(read_capped(e, STDERR_CAP)));
         let mut guard = child.id();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
@@ -268,14 +331,12 @@ impl ClaudeProc {
                                         "refused: the session uses an API key (apiKeySource={api_key_source}), not the subscription"
                                     ),
                                     is_error: true,
-                                    cost_usd: 0.0,
+                                    tokens: 0,
                                     duration_ms: 0,
                                     structured: None,
                                 });
                                 if let Some(pid) = guard.take() {
-                                    let _ = std::process::Command::new("kill")
-                                        .arg(pid.to_string())
-                                        .status();
+                                    kill_group(pid).await;
                                 }
                                 return;
                             }
@@ -287,11 +348,33 @@ impl ClaudeProc {
                 }
             }
         });
-        Ok(Self { child })
+        Ok(Self { child, stderr })
     }
 
+    /// Arrête le processus **et ses descendants** (groupe, unix), puis attend sa fin : sans cela, un sous-processus
+    /// lancé par `claude` survit à l'annulation (R4). `Child::kill` reste le repli si le groupe est introuvable.
     pub async fn kill(&mut self) -> Result<()> {
+        // `id()` vaut None une fois le processus réapé : pas de signal vers un pid réutilisé.
+        if let Some(pid) = self.child.id() {
+            kill_group(pid).await;
+        }
         self.child.kill().await.map_err(Into::into)
+    }
+
+    /// Sortie d'erreur capturée (bornée à `STDERR_CAP`), à appeler une fois le processus terminé ;
+    /// vide si la tâche ne se termine pas dans 2 s (descendant qui garde stderr ouvert) : diagnostic best-effort.
+    /// Les secrets connus sont masqués (`redact_secrets`).
+    /// `allow(dead_code)` TEMPORAIRE : appelée par `executor::run_local` (étape c), hors périmètre de ce poste.
+    #[allow(dead_code)]
+    pub async fn stderr_text(&mut self) -> String {
+        let Some(handle) = self.stderr.take() else {
+            return String::new();
+        };
+        match tokio::time::timeout(Duration::from_secs(2), handle).await {
+            Ok(Ok(text)) => redact_secrets(&text),
+            // Tâche interrompue ou délai dépassé : pas de diagnostic, le code de sortie reste disponible.
+            Ok(Err(_)) | Err(_) => String::new(),
+        }
     }
 
     pub async fn wait(&mut self) -> Result<std::process::ExitStatus> {
@@ -314,10 +397,10 @@ mod tests {
             if model.contains("haiku") && api_key_source == "none"));
         assert!(evs.contains(&ClaudeEvent::Text("pong".into())));
         match evs.last().unwrap() {
-            ClaudeEvent::Result { text, is_error, cost_usd, .. } => {
+            ClaudeEvent::Result { text, is_error, tokens, .. } => {
                 assert_eq!(text, "pong");
                 assert!(!is_error);
-                assert!(*cost_usd > 0.0);
+                assert!(*tokens > 0);
             }
             e => panic!("dernier événement inattendu : {e:?}"),
         }

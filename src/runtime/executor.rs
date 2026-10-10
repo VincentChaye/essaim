@@ -30,8 +30,8 @@ pub enum RunEvent {
     /// Pause avant la réalisation : le plan consolidé attend une validation (`true` = lancer, `false` = arrêter).
     Checkpoint { plan: String, reply: mpsc::UnboundedSender<bool> },
     Node { id: String, event: ClaudeEvent },
-    NodeFinished { id: String, status: NodeStatus, cost_usd: f64 },
-    RunFinished { ok: bool, cost_usd: f64 },
+    NodeFinished { id: String, status: NodeStatus, tokens: u64 },
+    RunFinished { ok: bool, tokens: u64 },
 }
 
 /// Tâche confiée à un `Runner`.
@@ -44,7 +44,7 @@ pub struct NodeJob {
 #[derive(Debug, Clone, Default)]
 pub struct NodeResult {
     pub output: String,
-    pub cost_usd: f64,
+    pub tokens: u64,
     pub is_error: bool,
     /// Sortie structurée si le nœud utilisait `--json-schema`.
     pub structured: Option<serde_json::Value>,
@@ -96,8 +96,8 @@ pub async fn run_local(
         tokio::select! {
             ev = crx.recv() => match ev {
                 Some(ev) => {
-                    if let ClaudeEvent::Result { text, is_error, cost_usd, structured, .. } = &ev {
-                        res = NodeResult { output: text.clone(), cost_usd: *cost_usd, is_error: *is_error, structured: structured.clone() };
+                    if let ClaudeEvent::Result { text, is_error, tokens, structured, .. } = &ev {
+                        res = NodeResult { output: text.clone(), tokens: *tokens, is_error: *is_error, structured: structured.clone() };
                     }
                     let _ = tx.send(ev);
                 }

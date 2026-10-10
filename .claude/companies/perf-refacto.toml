@@ -1,0 +1,72 @@
+name = "perf-refacto"
+max_calls = 30
+max_parallel = 2
+checkpoint = true
+
+[[seat]]
+id = "ceo"
+title = "CEO"
+agent = "perf-director"
+expertise = "pilotage performance et refactoring, arbitrage des priorités"
+
+[[seat]]
+id = "cto"
+title = "CTO"
+agent = "perf-architect"
+reports_to = "ceo"
+expertise = "architecture performante, optimisation algorithmique, découpage de modules, anti-redondance"
+
+[[seat]]
+id = "head-perf"
+title = "Head of Performance Engineering"
+agent = "engineering-manager"
+reports_to = "cto"
+expertise = "profilage, complexité algorithmique, allocations, mesures avant/après, optimisations ciblées"
+
+[[seat]]
+id = "perf-analyst"
+title = "Performance Engineer"
+agent = "perf-analyst"
+reports_to = "head-perf"
+expertise = "chemins critiques, complexité Big-O, clones et allocations inutiles, entrées/sorties"
+
+[[seat]]
+id = "dev-perf"
+title = "Backend Engineer (Optimisation)"
+agent = "developer"
+reports_to = "head-perf"
+expertise = "mise en oeuvre des optimisations, benchmarks, non-régression"
+builds = true
+allow_bash = [
+    "cargo build",
+    "cargo test",
+    "cargo bench",
+    "cargo clippy",
+]
+
+[[seat]]
+id = "mgr-refacto"
+title = "Engineering Manager, Code Health"
+agent = "engineering-manager"
+reports_to = "cto"
+expertise = "découpage de modules, duplication, abstractions communes, dette technique"
+
+[[seat]]
+id = "dup-analyst"
+title = "Software Engineer, Code Health"
+agent = "redundancy-analyst"
+reports_to = "mgr-refacto"
+expertise = "code dupliqué, logique redondante, code mort, factorisation possible"
+
+[[seat]]
+id = "dev-refacto"
+title = "Backend Engineer (Refactoring)"
+agent = "developer"
+reports_to = "mgr-refacto"
+expertise = "déplacements purs de code, factorisation et simplification sans régression"
+builds = true
+allow_bash = [
+    "cargo build",
+    "cargo test",
+    "cargo clippy",
+]

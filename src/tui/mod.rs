@@ -3,6 +3,7 @@ pub mod assistant;
 pub mod company_view;
 pub mod editor;
 pub mod manual;
+pub mod markdown;
 pub mod settings;
 pub mod term;
 pub mod ui;
@@ -20,13 +21,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// Ouvre un fichier dans $VISUAL / $EDITOR (ou vi) en suspendant la TUI.
-fn open_in_editor(path: &PathBuf) {
+/// Ouvre un fichier dans $VISUAL / $EDITOR (ou vi) en suspendant la TUI. Renvoie une erreur si l'éditeur est absent ou échoue.
+fn open_in_editor(path: &std::path::Path) -> Result<()> {
     let cmd = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "vi".into());
     let mut parts = cmd.split_whitespace();
-    if let Some(bin) = parts.next() {
-        let _ = std::process::Command::new(bin).args(parts).arg(path).status();
+    let Some(bin) = parts.next() else {
+        anyhow::bail!("{}", settings::tr("aucun éditeur configuré ($VISUAL / $EDITOR)", "no editor configured ($VISUAL / $EDITOR)"));
+    };
+    let status = std::process::Command::new(bin).args(parts).arg(path).status().map_err(|e| anyhow::anyhow!("{bin} : {e}"))?;
+    if !status.success() {
+        let raison = status.code().map(|c| format!("code {c}")).unwrap_or_else(|| settings::tr("interrompu", "interrupted").into());
+        anyhow::bail!("{bin} : {raison}");
     }
+    Ok(())
 }
 
 fn init_terminal() -> DefaultTerminal {
@@ -101,7 +108,9 @@ pub async fn run(root: PathBuf) -> Result<()> {
                 paused.store(true, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(120)).await;
                 restore_terminal();
-                open_in_editor(&path);
+                if let Err(e) = open_in_editor(&path) {
+                    app.status = format!("{} : {e:#}", settings::tr("éditeur non lancé", "editor not started"));
+                }
                 terminal = init_terminal();
                 paused.store(false, Ordering::SeqCst);
                 app.reload();

@@ -75,6 +75,55 @@ pub struct TreeRow {
     pub prefix: String,
 }
 
+/// Largeur d'une boîte du graphe et pas horizontal entre deux feuilles voisines (en cellules).
+pub const GRAPH_BOX_W: usize = 20;
+pub const GRAPH_SLOT: usize = 22;
+
+/// Un poste placé dans le graphe : même ordre que `tree_rows`, `cx` = centre horizontal de la boîte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphNode {
+    pub idx: usize,
+    pub depth: usize,
+    pub cx: usize,
+}
+
+/// Navigation 2D dans le graphe, par numéro de ligne (= ordre de `Company::graph`).
+pub mod graph_nav {
+    use super::GraphNode;
+
+    /// Supérieur : le plus proche poste précédent (préfixe) un niveau plus haut.
+    pub fn parent(g: &[GraphNode], row: usize) -> Option<usize> {
+        let d = g.get(row)?.depth;
+        (0..row).rev().find(|&r| g[r].depth + 1 == d)
+    }
+
+    /// Premier subordonné.
+    pub fn first_child(g: &[GraphNode], row: usize) -> Option<usize> {
+        let d = g.get(row)?.depth;
+        g.get(row + 1).filter(|n| n.depth == d + 1).map(|_| row + 1)
+    }
+
+    /// Subordonnés directs.
+    pub fn children(g: &[GraphNode], row: usize) -> Vec<usize> {
+        let Some(d) = g.get(row).map(|n| n.depth) else { return vec![] };
+        let mut out = vec![];
+        for r in row + 1..g.len() {
+            match g[r].depth {
+                x if x <= d => break,
+                x if x == d + 1 => out.push(r),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Voisin du même niveau, à droite ou à gauche (traverse les branches).
+    pub fn side(g: &[GraphNode], row: usize, right: bool) -> Option<usize> {
+        let d = g.get(row)?.depth;
+        if right { (row + 1..g.len()).find(|&r| g[r].depth == d) } else { (0..row).rev().find(|&r| g[r].depth == d) }
+    }
+}
+
 /// Majorant du nombre d'appels `claude` d'une mission (la délégation étant dynamique, le réel est ≤).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CallEstimate {
@@ -193,6 +242,33 @@ impl Company {
         let mut seen = HashSet::new();
         for r in self.roots() {
             walk(self, r, 0, &mut vec![], true, &mut seen, &mut out);
+        }
+        out
+    }
+
+    /// Placement en arbre : feuilles côte à côte, chaque supérieur centré au-dessus de ses subordonnés.
+    pub fn graph(&self) -> Vec<GraphNode> {
+        fn walk(c: &Company, i: usize, depth: usize, slot: &mut usize, seen: &mut HashSet<usize>, out: &mut Vec<GraphNode>) -> Option<usize> {
+            if !seen.insert(i) {
+                return None;
+            }
+            let pos = out.len();
+            out.push(GraphNode { idx: i, depth, cx: 0 });
+            let xs: Vec<usize> = c.children(i).into_iter().filter_map(|j| walk(c, j, depth + 1, slot, seen, out)).collect();
+            let cx = match (xs.first(), xs.last()) {
+                (Some(a), Some(b)) => (a + b) / 2,
+                _ => {
+                    *slot += 1;
+                    (*slot - 1) * GRAPH_SLOT + GRAPH_BOX_W / 2
+                }
+            };
+            out[pos].cx = cx;
+            Some(cx)
+        }
+        let mut out = vec![];
+        let (mut seen, mut slot) = (HashSet::new(), 0);
+        for r in self.roots() {
+            walk(self, r, 0, &mut slot, &mut seen, &mut out);
         }
         out
     }
@@ -399,6 +475,35 @@ reports_to = "ciso"
             lines,
             vec!["ceo", "├─ cto", "│  └─ mgr", "│     ├─ dev1", "│     └─ dev2", "└─ ciso", "   └─ sec"]
         );
+    }
+
+    #[test]
+    fn graphe_centre_et_navigation() {
+        use super::graph_nav as nav;
+        let c = company();
+        let g = c.graph();
+        let ids: Vec<&str> = g.iter().map(|n| c.seats[n.idx].id.as_str()).collect();
+        assert_eq!(ids, c.tree_rows().iter().map(|r| c.seats[r.idx].id.as_str()).collect::<Vec<_>>(), "même ordre que l'arbre");
+        let row = |id: &str| ids.iter().position(|x| *x == id).unwrap();
+        // Un supérieur est centré sur ses subordonnés ; deux voisins d'un niveau ne se chevauchent pas.
+        assert_eq!(g[row("mgr")].cx, (g[row("dev1")].cx + g[row("dev2")].cx) / 2);
+        for a in &g {
+            for b in g.iter().filter(|b| b.depth == a.depth && b.cx > a.cx) {
+                assert!(b.cx - a.cx >= GRAPH_BOX_W + 1, "boîtes chevauchées");
+            }
+        }
+        assert_eq!(nav::parent(&g, row("dev1")), Some(row("mgr")));
+        assert_eq!(nav::parent(&g, row("ciso")), Some(row("ceo")));
+        assert_eq!(nav::parent(&g, row("ceo")), None);
+        assert_eq!(nav::first_child(&g, row("cto")), Some(row("mgr")));
+        assert_eq!(nav::first_child(&g, row("dev1")), None);
+        assert_eq!(nav::children(&g, row("ceo")), vec![row("cto"), row("ciso")]);
+        assert_eq!(nav::side(&g, row("cto"), true), Some(row("ciso")));
+        assert_eq!(nav::side(&g, row("dev2"), false), Some(row("dev1")));
+        assert_eq!(nav::side(&g, row("ciso"), true), None);
+        // Traverse les branches : mgr (sous cto) ↔ sec (sous ciso) sont au même niveau.
+        assert_eq!(nav::side(&g, row("mgr"), true), Some(row("sec")));
+        assert_eq!(nav::side(&g, row("sec"), false), Some(row("mgr")));
     }
 
     #[test]

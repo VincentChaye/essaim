@@ -1,5 +1,5 @@
 use crate::model::agent::{self, AgentDef};
-use crate::model::company::{Company, Seat};
+use crate::model::company::{Company, Seat, graph_nav};
 use crate::model::roles;
 use crate::runtime::claude_proc::ClaudeEvent;
 use crate::runtime::company_exec::{CompanyOptions, run_mission};
@@ -40,7 +40,7 @@ impl Tab {
     }
 
     pub fn index(self) -> usize {
-        Tab::ALL.iter().position(|t| *t == self).unwrap()
+        Tab::ALL.iter().position(|t| *t == self).unwrap_or(0)
     }
 }
 
@@ -54,6 +54,39 @@ pub enum AssistantKind {
     Company,
     /// Révision du plan consolidé d'un run en attente au point de contrôle.
     Plan,
+    /// Modification d'un élément existant (agent, poste, entreprise, brief) avec le modèle.
+    Edit,
+    /// Discussion sur le compte rendu d'une mission pour en tirer des actions.
+    Debrief,
+}
+
+/// Élément dont on choisit le mode d'édition (touche `e`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditWhat {
+    Agent(String),
+    /// Poste : id.
+    Seat(String),
+    Company,
+    Mission,
+}
+
+/// Choix entre édition simple (formulaire ou $EDITOR) et édition avec le modèle (conversation).
+#[derive(Debug, Clone)]
+pub struct EditChoice {
+    pub what: EditWhat,
+    /// Fichier concerné (agent, entreprise ou brief).
+    pub file: PathBuf,
+    /// Intitulé affiché dans la fenêtre.
+    pub label: String,
+    /// 0 = édition simple, 1 = avec le modèle.
+    pub sel: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompZone {
+    Companies,
+    Missions,
+    Graph,
 }
 
 /// Navigation entre onglets par raccourci global (valable aussi dans le terminal intégré).
@@ -211,7 +244,14 @@ pub struct SeatForm {
     /// Id du poste édité (None = création), pour gérer le renommage.
     pub original: Option<String>,
     pub path: PathBuf,
+    /// Poste tel qu'ouvert, pour savoir si des changements seraient perdus.
+    initial: Seat,
+    /// Demande de vérification en cours : `Some(true)` = valider, `Some(false)` = annuler.
+    pub confirm: Option<bool>,
 }
+
+/// Boutons sous les champs : `focus == fields.len()` = Valider, `+ 1` = Annuler.
+const SEAT_BUTTONS: usize = 2;
 
 fn descendants(c: &Company, i: usize) -> Vec<usize> {
     let mut out = vec![];
@@ -251,7 +291,7 @@ impl SeatForm {
             }
         };
         let level = roles::level_label(depth);
-        Self {
+        let mut form = Self {
             fields: vec![
                 Field::Text(TextBuf::new(&s.id, false)),
                 Field::Text(TextBuf::new(&s.title, false)),
@@ -275,7 +315,15 @@ impl SeatForm {
             focus: 0,
             original: seat.map(|_| s.id.clone()),
             path,
-        }
+            initial: s.clone(),
+            confirm: None,
+        };
+        form.initial = form.to_seat();
+        form
+    }
+
+    fn changed(&self) -> bool {
+        self.to_seat() != self.initial
     }
 
     fn to_seat(&self) -> Seat {
@@ -297,30 +345,61 @@ pub enum Mode {
     Normal,
     EditAgent(AgentForm),
     EditSeat(SeatForm),
-    /// Suppression d'un poste : (fichier de l'entreprise, id, intitulé).
-    ConfirmDeleteSeat(PathBuf, String, String),
-    ConfirmDelete(String),
-    /// Suppression d'une session background : (id, nom).
-    ConfirmRemoveSession(String, String),
-    /// Action à confirmer (terminer, arrêter, supprimer une entrée d'historique).
+    /// Choix du mode d'édition : simple ou avec le modèle.
+    ChooseEdit(EditChoice),
+    /// Action destructive ou irréversible à confirmer (suppression, arrêt, annulation, écrasement).
     ConfirmAction(PendingAction),
 }
 
-/// Action potentiellement destructive, exécutée seulement après un `y`.
+/// Action potentiellement destructive, exécutée seulement après un `o` (ou `y`) ; toute autre touche l'annule.
 pub enum PendingAction {
-    DeleteHistory(String),
-    CancelRun,
+    /// Suppression d'un agent : nom.
+    DeleteAgent(String),
+    /// Suppression d'un poste : (fichier de l'entreprise, id, intitulé).
+    DeleteSeat(PathBuf, String, String),
+    /// Suppression d'une entrée d'historique : (id, nom du run).
+    DeleteHistory(String, String),
+    /// Annulation du run en cours : nom.
+    CancelRun(String),
+    /// Sortie de l'outil alors qu'un run est en cours (il sera annulé) : nom du run.
+    QuitRun(String),
+    /// Mission relancée alors qu'elle écraserait conception / rapport : (titre, reprise).
+    StartMission(String, bool),
+    /// Fin de la session Claude intégrée.
     FinishTerm,
+    /// Suppression d'une session background : (id, nom).
+    RemoveSession(String, String),
+    /// Arrêt d'une session background : (id, nom).
     StopSession(String, String),
+}
+
+/// Gabarit commun des confirmations : « Supprimer {objet} « {nom} » ? (o/n) ».
+fn ask_delete(objet_fr: &str, objet_en: &str, nom: &str) -> String {
+    tf!("Supprimer {objet_fr} « {nom} » ? (o/n)", "Delete {objet_en} \"{nom}\"? (o/n)")
 }
 
 impl PendingAction {
     pub fn question(&self) -> String {
         match self {
-            Self::DeleteHistory(_) => tr("Supprimer ce run de l'historique ?", "Remove this run from history?").into(),
-            Self::CancelRun => tr("Annuler le run en cours ?", "Cancel the current run?").into(),
-            Self::FinishTerm => tr("Terminer la session en cours ?", "End the current session?").into(),
-            Self::StopSession(_, name) => tf!("Arrêter la session « {name} » ?", "Stop the session \"{name}\"?"),
+            Self::DeleteAgent(name) => ask_delete("l'agent", "the agent", name),
+            Self::DeleteSeat(_, _, title) => ask_delete("le poste", "the seat", title),
+            Self::DeleteHistory(_, name) => ask_delete("le run", "the run", name),
+            Self::RemoveSession(_, name) => ask_delete("la session", "the session", name),
+            Self::CancelRun(name) => tf!("Annuler le run « {name} » ? (o/n)", "Cancel the run \"{name}\"? (o/n)"),
+            Self::QuitRun(name) => tf!("Quitter et annuler le run « {name} » ? (o/n)", "Quit and cancel the run \"{name}\"? (o/n)"),
+            Self::StartMission(title, _) => tf!("Relancer « {title} » depuis le début ? Le plan et le rapport précédents seront remplacés. (o/n)", "Restart \"{title}\" from scratch? The previous plan and report will be replaced. (o/n)"),
+            Self::FinishTerm => tr("Terminer la session Claude en cours ? (o/n)", "End the current Claude session? (o/n)").into(),
+            Self::StopSession(_, name) => tf!("Arrêter la session « {name} » ? (o/n)", "Stop the session \"{name}\"? (o/n)"),
+        }
+    }
+
+    /// Précision affichée sous la question (conséquences, postes concernés).
+    pub fn detail(&self, users: &[String]) -> Option<String> {
+        match self {
+            Self::DeleteAgent(_) if !users.is_empty() => Some(tf!("⚠ Postes utilisant cet agent : {}", "⚠ Seats using this agent: {}", users.join(", "))),
+            Self::DeleteSeat(..) => Some(tr("Ses subordonnés remontent d'un cran.", "Its subordinates move up one level.").into()),
+            Self::DeleteHistory(..) => Some(tr("L'historique du run est effacé ; les missions restent.", "The run history is erased; missions are kept.").into()),
+            _ => None,
         }
     }
 }
@@ -340,12 +419,12 @@ pub struct NodeView {
     pub depth: usize,
     pub state: NodeState,
     pub log: Vec<String>,
-    pub cost: f64,
+    pub tokens: u64,
 }
 
 impl NodeView {
     pub fn new(id: &str, agent: &str) -> Self {
-        Self { id: id.into(), agent: agent.into(), label: id.into(), depth: 0, state: NodeState::Waiting, log: vec![], cost: 0.0 }
+        Self { id: id.into(), agent: agent.into(), label: id.into(), depth: 0, state: NodeState::Waiting, log: vec![], tokens: 0 }
     }
 }
 
@@ -358,7 +437,8 @@ pub struct SettingsMenu {
 /// Mission passée ouverte en lecture : brief, plan et rapport.
 pub struct MissionView {
     pub title: String,
-    pub text: String,
+    pub dir: PathBuf,
+    pub text: Vec<ratatui::text::Line<'static>>,
     pub scroll: u16,
 }
 
@@ -373,7 +453,7 @@ pub struct RunView {
     pub name: String,
     pub nodes: Vec<NodeView>,
     pub sel: usize,
-    pub cost: f64,
+    pub tokens: u64,
     /// None = en cours ; Some(ok) = terminé.
     pub finished: Option<bool>,
     pub cancel: watch::Sender<bool>,
@@ -401,11 +481,16 @@ pub struct App {
     pub pending_mission_dir: Option<PathBuf>,
     /// Ligne sélectionnée dans l'arbre de l'organigramme.
     pub seat_sel: usize,
+    /// Zone de l'onglet Entreprise sous le curseur, et si l'on est « entré » dedans (Entrée / Échap).
+    pub zone: CompZone,
+    pub zone_in: bool,
     pub run: Option<RunView>,
     pub checkpoint: Option<CheckpointState>,
     /// Entreprise et dossier de la mission du run en cours : permettent de réviser le plan au point de contrôle.
     pub run_ctx: Option<(Company, PathBuf)>,
     pub mission_view: Option<MissionView>,
+    /// Missions dépliées dans la liste (id → résumé).
+    pub mission_open: std::collections::HashMap<String, missions::Summary>,
     /// Fenêtre d'aide (Ctrl+K) et son défilement.
     pub help_open: bool,
     /// Aide : manuel complet (`m`) au lieu de l'aide de l'onglet courant.
@@ -464,10 +549,13 @@ impl App {
             mission_sel: 0,
             pending_mission_dir: None,
             seat_sel: 0,
+            zone: CompZone::Companies,
+            zone_in: true,
             run: None,
             checkpoint: None,
             run_ctx: None,
             mission_view: None,
+            mission_open: Default::default(),
             help_open: false,
             help_full: false,
             lang: Lang::Fr,
@@ -513,12 +601,44 @@ impl App {
         paths
             .into_iter()
             .map(|path| {
-                let file = path.file_name().unwrap().to_string_lossy().into_owned();
+                let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let parsed = Company::load(&path).map_err(|e| format!("{e:#}"));
                 let problem = parsed.as_ref().ok().and_then(|c| c.validate(agent_names).err()).map(|e| format!("{e:#}"));
                 CompanyEntry { path, file, parsed, problem }
             })
             .collect()
+    }
+
+    /// Missions de l'entreprise sélectionnée (index dans `missions`) : les siennes et celles que personne n'a encore lancées.
+    pub fn visible_missions(&self) -> Vec<usize> {
+        let file = self.companies.get(self.comp_sel).map(|c| c.file.as_str());
+        (0..self.missions.len()).filter(|&i| self.missions[i].company.as_deref().is_none_or(|c| Some(c) == file)).collect()
+    }
+
+    /// Missions lancées avant le rattachement : retrouve leur entreprise via le nom du run (« entreprise · titre »).
+    fn backfill_mission_companies(&mut self) {
+        let mut changed = false;
+        for m in self.missions.iter().filter(|m| m.company.is_none()) {
+            let found = self.companies.iter().find(|c| {
+                let Ok(co) = &c.parsed else { return false };
+                let name = format!("{} · {}", co.name, m.title);
+                self.history.iter().any(|r| r.pipeline == name)
+            });
+            if let Some(c) = found {
+                changed |= missions::set_company(&m.dir, &c.file).is_ok();
+            }
+        }
+        if changed {
+            self.missions = missions::list(&self.root);
+        }
+    }
+
+    /// Ramène la sélection de mission sur une mission visible pour l'entreprise courante.
+    pub fn snap_mission_sel(&mut self) {
+        let v = self.visible_missions();
+        if !v.contains(&self.mission_sel) {
+            self.mission_sel = v.first().copied().unwrap_or(0);
+        }
     }
 
     /// Relit agents, entreprises et missions depuis le disque.
@@ -530,6 +650,8 @@ impl App {
         self.missions = missions::list(&self.root);
         self.mission_sel = self.mission_sel.min(self.missions.len().saturating_sub(1));
         self.history = store::load_all(&self.root);
+        self.backfill_mission_companies();
+        self.snap_mission_sel();
         self.hist_sel = self.hist_sel.min(self.history.len().saturating_sub(1));
         self.agent_sel = self.agent_sel.min(self.agents.len().saturating_sub(1));
     }
@@ -543,9 +665,9 @@ impl App {
     pub fn names_for(&self, kind: AssistantKind) -> Vec<String> {
         match kind {
             AssistantKind::Agent => self.agents.iter().map(|a| a.name.clone()).collect(),
-            AssistantKind::Mission => self.missions.iter().map(|m| m.id.clone()).collect(),
+            AssistantKind::Mission | AssistantKind::Debrief => self.missions.iter().map(|m| m.id.clone()).collect(),
             AssistantKind::Company => self.company_files(),
-            AssistantKind::Plan => vec![],
+            AssistantKind::Plan | AssistantKind::Edit | AssistantKind::Debrief => vec![],
         }
     }
 
@@ -594,6 +716,19 @@ impl App {
                 };
             }
             AssistantKind::Plan => self.after_plan_revision(),
+            AssistantKind::Edit => {
+                self.status = match agent::invalid_files(&self.root).first() {
+                    Some((file, err)) => tf!("⚠ {file} est illisible : {err}", "⚠ {file} is unreadable: {err}"),
+                    None => tr("modifications rechargées", "changes reloaded").into(),
+                };
+            }
+            AssistantKind::Debrief => {
+                let before_n = before.len();
+                self.status = match self.missions.len().checked_sub(before_n) {
+                    Some(n) if n > 0 => tf!("{n} nouvelle(s) mission(s) créée(s) — voir la liste des missions", "{n} new mission(s) created — see the missions list"),
+                    _ => tr("discussion terminée — actions.md à jour si des actions ont été validées", "discussion over — actions.md is up to date if actions were approved").into(),
+                };
+            }
             AssistantKind::Mission => {
                 if let Some(dir) = self.pending_mission_dir.take() {
                     let _ = std::fs::remove_dir(dir); // sans effet si un brief y a été écrit
@@ -778,6 +913,7 @@ impl App {
     /// Exécute une action sur une session puis notifie l'UI.
     fn session_action(&mut self, id: String, label: &'static str, remove: bool) {
         if tokio::runtime::Handle::try_current().is_err() {
+            self.status = tr("action indisponible : pas de runtime asynchrone", "action unavailable: no async runtime").into();
             return;
         }
         let tx = self.tx.clone();
@@ -787,7 +923,7 @@ impl App {
             settings::set_current(lang); // fil du runtime : la langue est posée juste avant de formater
             let msg = match res {
                 Ok(()) => tf!("session {id} {label}", "session {id} {label}"),
-                Err(e) => tf!("erreur : {e:#}", "error: {e:#}"),
+                Err(e) => erreur(&e),
             };
             let _ = tx.send(AppEvent::Notice(msg));
         });
@@ -809,7 +945,7 @@ impl App {
             return;
         }
         if self.term.is_some() {
-            self.status = tr("une session Claude est déjà ouverte (onglet 6)", "a Claude session is already open (tab 6)").into();
+            self.status = tr("une session Claude est déjà ouverte (onglet 5)", "a Claude session is already open (tab 5)").into();
             return;
         }
         let (kind, args, title, origin) = match (assistant, attach) {
@@ -819,6 +955,8 @@ impl App {
                     AssistantKind::Mission => ("brief de mission", Tab::Company),
                     AssistantKind::Company => ("nouvelle entreprise", Tab::Company),
                     AssistantKind::Plan => ("révision du plan", Tab::Run),
+                    AssistantKind::Edit => ("modification", self.tab),
+                    AssistantKind::Debrief => ("compte rendu", Tab::Company),
                 };
                 (Some(k), args, title.to_string(), origin)
             }
@@ -839,7 +977,7 @@ impl App {
                 self.tab = Tab::Terminal;
                 self.status.clear();
             }
-            Err(e) => self.status = format!("erreur : {e:#}"),
+            Err(e) => self.status = erreur(&e),
         }
     }
 
@@ -895,7 +1033,16 @@ impl App {
         true
     }
 
+    /// `q` / Ctrl+C : sortie directe, sauf si un run est en cours (confirmation, il serait annulé).
     fn request_quit(&mut self) {
+        if let Some(r) = self.run.as_ref().filter(|r| r.finished.is_none()) {
+            self.mode = Mode::ConfirmAction(PendingAction::QuitRun(r.name.clone()));
+            return;
+        }
+        self.quit_now();
+    }
+
+    fn quit_now(&mut self) {
         if let Some(t) = self.term.as_mut() {
             t.kill();
         }
@@ -970,35 +1117,95 @@ impl App {
             self.key_mission_view(k);
             return;
         }
-        if self.checkpoint.is_some() {
+        // Le point de contrôle ne concerne que l'onglet Run (il y bascule à son arrivée).
+        if self.checkpoint.is_some() && self.tab == Tab::Run {
             self.key_checkpoint(k);
             return;
         }
         self.status.clear();
         match std::mem::replace(&mut self.mode, Mode::Normal) {
             Mode::EditAgent(form) => self.key_form(form, k),
-            Mode::ConfirmDelete(name) => self.key_confirm(name, k),
-            Mode::ConfirmRemoveSession(id, name) => {
-                if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('o')) {
-                    self.status = tf!("suppression de « {name} »…", "deleting \"{name}\"…");
-                    self.session_action(id, tr("supprimée", "deleted"), true);
-                }
-            }
             Mode::EditSeat(form) => self.key_seat_form(form, k),
-            Mode::ConfirmAction(a) => {
-                if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('o')) {
-                    self.run_action(a);
+            Mode::ChooseEdit(c) => self.key_choose_edit(c, k),
+            Mode::ConfirmAction(a) => match k.code {
+                KeyCode::Char('o' | 'O' | 'y' | 'Y') => self.run_action(a),
+                // Refus, Échap ou toute autre touche : par défaut, l'action n'a pas lieu.
+                _ => self.status = tr("Annulé.", "Cancelled.").into(),
+            },
+            Mode::Normal => self.key_normal(k),
+        }
+    }
+
+    /// Onglet Entreprise : les flèches changent de zone ; Entrée y entre (flèches locales), Échap en sort.
+    fn company_nav(&mut self, k: KeyEvent) {
+        let (up, down, left, right) = (
+            matches!(k.code, KeyCode::Up | KeyCode::Char('k')),
+            matches!(k.code, KeyCode::Down | KeyCode::Char('j')),
+            matches!(k.code, KeyCode::Left | KeyCode::Char('h')),
+            matches!(k.code, KeyCode::Right | KeyCode::Char('l')),
+        );
+        if k.code == KeyCode::Esc {
+            self.zone_in = false;
+            return;
+        }
+        if !self.zone_in {
+            match k.code {
+                KeyCode::Enter => self.zone_in = true,
+                _ if left => self.zone = match self.zone { CompZone::Missions => CompZone::Companies, z => z },
+                _ if right => self.zone = match self.zone { CompZone::Companies => CompZone::Missions, z => z },
+                _ if down => self.zone = CompZone::Graph,
+                _ if up && self.zone == CompZone::Graph => self.zone = CompZone::Missions,
+                _ => {}
+            }
+            return;
+        }
+        match self.zone {
+            CompZone::Companies => {
+                if (down || up) && !self.companies.is_empty() {
+                    let n = self.companies.len();
+                    self.comp_sel = if down { (self.comp_sel + 1) % n } else { (self.comp_sel + n - 1) % n };
+                    self.seat_sel = 0;
+                    self.snap_mission_sel();
+                }
+                if k.code == KeyCode::Enter {
+                    self.zone = CompZone::Missions;
                 }
             }
-            Mode::ConfirmDeleteSeat(path, id, title) => {
-                if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('o')) {
-                    match self.delete_seat(&path, &id) {
-                        Ok(()) => self.status = tf!("poste « {title} » supprimé", "seat \"{title}\" deleted"),
-                        Err(e) => self.status = format!("erreur : {e:#}"),
+            CompZone::Missions => {
+                let v = self.visible_missions();
+                if let Some(pos) = v.iter().position(|&i| i == self.mission_sel) {
+                    let n = v.len();
+                    if down {
+                        self.mission_sel = v[(pos + 1) % n];
+                    } else if up {
+                        self.mission_sel = v[(pos + n - 1) % n];
                     }
                 }
+                if k.code == KeyCode::Enter {
+                    self.open_mission();
+                } else if k.code == KeyCode::Char(' ') || left || right {
+                    self.toggle_summary(if left { Some(false) } else if right { Some(true) } else { None });
+                }
             }
-            Mode::Normal => self.key_normal(k),
+            CompZone::Graph => {
+                // ↑ supérieur · ↓ premier subordonné · ← → voisin du même niveau.
+                let graph = self.companies.get(self.comp_sel).and_then(|c| c.parsed.as_ref().ok()).map(|c| c.graph()).unwrap_or_default();
+                let sel = self.seat_sel.min(graph.len().saturating_sub(1));
+                let target = match k.code {
+                    _ if up => graph_nav::parent(&graph, sel),
+                    _ if down => graph_nav::first_child(&graph, sel),
+                    _ if left => graph_nav::side(&graph, sel, false),
+                    _ if right => graph_nav::side(&graph, sel, true),
+                    KeyCode::Home | KeyCode::Char('g') => (!graph.is_empty()).then_some(0),
+                    _ => None,
+                };
+                if let Some(t) = target {
+                    self.seat_sel = t;
+                }
+                if k.code == KeyCode::Enter {
+                    self.open_seat_form(true);
+                }
+            }
         }
     }
 
@@ -1028,58 +1235,73 @@ impl App {
                     KeyCode::Char('N') => self.mode = Mode::EditAgent(AgentForm::new(None)),
                     KeyCode::Char('e') | KeyCode::Enter => {
                         if let Some(a) = self.agents.get(self.agent_sel) {
-                            self.mode = Mode::EditAgent(AgentForm::new(Some(a)));
+                            let file = self.root.join(".claude/agents").join(format!("{}.md", a.name));
+                            self.mode = Mode::ChooseEdit(EditChoice { what: EditWhat::Agent(a.name.clone()), file, label: tf!("l'agent « {} »", "the agent \"{}\"", a.name), sel: 0 });
                         }
                     }
                     KeyCode::Char('D') => {
                         if let Some(a) = self.agents.get(self.agent_sel) {
-                            self.mode = Mode::ConfirmDelete(a.name.clone());
+                            self.mode = Mode::ConfirmAction(PendingAction::DeleteAgent(a.name.clone()));
                         }
                     }
                     _ => {}
                 }
             }
             Tab::Company => {
-                let rows = self
-                    .companies
-                    .get(self.comp_sel)
-                    .and_then(|c| c.parsed.as_ref().ok())
-                    .map(|c| c.tree_rows().len())
-                    .unwrap_or(0);
-                if down || up {
-                    self.seat_sel = step(self.seat_sel, rows, down);
-                }
+                self.company_nav(k);
                 match k.code {
                     KeyCode::Char('c') if !self.companies.is_empty() => {
                         self.comp_sel = (self.comp_sel + 1) % self.companies.len();
                         self.seat_sel = 0;
+                        self.snap_mission_sel();
                     }
                     KeyCode::Char('C') if !self.companies.is_empty() => {
                         self.comp_sel = (self.comp_sel + self.companies.len() - 1) % self.companies.len();
                         self.seat_sel = 0;
+                        self.snap_mission_sel();
                     }
                     KeyCode::Char('n') => {
                         let agents: Vec<(String, String)> = self.agents.iter().map(|a| (a.name.clone(), a.description.clone())).collect();
                         let files = self.company_files();
                         self.assistant_request = Some((AssistantKind::Company, super::assistant::company_creation_args(self.lang, &agents, &files)));
                     }
-                    KeyCode::Char('a') => self.open_seat_form(false),
-                    KeyCode::Char('e') => self.open_seat_form(true),
-                    KeyCode::Char('x') => {
+                    // L'édition dépend de la zone où l'on est entré : poste (organigramme), entreprise ou mission.
+                    KeyCode::Char('a') if self.zone_in && self.zone == CompZone::Graph => self.open_seat_form(false),
+                    KeyCode::Char('e') if self.zone_in => match self.zone {
+                        CompZone::Graph => {
+                            if let Some((path, c, i)) = self.selected_seat() {
+                                let s = &c.seats[i];
+                                self.mode = Mode::ChooseEdit(EditChoice { what: EditWhat::Seat(s.id.clone()), file: path, label: tf!("le poste « {} »", "the seat \"{}\"", s.title), sel: 0 });
+                            }
+                        }
+                        CompZone::Companies => {
+                            if let Some(c) = self.companies.get(self.comp_sel) {
+                                self.mode = Mode::ChooseEdit(EditChoice { what: EditWhat::Company, file: c.path.clone(), label: tf!("l'entreprise « {} »", "the company \"{}\"", c.file), sel: 0 });
+                            }
+                        }
+                        CompZone::Missions => {
+                            if self.visible_missions().contains(&self.mission_sel) {
+                                if let Some(m) = self.missions.get(self.mission_sel) {
+                                    self.mode = Mode::ChooseEdit(EditChoice { what: EditWhat::Mission, file: m.dir.join("brief.md"), label: tf!("le brief « {} »", "the brief \"{}\"", m.title), sel: 0 });
+                                }
+                            }
+                        }
+                    },
+                    KeyCode::Char('x') if self.zone_in && self.zone == CompZone::Graph => {
                         if let Some((path, c, i)) = self.selected_seat() {
                             let s = &c.seats[i];
-                            self.mode = Mode::ConfirmDeleteSeat(path, s.id.clone(), s.title.clone());
+                            self.mode = Mode::ConfirmAction(PendingAction::DeleteSeat(path, s.id.clone(), s.title.clone()));
                         }
                     }
                     KeyCode::Char('m') => self.request_mission_brief(),
-                    KeyCode::Enter | KeyCode::Char('o') => self.open_mission(),
+                    KeyCode::Char('o') => self.open_mission(),
                     KeyCode::Char('r') => self.start_mission(true),
                     KeyCode::Char('R') => self.start_mission(false),
-                    KeyCode::Char('t') if !self.missions.is_empty() => self.mission_sel = (self.mission_sel + 1) % self.missions.len(),
-                    KeyCode::Char('T') if !self.missions.is_empty() => self.mission_sel = (self.mission_sel + self.missions.len() - 1) % self.missions.len(),
-                    KeyCode::Char('E') => {
-                        if let Some(c) = self.companies.get(self.comp_sel) {
-                            self.editor_request = Some(c.path.clone());
+                    KeyCode::Char('t' | 'T') => {
+                        let v = self.visible_missions();
+                        if let Some(pos) = v.iter().position(|&i| i == self.mission_sel) {
+                            let n = v.len();
+                            self.mission_sel = v[if k.code == KeyCode::Char('t') { (pos + 1) % n } else { (pos + n - 1) % n }];
                         }
                     }
                     _ => {}
@@ -1098,7 +1320,7 @@ impl App {
                         KeyCode::Enter => self.open_history(),
                         KeyCode::Char('D') => {
                             if let Some(h) = self.history.get(self.hist_sel) {
-                                self.mode = Mode::ConfirmAction(PendingAction::DeleteHistory(h.id.clone()));
+                                self.mode = Mode::ConfirmAction(PendingAction::DeleteHistory(h.id.clone(), h.pipeline.clone()));
                             }
                         }
                         _ => {}
@@ -1108,7 +1330,7 @@ impl App {
                         r.sel = step(r.sel, r.nodes.len(), down);
                     }
                     if k.code == KeyCode::Char('s') && r.finished.is_none() {
-                        self.mode = Mode::ConfirmAction(PendingAction::CancelRun);
+                        self.mode = Mode::ConfirmAction(PendingAction::CancelRun(r.name.clone()));
                     }
                 }
             }
@@ -1134,7 +1356,7 @@ impl App {
                     KeyCode::Char('s') => {
                         self.mode = Mode::ConfirmAction(PendingAction::StopSession(id, name));
                     }
-                    KeyCode::Char('x') => self.mode = Mode::ConfirmRemoveSession(id, name),
+                    KeyCode::Char('x') => self.mode = Mode::ConfirmAction(PendingAction::RemoveSession(id, name)),
                     KeyCode::Char('a') | KeyCode::Enter => self.attach_request = Some(id),
                     _ => {}
                 }
@@ -1145,23 +1367,73 @@ impl App {
     /// Validation du plan avant la réalisation : Entrée lance, Échap arrête, flèches défilent.
     /// `Entrée` / `o` : ouvre la mission sélectionnée (brief, plan, rapport) en lecture.
     fn open_mission(&mut self) {
-        let Some(m) = self.missions.get(self.mission_sel) else {
+        let Some(m) = self.visible_missions().contains(&self.mission_sel).then(|| self.missions.get(self.mission_sel)).flatten() else {
             self.status = tr("aucune mission : m pour en cadrer une avec le boss", "no mission: m to frame one with the boss").into();
             return;
         };
-        let mut text = String::new();
-        for (name, label) in [("brief.md", "BRIEF"), ("conception.md", "PLAN (conception)"), ("rapport.md", "RAPPORT")] {
+        let mut md = String::new();
+        for (name, label) in [
+            ("compte-rendu.md", ""),
+            ("rapport.md", tr("Rapport du boss", "Boss report")),
+            ("conception.md", tr("Plan (conception)", "Plan (design)")),
+            ("brief.md", "Brief"),
+        ] {
             if let Ok(t) = std::fs::read_to_string(m.dir.join(name)) {
-                text.push_str(&format!("═══ {label} ═══\n\n{}\n\n", t.trim_end()));
+                // Le compte rendu cite déjà le rapport final : on ne le répète pas.
+                if name == "rapport.md" && md.contains("compte-rendu") {
+                    continue;
+                }
+                if !label.is_empty() {
+                    md.push_str(&format!("# {label}\n\n"));
+                }
+                md.push_str(t.trim_end());
+                md.push_str("\n\n---\n\n");
             }
         }
-        self.mission_view = Some(MissionView { title: m.title.clone(), text, scroll: 0 });
+        if md.is_empty() {
+            md = tr("_Cette mission n'a encore aucun contenu._", "_This mission has no content yet._").into();
+        }
+        let width = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(100).min(96).saturating_sub(4);
+        self.mission_view = Some(MissionView { title: m.title.clone(), dir: m.dir.clone(), text: super::markdown::render(&md, width), scroll: 0 });
+    }
+
+    /// Déplie / replie le résumé de la mission sélectionnée (`want` : Some(true) déplie, Some(false) replie).
+    fn toggle_summary(&mut self, want: Option<bool>) {
+        let Some(m) = self.visible_missions().contains(&self.mission_sel).then(|| self.missions.get(self.mission_sel)).flatten() else { return };
+        let open = self.mission_open.contains_key(&m.id);
+        if want.unwrap_or(!open) {
+            if !open {
+                let s = missions::summarize(&m.dir);
+                self.mission_open.insert(m.id.clone(), s);
+            }
+        } else {
+            self.mission_open.remove(&m.id);
+        }
+    }
+
+    /// `d` dans la vue d'une mission : conversation avec le modèle sur son compte rendu.
+    fn start_debrief(&mut self, dir: &std::path::Path) {
+        if !["compte-rendu.md", "rapport.md", "conception.md"].iter().any(|n| dir.join(n).exists()) {
+            self.status = tr("rien à discuter : la mission n'a pas encore été lancée", "nothing to discuss: the mission has not run yet").into();
+            return;
+        }
+        let rel = dir.strip_prefix(&self.root).unwrap_or(dir).display().to_string();
+        let followup = missions::new_id(store::now_ms() + 1);
+        let agents: Vec<(String, String)> = self.agents.iter().map(|a| (a.name.clone(), a.description.clone())).collect();
+        let companies: Vec<(String, Vec<String>)> = self.companies.iter().filter_map(|c| c.parsed.as_ref().ok().map(|p| (c.file.clone(), p.outline()))).collect();
+        let args = super::assistant::debrief_args(self.lang, &rel, &followup, &agents, &companies);
+        self.assistant_request = Some((AssistantKind::Debrief, args));
     }
 
     fn key_mission_view(&mut self, k: KeyEvent) {
         let Some(v) = self.mission_view.as_mut() else { return };
         match k.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter | KeyCode::Char('o') => self.mission_view = None,
+            KeyCode::Char('d') => {
+                let dir = v.dir.clone();
+                self.mission_view = None;
+                self.start_debrief(&dir);
+            }
             KeyCode::Down | KeyCode::Char('j') => v.scroll = v.scroll.saturating_add(1),
             KeyCode::Up | KeyCode::Char('k') => v.scroll = v.scroll.saturating_sub(1),
             KeyCode::PageDown | KeyCode::Char(' ') => v.scroll = v.scroll.saturating_add(15),
@@ -1203,10 +1475,20 @@ impl App {
         match k.code {
             KeyCode::Esc => return, // annule (mode déjà remis à Normal)
             KeyCode::Char('s') if ctrl => {
+                // Renommer un agent reporte le nouveau nom dans les postes qui le citent.
+                let new_name = form.to_def().name;
+                let renamed_from = form.original.clone().filter(|old| !old.is_empty() && *old != new_name);
                 match self.save_form(&form) {
-                    Ok(name) => self.status = tf!("agent « {name} » enregistré", "agent \"{name}\" saved"),
+                    Ok(name) => {
+                        let (done, failed) = renamed_from.as_deref().map(|o| self.rewire_agent(o, &name)).unwrap_or_default();
+                        self.status = match (done.is_empty(), failed.is_empty()) {
+                            (true, true) => tf!("agent « {name} » enregistré", "agent \"{name}\" saved"),
+                            (false, true) => tf!("agent « {name} » enregistré · postes mis à jour : {}", "agent \"{name}\" saved · seats updated: {}", done.join(", ")),
+                            (_, false) => tf!("agent « {name} » enregistré ⚠ postes NON mis à jour : {}", "agent \"{name}\" saved ⚠ seats NOT updated: {}", failed.join(", ")),
+                        };
+                    }
                     Err(e) => {
-                        self.status = format!("erreur : {e:#}");
+                        self.status = erreur(&e);
                         self.mode = Mode::EditAgent(form);
                     }
                 }
@@ -1225,7 +1507,7 @@ impl App {
     fn save_form(&mut self, form: &AgentForm) -> anyhow::Result<String> {
         let def = form.to_def();
         if def.description.is_empty() {
-            anyhow::bail!("la description est obligatoire");
+            anyhow::bail!("{}", tr("la description est obligatoire", "the description is required"));
         }
         agent::save(&self.root, &def)?;
         if let Some(old) = &form.original {
@@ -1255,6 +1537,45 @@ impl App {
     }
 
     /// `a` : nouveau poste sous le poste sélectionné ; `e` : édite le poste sélectionné.
+    /// Fenêtre de choix du mode d'édition : ←→/↑↓/Tab changent, Entrée valide, 1 et 2 choisissent, Échap annule.
+    fn key_choose_edit(&mut self, mut c: EditChoice, k: KeyEvent) {
+        let go = match k.code {
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('h' | 'j' | 'k' | 'l') => {
+                c.sel = 1 - c.sel;
+                self.mode = Mode::ChooseEdit(c);
+                return;
+            }
+            KeyCode::Char('1' | 's' | 'S') => 0,
+            KeyCode::Char('2' | 'm' | 'M') => 1,
+            KeyCode::Enter => c.sel,
+            _ => {
+                self.status = tr("Annulé.", "Cancelled.").into();
+                return;
+            }
+        };
+        if go == 1 {
+            let what = match &c.what {
+                EditWhat::Agent(n) => format!("the subagent \"{n}\" (a Markdown file with YAML frontmatter: name, description, model, tools; then the system prompt)"),
+                EditWhat::Seat(id) => format!("the seat with id \"{id}\" in the company file (a TOML file: [[seats]] tables; keep every other seat unchanged and keep reports_to links consistent)"),
+                EditWhat::Company => "the company file (a TOML file: a tree of [[seats]]; keep reports_to links consistent)".to_string(),
+                EditWhat::Mission => "the mission brief (a Markdown file)".to_string(),
+            };
+            let agents: Vec<String> = self.agents.iter().map(|a| a.name.clone()).collect();
+            let args = super::assistant::edit_args(self.lang, &what, &c.file.to_string_lossy(), &agents);
+            self.assistant_request = Some((AssistantKind::Edit, args));
+            return;
+        }
+        match c.what {
+            EditWhat::Agent(name) => {
+                if let Some(a) = self.agents.iter().find(|a| a.name == name) {
+                    self.mode = Mode::EditAgent(AgentForm::new(Some(a)));
+                }
+            }
+            EditWhat::Seat(_) => self.open_seat_form(true),
+            EditWhat::Company | EditWhat::Mission => self.editor_request = Some(c.file),
+        }
+    }
+
     fn open_seat_form(&mut self, edit: bool) {
         let Some((path, c, i)) = self.selected_seat() else { return };
         let agents: Vec<String> = self.agents.iter().map(|a| a.name.clone()).collect();
@@ -1269,26 +1590,51 @@ impl App {
     fn key_seat_form(&mut self, mut form: SeatForm, k: KeyEvent) {
         let n = form.fields.len();
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        match k.code {
-            KeyCode::Esc => return,
-            KeyCode::Char('s') if ctrl => {
-                match self.save_seat(&form) {
-                    Ok(id) => self.status = tf!("poste « {id} » enregistré", "seat \"{id}\" saved"),
-                    Err(e) => {
-                        self.status = format!("erreur : {e:#}");
-                        self.mode = Mode::EditSeat(form);
-                    }
+        // Vérification en cours : « o » confirme, toute autre touche revient au formulaire.
+        if let Some(validate) = form.confirm.take() {
+            if matches!(k.code, KeyCode::Char('o' | 'O' | 'y' | 'Y')) {
+                if validate {
+                    return self.submit_seat_form(form);
                 }
+                self.status = tr("Modifications abandonnées.", "Changes discarded.").into();
                 return;
             }
-            KeyCode::Tab => form.focus = (form.focus + 1) % n,
-            KeyCode::BackTab => form.focus = (form.focus + n - 1) % n,
-            KeyCode::Enter if form.focus < n - 1 => form.focus += 1,
+            self.mode = Mode::EditSeat(form);
+            return;
+        }
+        match k.code {
+            KeyCode::Esc if form.changed() => form.confirm = Some(false),
+            KeyCode::Esc => return,
+            KeyCode::Char('s') if ctrl => form.confirm = Some(true),
+            KeyCode::Up => form.focus = form.focus.saturating_sub(1),
+            KeyCode::Down => form.focus = (form.focus + 1).min(n + SEAT_BUTTONS - 1),
+            KeyCode::Tab => form.focus = (form.focus + 1) % (n + SEAT_BUTTONS),
+            KeyCode::BackTab => form.focus = (form.focus + n + SEAT_BUTTONS - 1) % (n + SEAT_BUTTONS),
+            KeyCode::Left | KeyCode::Right if form.focus >= n => form.focus = if form.focus == n { n + 1 } else { n },
+            KeyCode::Enter if form.focus == n => form.confirm = Some(true),
+            KeyCode::Enter if form.focus == n + 1 => {
+                if !form.changed() {
+                    return;
+                }
+                form.confirm = Some(false);
+            }
+            KeyCode::Enter => form.focus += 1,
+            _ if form.focus >= n => {}
             _ => {
                 form.fields[form.focus].handle_key(k);
             }
         }
         self.mode = Mode::EditSeat(form);
+    }
+
+    fn submit_seat_form(&mut self, form: SeatForm) {
+        match self.save_seat(&form) {
+            Ok(id) => self.status = tf!("poste « {id} » enregistré", "seat \"{id}\" saved"),
+            Err(e) => {
+                self.status = erreur(&e);
+                self.mode = Mode::EditSeat(form);
+            }
+        }
     }
 
     fn save_seat(&mut self, form: &SeatForm) -> anyhow::Result<String> {
@@ -1327,7 +1673,7 @@ impl App {
     /// Supprime un poste ; ses subordonnés remontent d'un cran. Le boss ne part que s'il est seul.
     fn delete_seat(&mut self, path: &std::path::Path, id: &str) -> anyhow::Result<()> {
         let mut c = Company::load(path)?;
-        let i = c.index_of(id).ok_or_else(|| anyhow::anyhow!("poste introuvable"))?;
+        let i = c.index_of(id).ok_or_else(|| anyhow::anyhow!("{}", tr("poste introuvable", "seat not found")))?;
         let parent = c.seats[i].reports_to.clone();
         if parent.is_none() && c.seats.len() > 1 {
             anyhow::bail!("{}", tr("le boss ne peut pas être supprimé tant qu'il a des subordonnés", "the boss cannot be deleted while it has subordinates"));
@@ -1343,37 +1689,79 @@ impl App {
         Ok(())
     }
 
+    /// Postes (« entreprise · poste ») qui utilisent l'agent `name`, d'après les entreprises lisibles.
+    /// Reporte un renommage d'agent dans les postes des entreprises : (postes mis à jour, échecs).
+    fn rewire_agent(&mut self, old: &str, new: &str) -> (Vec<String>, Vec<String>) {
+        let (mut done, mut failed) = (vec![], vec![]);
+        for e in &self.companies {
+            let Ok(c) = &e.parsed else { continue };
+            if !c.seats.iter().any(|s| s.agent == old) {
+                continue;
+            }
+            let mut c = c.clone();
+            let file = e.file.trim_end_matches(".toml").to_string();
+            let ids: Vec<String> = c.seats.iter().filter(|s| s.agent == old).map(|s| format!("{file} · {}", s.id)).collect();
+            for s in c.seats.iter_mut().filter(|s| s.agent == old) {
+                s.agent = new.to_string();
+            }
+            match c.save(&e.path) {
+                Ok(()) => done.extend(ids),
+                Err(_) => failed.extend(ids),
+            }
+        }
+        self.reload();
+        (done, failed)
+    }
+
+    pub fn seats_using_agent(&self, name: &str) -> Vec<String> {
+        self.companies
+            .iter()
+            .filter_map(|e| e.parsed.as_ref().ok().map(|c| (e.file.trim_end_matches(".toml"), c)))
+            .flat_map(|(file, c)| c.seats.iter().filter(move |s| s.agent == name).map(move |s| format!("{file} · {}", s.id)))
+            .collect()
+    }
+
+    /// Exécute l'action confirmée. Chaque action rafraîchit l'état affiché et annonce son résultat.
     fn run_action(&mut self, a: PendingAction) {
         match a {
-            PendingAction::DeleteHistory(id) => {
-                match store::delete(&self.root, &id) {
-                    Ok(()) => self.status = tr("run supprimé de l'historique", "run removed from history").into(),
-                    Err(e) => self.status = format!("erreur : {e:#}"),
+            PendingAction::DeleteAgent(name) => {
+                match agent::delete(&self.root, &name) {
+                    Ok(true) => self.status = tf!("agent « {name} » supprimé", "agent \"{name}\" deleted"),
+                    Ok(false) => self.status = tf!("« {name} » vient du dossier utilisateur (~/.claude/agents) : supprimez-le à la main", "\"{name}\" comes from the user folder (~/.claude/agents): delete it by hand"),
+                    Err(e) => self.status = erreur(&e),
                 }
                 self.reload();
             }
-            PendingAction::CancelRun => {
+            PendingAction::DeleteSeat(path, id, title) => {
+                match self.delete_seat(&path, &id) {
+                    Ok(()) => self.status = tf!("poste « {title} » supprimé", "seat \"{title}\" deleted"),
+                    Err(e) => self.status = erreur(&e),
+                }
+            }
+            PendingAction::DeleteHistory(id, _) => {
+                match store::delete(&self.root, &id) {
+                    Ok(()) => self.status = tr("run supprimé de l'historique", "run removed from history").into(),
+                    Err(e) => self.status = erreur(&e),
+                }
+                self.reload();
+            }
+            PendingAction::CancelRun(_) => {
                 if let Some(r) = &self.run {
                     let _ = r.cancel.send(true);
                     self.status = tr("annulation demandée…", "cancellation requested…").into();
                 }
             }
+            PendingAction::QuitRun(_) => self.quit_now(),
+            PendingAction::StartMission(_, resume) => self.launch_mission(resume),
             PendingAction::FinishTerm => self.finish_term(),
+            PendingAction::RemoveSession(id, name) => {
+                self.status = tf!("suppression de « {name} »…", "deleting \"{name}\"…");
+                self.session_action(id, tr("supprimée", "deleted"), true);
+            }
             PendingAction::StopSession(id, name) => {
-                self.status = format!("arrêt de « {name} »…");
+                self.status = tf!("arrêt de « {name} »…", "stopping \"{name}\"…");
                 self.session_action(id, tr("arrêtée", "stopped"), false);
             }
-        }
-    }
-
-    fn key_confirm(&mut self, name: String, k: KeyEvent) {
-        if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('o')) {
-            match agent::delete(&self.root, &name) {
-                Ok(true) => self.status = tf!("agent « {name} » supprimé", "agent \"{name}\" deleted"),
-                Ok(false) => self.status = tf!("« {name} » vient du dossier utilisateur (~/.claude/agents) : supprimez-le à la main", "\"{name}\" comes from the user folder (~/.claude/agents): delete it by hand"),
-                Err(e) => self.status = format!("erreur : {e:#}"),
-            }
-            self.reload();
         }
     }
 
@@ -1401,7 +1789,7 @@ impl App {
         let dir = match missions::create(&self.root, &id) {
             Ok(d) => d,
             Err(e) => {
-                self.status = format!("erreur : {e:#}");
+                self.status = erreur(&e);
                 return;
             }
         };
@@ -1412,15 +1800,32 @@ impl App {
         self.assistant_request = Some((AssistantKind::Mission, args));
     }
 
-    /// `r` sur l'onglet Entreprise : lance la mission sélectionnée avec l'entreprise sélectionnée.
+    /// `r` / `R` sur l'onglet Entreprise : lance la mission sélectionnée avec l'entreprise sélectionnée.
     /// `resume` : une mission dont la conception est terminée repart de son plan au lieu de tout rejouer.
+    /// Un lancement qui écraserait conception ou rapport existants demande d'abord confirmation.
     fn start_mission(&mut self, resume: bool) {
         if self.running() {
             self.status = tr("un run est déjà en cours", "a run is already in progress").into();
             return;
         }
+        let selected = self.visible_missions().contains(&self.mission_sel).then(|| self.missions.get(self.mission_sel)).flatten();
+        if let Some(m) = selected {
+            if (m.has_conception || m.has_report) && !(resume && m.resumable) {
+                self.mode = Mode::ConfirmAction(PendingAction::StartMission(m.title.clone(), resume));
+                return;
+            }
+        }
+        self.launch_mission(resume);
+    }
+
+    /// Lance la mission sélectionnée, sans confirmation (voir `start_mission`).
+    fn launch_mission(&mut self, resume: bool) {
+        if self.running() {
+            self.status = tr("un run est déjà en cours", "a run is already in progress").into();
+            return;
+        }
         let Some(company) = self.usable_company() else { return };
-        let Some(mission) = self.missions.get(self.mission_sel).cloned() else {
+        let Some(mission) = self.visible_missions().contains(&self.mission_sel).then(|| self.missions.get(self.mission_sel).cloned()).flatten() else {
             self.status = tr("aucune mission : m pour en cadrer une avec le boss", "no mission: m to frame one with the boss").into();
             return;
         };
@@ -1431,12 +1836,16 @@ impl App {
                 return;
             }
         };
+        if let Some(file) = self.companies.get(self.comp_sel).map(|c| c.file.clone()) {
+            let _ = missions::set_company(&mission.dir, &file);
+            self.missions = missions::list(&self.root);
+        }
         let (cancel_tx, cancel_rx) = watch::channel(false);
         self.run = Some(RunView {
             name: format!("{} · {}", company.name, mission.title),
             nodes: vec![],
             sel: 0,
-            cost: 0.0,
+            tokens: 0,
             finished: None,
             cancel: cancel_tx,
         });
@@ -1476,7 +1885,7 @@ impl App {
                     let _ = notice_tx.send(AppEvent::Notice(tf!("mission {verdict} — livrables dans {dir}", "mission {verdict} — deliverables in {dir}")));
                 }
                 Err(e) => {
-                    let _ = fail_tx.send(RunEvent::RunFinished { ok: false, cost_usd: 0.0 });
+                    let _ = fail_tx.send(RunEvent::RunFinished { ok: false, tokens: 0 });
                     let _ = notice_tx.send(AppEvent::Notice(tf!("mission impossible : {e:#}", "mission impossible: {e:#}")));
                 }
             }
@@ -1492,6 +1901,7 @@ impl App {
         }
         if matches!(ev, RunEvent::RunFinished { .. }) {
             self.checkpoint = None; // run terminé ou annulé pendant l'attente
+            self.write_compte_rendu(&ev);
             self.missions = missions::list(&self.root); // conception.md / rapport.md viennent d'apparaître
         }
         let Some(run) = &mut self.run else { return };
@@ -1532,24 +1942,64 @@ impl App {
                     log.drain(..log.len() - MAX_LOG);
                 }
             }
-            RunEvent::NodeFinished { id, status, cost_usd } => {
+            RunEvent::NodeFinished { id, status, tokens } => {
                 if let Some(i) = node(run, &id) {
                     let n = &mut run.nodes[i];
                     if let NodeStatus::Failed(m) | NodeStatus::Skipped(m) = &status {
                         n.log.push(format!("— {m}"));
                     }
-                    n.cost = cost_usd;
+                    n.tokens = tokens;
                     n.state = NodeState::Done(status);
                 }
             }
-            RunEvent::RunFinished { ok, cost_usd } => {
-                run.cost = cost_usd;
+            RunEvent::RunFinished { ok, tokens } => {
+                run.tokens = tokens;
                 run.finished = Some(ok);
             }
         }
         if self.run.as_ref().is_some_and(|r| r.finished.is_some()) {
             self.persist_run();
         }
+    }
+
+    /// Écrit `compte-rendu.md` dans la mission quand son run se termine (rien à écrire pour un pipeline).
+    fn write_compte_rendu(&mut self, ev: &RunEvent) {
+        let RunEvent::RunFinished { ok, tokens } = ev else { return };
+        let (Some(run), Some((company, dir))) = (&self.run, &self.run_ctx) else { return };
+        let read = |n: &str| std::fs::read_to_string(dir.join(n)).unwrap_or_default();
+        let realised = run.nodes.iter().any(|n| n.id.contains("/realisation/"));
+        let steps: Vec<_> = run
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.state, NodeState::Done(_)))
+            .map(|n| missions::StepLine {
+                label: n.label.clone(),
+                agent: n.agent.clone(),
+                status: match &n.state {
+                    NodeState::Done(NodeStatus::Succeeded) => "✔".into(),
+                    NodeState::Done(NodeStatus::Failed(_)) => "✖".into(),
+                    NodeState::Done(NodeStatus::Skipped(_)) => "⊘".into(),
+                    _ => "—".into(),
+                },
+                tokens: n.tokens,
+            })
+            .collect();
+        let issues = run
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.state {
+                NodeState::Done(NodeStatus::Failed(m)) | NodeState::Done(NodeStatus::Skipped(m)) => Some((n.label.clone(), m.clone())),
+                _ => None,
+            })
+            .collect();
+        let final_report = if realised { read("rapport.md") } else { read("conception.md") };
+        let title = run.name.split(" · ").nth(1).unwrap_or(&run.name).to_string();
+        let date = RunRecord { id: String::new(), pipeline: String::new(), started_ms: self.run_started_ms, finished: None, tokens: 0, nodes: vec![] }.started_label();
+        let md = missions::compte_rendu(
+            &missions::ReportData { title: &title, company: &company.name, date: &date, ok: *ok, realised, tokens: *tokens, steps, issues, final_report: &final_report },
+            self.lang == Lang::Fr,
+        );
+        let _ = missions::write_output(dir, "compte-rendu.md", &md);
     }
 
     /// Enregistre l'état du run courant (au démarrage, puis à la fin).
@@ -1560,7 +2010,7 @@ impl App {
             pipeline: run.name.clone(),
             started_ms: self.run_started_ms,
             finished: run.finished,
-            cost_usd: if run.finished.is_some() { run.cost } else { run.nodes.iter().map(|n| n.cost).sum() },
+            tokens: if run.finished.is_some() { run.tokens } else { run.nodes.iter().map(|n| n.tokens).sum() },
             nodes: run
                 .nodes
                 .iter()
@@ -1573,7 +2023,7 @@ impl App {
                         NodeState::Done(s) => Some(s.clone()),
                         _ => None,
                     },
-                    cost: n.cost,
+                    tokens: n.tokens,
                     log: n.log.clone(),
                 })
                 .collect(),
@@ -1606,17 +2056,22 @@ impl App {
                     // Un nœud sans statut dans un run terminé a été interrompu.
                     state: NodeState::Done(n.status.clone().unwrap_or(NodeStatus::Cancelled)),
                     log: n.log.clone(),
-                    cost: n.cost,
+                    tokens: n.tokens,
                 })
                 .collect(),
             sel: 0,
-            cost: h.cost_usd,
+            tokens: h.tokens,
             finished: Some(h.finished.unwrap_or(false)),
             cancel,
         });
         self.run_id = None; // lecture seule : ne pas réécrire l'historique
         self.show_history = false;
     }
+}
+
+/// Message d'erreur affiché dans la barre d'état, selon la langue courante.
+pub fn erreur(e: &anyhow::Error) -> String {
+    tf!("erreur : {e:#}", "error: {e:#}")
 }
 
 fn step(i: usize, len: usize, down: bool) -> usize {

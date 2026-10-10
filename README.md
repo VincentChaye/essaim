@@ -2,8 +2,9 @@
 
 TUI en Rust pour concevoir et exécuter des structures multi-agents avec Claude Code.
 Tout passe par le CLI `claude` et **votre abonnement** : aucune clé API n'est utilisée.
-Les variables `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`
-et `CLAUDE_CODE_USE_FOUNDRY` sont retirées de chaque processus `claude` lancé par essaim. Un nœud `-p` dont la
+Les variables `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` et toute variable dont le nom commence par `CLAUDE_CODE_USE_`
+(par exemple `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`) sont retirées de chaque
+processus `claude` lancé par essaim. Le préfixe est reconnu tel quel, en majuscules. Un nœud `-p` dont la
 session n'est pas sur l'abonnement est interrompu (voir [Limites connues](#limites-connues)).
 
 ## Installation
@@ -15,7 +16,7 @@ cargo install --path .         # optionnel : installe `essaim` dans ~/.cargo/bin
 ```
 
 Prérequis :
-- Rust, édition 2024 (donc Rust 1.85 ou plus récent, déduit de `Cargo.toml`).
+- Rust, édition 2024 (`Cargo.toml` : `edition = "2024"`, qui exige Rust 1.85 ou plus récent ; aucune `rust-version` n'est déclarée).
 - `claude` dans le PATH (ou désigné par `ESSAIM_CLAUDE_BIN`), connecté : `claude auth status` → `claude.ai`.
 - Unix uniquement (voir [Limites connues](#limites-connues)).
 
@@ -48,7 +49,7 @@ git tag v0.1.0 && git push origin v0.1.0
 ## Reprendre une mission interrompue
 
 Quand la conception d'une mission est menée à terme (sans échec ni annulation), son plan est marqué validé
-(`.essaim/missions/<id>/conception.ok`). Si le run est ensuite annulé ou la réalisation refusée, la reprise repart de ce
+(`.essaim/missions/<id>/conception.ok`, avec un `conception.md` non vide). Si le run est ensuite annulé ou la réalisation refusée, la reprise repart de ce
 plan : la conception n'est pas rejouée (aucun appel reconsommé), le point de contrôle puis la réalisation se relancent.
 
 - TUI, onglet Entreprise : `r` reprend automatiquement une mission « plan validé · reprenable » ; `R` recommence à zéro.
@@ -60,11 +61,11 @@ réalisation annulée repart du début du plan (les fichiers déjà modifiés re
 ## Modifier le plan avant la réalisation
 
 Au point de contrôle (onglet Run), `e` ouvre une conversation avec le boss de l'entreprise (session Claude Code en mode
-plan, onglet 6). Il lit le brief et le plan consolidé, discute des changements avec vous, puis réécrit
+plan, dans l'onglet 5). Il lit le brief et le plan consolidé, discute des changements avec vous, puis réécrit
 `.essaim/missions/<id>/conception.md`. En quittant (`/exit`), le plan relu s'affiche : `Entrée` lance la réalisation avec
 la version révisée, `Échap` arrête, `e` rouvre la conversation. Le run reste en attente pendant la conversation.
 La réalisation lit toujours `conception.md` au moment de la validation : une retouche manuelle du fichier est donc
-aussi prise en compte. En CLI (`company run`), répondre `e` au point de contrôle fait la même chose : `claude` s'ouvre dans le terminal, puis le plan relu est réaffiché (`o` valide, `N` arrête, `e` recommence). Avec `--yes`, le plan n'est pas modifiable.
+aussi prise en compte. En CLI (`company run`), répondre `e` au point de contrôle fait la même chose : `claude` s'ouvre dans le terminal, puis le plan relu est réaffiché (`o` valide, `N` ou toute autre réponse arrête, `e` recommence). Avec `--yes`, le plan n'est pas modifiable.
 
 ## Démarrage rapide
 
@@ -85,46 +86,102 @@ Dans la TUI : `2` (Entreprise) → `m` pour cadrer une mission avec le boss → 
 | `essaim agents` | liste les agents |
 | `essaim company show <e.toml>` | affiche l'organigramme (niveaux N, N-1…) et l'estimation d'appels |
 | `essaim company check <e.toml>` | valide l'organigramme |
-| `essaim company run <e.toml> (--brief "…" \| --mission <id> [--resume]) [--yes]` | exécute une mission (conception → plan → réalisation) ; `--resume` reprend une mission interrompue |
+| `essaim company run <e.toml> (--brief "…" \| --brief @fichier \| --mission <id> [--resume]) [--yes]` | exécute une mission (conception → plan → réalisation) ; `--resume` reprend une mission interrompue |
 
 - `--root <dossier>` (défaut : dossier courant) est accepté par `init`, `agents`, `company check` et
   `company run`. `company show` ne l'accepte pas.
 - `--brief @fichier` lit le brief dans un fichier. `--brief "…"` crée un nouveau dossier
-  `.essaim/missions/<id>/` ; `--mission <id>` reprend un brief existant (`brief.md`).
+  `.essaim/missions/<id>/` ; `--mission <id>` reprend un brief existant (`brief.md`). `--brief` et `--mission` ne se combinent pas ; `--resume` exige `--mission`.
 - `--yes` est requis si l'estimation dépasse **30 appels** (seuil fixe). Il valide aussi le point de contrôle :
-  la réalisation démarre sans invite. Sans `--yes`, essaim demande « Lancer la réalisation (les postes ⚒ vont modifier le projet) ? [o/N] » sur stdin.
+  la réalisation démarre sans invite. Sans `--yes`, essaim demande « Lancer la réalisation (les postes ⚒ vont modifier le projet) ? [o/N/e = modifier le plan avec le boss] » sur stdin.
 - Codes de sortie : `0` = succès ; `1` = erreur (lecture, validation, `--yes` manquant) ou nœud/poste en échec.
   Une réalisation refusée sort aussi en `0` (voir [Limites connues](#limites-connues)).
 
+Exemples qui ne lancent pas `claude` (copiables tels quels, à la racine d'un projet) :
+
+```sh
+essaim init
+essaim agents
+essaim company check .claude/companies/acme-studio.toml
+essaim company show .claude/companies/acme-studio.toml
+```
+
+Exemple de mission (lance `claude` et consomme votre abonnement) :
+
+```sh
+printf '%s\n' "Ajouter une page d'accueil" > brief.md
+essaim company run .claude/companies/acme-studio.toml --brief @brief.md
+```
+
+Reprise (remplacez `<id>` par le nom d'un dossier de `.essaim/missions/`) :
+
+```sh
+essaim company run .claude/companies/acme-studio.toml --mission <id> --resume
+```
+
 ## Touches
 
-`Tab` / `Maj+Tab`, `F1`–`F5` ou `1`–`5` changent d'onglet · `Ctrl+K` ouvre l'aide de l'onglet courant (`m` : manuel complet au format `man`, navigation façon `less`) · `F10` ouvre les réglages (langue français/English, choisie au premier lancement ; l'interface suit ce choix, les consignes envoyées aux modèles sont en anglais — moins de tokens — avec la langue choisie en rappel et mémorisée dans `~/.config/essaim/settings.toml` ou équivalent de ta plateforme) · `q` ou `Ctrl+C` quitte (annule le run en cours).
+**Cinq onglets**, dans cet ordre : `1` **Agents** · `2` **Entreprise** · `3` **Run** · `4` **Sessions** · `5` **Claude** (session Claude Code intégrée).
 
-- **Agents** : `n` créer **avec l'assistant** · `N` créer avec un formulaire · `e` ou `Entrée` éditer (formulaire) · `D` supprimer (confirmation `o` ou `y`).
-  Formulaire : `Tab` champ suivant, `←` `→` choisir le modèle, `Ctrl+S` enregistrer, `Échap` annuler.
+### Partout (hors session Claude)
 
-- **Entreprise** : `n` créer une entreprise **avec l'assistant** · `m` cadrer une mission avec le boss · `r` (ou `R`) lancer la mission choisie · `t`/`T` mission suivante/précédente · `Entrée` ouvrir une mission (brief, plan, rapport — anciennes comprises) · `c`/`C` entreprise suivante/précédente · `E` éditer le TOML (`$VISUAL` / `$EDITOR`).
-- **Run** : `↑↓` choisir un nœud · `s` annuler le run en cours · `h` historique (`Entrée` rouvre un run, `D` le supprime).
-- **Sessions** : `a` ou `Entrée` attacher (dans l'onglet Claude) · `s` arrêter · `x` supprimer (confirmation `o` ou `y`) · `r` rafraîchir.
+- `Tab` / `Maj+Tab` : onglet suivant / précédent. `1`–`5` : onglet numéroté.
+- `F1`–`F5` ou `Alt`+`1`–`5` : onglet numéroté, y compris dans la session Claude. Sur AZERTY, `Alt`+ `&` `é` `"` `'` `(` pour `1` à `5`.
+- `Ctrl+PgUp` / `Ctrl+PgDn` : onglet précédent / suivant.
+- `Ctrl+K` : ouvre ou ferme l'aide de l'onglet courant. Dans l'aide, `m` bascule vers le manuel complet au format `man` (navigation façon `less` : `↑` `↓` ou `j` `k`, `Espace` / `b`, `g` / `G`).
+- `F10` : réglages. Langue français/English, choisie au premier lancement ; l'interface suit ce choix. Les consignes envoyées aux modèles sont en anglais (moins de tokens), avec la langue choisie en rappel. Le choix est mémorisé dans `settings.toml` (voir [Formats](#formats)).
+- `q` ou `Ctrl+C` : quitte. Si un run est en cours, essaim demande confirmation (`o` ou `y`) ; le run est alors annulé.
 
-### Onglet Claude : terminal intégré (`5`)
+### 1 · Agents
 
-`n` (assistant) et `a` (attacher une session) ouvrent **un vrai Claude Code dans l'onglet 6**, sans quitter
+- `n` créer **avec l'assistant** · `N` créer avec un formulaire · `D` supprimer (confirmation `o` ou `y`).
+- `e` ou `Entrée` : fenêtre de choix du mode d'édition. `1` ou `s` = édition simple (formulaire ou `$EDITOR`), `2` ou `m` = avec le modèle (conversation). `←` `→` ou `Tab` changent, `Entrée` valide, `Échap` annule.
+- Formulaire : `Tab` champ suivant, `←` `→` choisir le modèle, `Ctrl+S` enregistrer, `Échap` annuler.
+
+### 2 · Entreprise
+
+L'onglet a trois zones : **Entreprises**, **Missions** et **organigramme**.
+
+- `←` `→` (ou `h` `l`) passent d'une zone à l'autre (Entreprises ↔ Missions). `↓` va à l'organigramme, `↑` revient aux Missions depuis l'organigramme.
+- `Entrée` entre dans la zone : les flèches n'agissent alors que dedans. `Échap` en sort.
+- Zone Entreprises (après `Entrée`) : `↑` `↓` changent d'entreprise ; `Entrée` passe aux Missions.
+- Zone Missions (après `Entrée`) : `↑` `↓` choisissent la mission ; `Entrée` ou `o` ouvre la mission (brief, plan, rapport, anciennes comprises) ; `Espace` (ou `←` `→`) déplie ou replie son résumé.
+- Zone organigramme (après `Entrée`) : `↑` supérieur · `↓` premier subordonné · `←` `→` voisin du même niveau · `Home` ou `g` premier poste (le boss). `a` ajoute un poste sous le poste choisi · `e` édite le poste · `x` retire le poste (confirmation ; ses subordonnés remontent d'un cran). Le boss ne part que seul.
+- `e` dans une zone entrée : édite le poste, l'entreprise ou le brief selon la zone. Une fenêtre propose l'édition simple (formulaire de poste, ou `$EDITOR` pour un fichier) ou l'édition avec le modèle. Les formulaires de poste réécrivent le TOML, qui perd alors ses commentaires.
+- Hors zone : `n` créer une entreprise **avec l'assistant** · `m` cadrer une mission avec le boss · `c` / `C` entreprise suivante / précédente · `t` / `T` mission suivante / précédente.
+- `r` lance la mission choisie. Si sa conception est menée à terme, elle reprend à la réalisation sans rejouer la conception. Sinon, ou si un plan ou un rapport existe déjà, une confirmation est demandée. `R` relance depuis le début, après confirmation si un plan ou un rapport existe.
+
+### 3 · Run
+
+- `↑` `↓` choisissent un nœud (son journal s'affiche) · `s` annule le run en cours (confirmation, si le run n'est pas terminé).
+- `h` bascule l'historique. Dans l'historique, `↑` `↓` choisissent, `Entrée` rouvre un run, `D` le supprime (confirmation).
+- Point de contrôle (plan consolidé, affiché à la fin de la conception quand `checkpoint = true`) : `Entrée` lance la réalisation · `Échap` arrête la mission sur le plan · `e` ouvre la conversation avec le boss (voir [Modifier le plan](#modifier-le-plan-avant-la-réalisation)) · `↑` `↓` ou `j` `k`, `PgUp` / `PgDn` font défiler le plan.
+
+### 4 · Sessions
+
+Sessions background de Claude Code.
+
+- `↑` `↓` choisissent une session · `a` ou `Entrée` l'attache dans l'onglet 5 · `s` arrête · `x` supprime (confirmation `o` ou `y`) · `r` rafraîchit la liste.
+
+### 5 · Claude : terminal intégré
+
+`n` (assistant, dans Agents ou Entreprise) et `a` (attacher une session, dans Sessions) ouvrent **un vrai Claude Code dans l'onglet 5**, sans quitter
 l'outil. essaim possède le pseudo-terminal : il interprète l'affichage de Claude et lui réinjecte tes
 touches (flèches, Entrée, Échap, Ctrl+…, collage…). Tout fonctionne comme dans un terminal normal :
 questionnaires, validation du plan, demandes de permission, commandes `/…`.
 
 - **Changer d'onglet sans quitter la session** (raccourcis interceptés avant d'atteindre Claude) :
-  `F1`–`F6` · `Alt`+`1`–`6` (sur AZERTY : `Alt`+`&` `é` `"` `'` `(` `§`) · `Ctrl+PageUp` / `Ctrl+PageDown`.
-  La session continue en arrière-plan (pastille ● sur l'onglet) ; en revenant sur l'onglet 6, le focus
+  `F1`–`F5` · `Alt`+`1`–`5` (sur AZERTY : `Alt`+`&` `é` `"` `'` `(`) · `Ctrl+PgUp` / `Ctrl+PgDn`.
+  `Ctrl+K` et `F10` sont aussi interceptés.
+  La session continue en arrière-plan (pastille ● sur l'onglet) ; en revenant sur l'onglet 5, le focus
   lui est rendu automatiquement.
   `Alt` demande que le terminal envoie Option/Alt comme « Meta » (iTerm2 : *Left Option key = Esc+* ;
-  Terminal.app : *Utiliser Option comme touche Meta*). Sinon, `F1`–`F6` (avec `Fn` sur Mac) fonctionnent partout.
-- `Ctrl+\` : bascule en touches de navigation sur l'onglet lui-même ; `Entrée` ou `i` reprend la session, `x` la ferme.
-- Tant que le focus est dans la session, **toutes** les touches vont à Claude (y compris `q` et `Ctrl+C`).
+  Terminal.app : *Utiliser Option comme touche Meta*). Sinon, `F1`–`F5` (avec `Fn` sur Mac) fonctionnent partout.
+- `Ctrl+\` : rend les touches de navigation à essaim (la session continue). `Entrée` ou `i` reprend la session, `x` la ferme (confirmation).
+- Tant que le focus est dans la session, **toutes** les autres touches vont à Claude (y compris `q` et `Ctrl+C`).
 - `/exit` dans la session la termine. Si elle a duré plus de 2 s et s'est terminée sans erreur, l'onglet se ferme et
   tu reviens là où tu étais. Sinon (sortie rapide ou code non nul), l'écran est conservé avec un bandeau ; une touche le ferme.
-- Une seule session intégrée à la fois.
+- Une seule session intégrée à la fois : si une session est déjà ouverte, essaim le signale et n'en lance pas une seconde.
 
 ### Créer avec l'assistant (`n` dans Agents ou Entreprise)
 
@@ -154,12 +211,19 @@ Une **entreprise** (`.claude/companies/<nom>.toml`) place des agents dans un org
 2. **Conception** (`r`) : le boss découpe par domaine et délègue à ses subordonnés directs, qui spécialisent et
    délèguent à leur tour jusqu'aux workers (texte, lecture seule) ; les rapports remontent et sont synthétisés à
    chaque niveau. Le rapport du boss est le **plan consolidé**.
-3. **Réalisation** : après validation du plan (Entrée / Échap dans la TUI ; invite `[o/N]` ou `--yes` en ligne de commande),
+3. **Réalisation** : après validation du plan (Entrée / Échap dans la TUI ; invite `[o/N/e]` ou `--yes` en ligne de commande),
    la branche des postes ⚒ met en place dans le projet. Chaque délégation porte un périmètre de fichiers inclus dans celui
    du supérieur ; les périmètres qui se chevauchent sont exécutés l'un après l'autre. Un poste ⚒ peut lire
    (`Read`, `Grep`, `Glob`) et écrire (`Edit`, `Write`) uniquement dans son périmètre, et lancer `Bash` seulement
    pour les commandes de `allow_bash` (règles `Bash(<commande>:*)`) ; le reste est refusé (`--permission-mode dontAsk`).
    La portée exacte de ces règles relève de Claude Code et n'est pas vérifiée ici.
+
+**Point de contrôle** (`checkpoint`, défaut `true`). Quand il est actif, le plan consolidé est affiché avant toute
+réalisation et demande validation. En ligne de commande, sans `--yes`, essaim pose la question
+« Lancer la réalisation (les postes ⚒ vont modifier le projet) ? [o/N/e = modifier le plan avec le boss] » ; `o`, `oui`, `y` ou `yes`
+lance la réalisation, toute autre réponse arrête la mission sur le plan.
+Avec `checkpoint = false`, il n'y a ni plan à valider ni invite : la réalisation démarre dès la fin de la conception.
+Un avertissement d'exécution signalera ce cas : **À CONFIRMER** (texte exact et canal, stderr ou bandeau TUI, à reprendre de la décision CTO ; il n'est pas encore présent dans le code).
 
 Livrables : `.essaim/missions/<id>/{brief,conception,rapport}.md`. `rapport.md` n'existe que si la réalisation
 a été lancée et s'est terminée. Garde-fous dans le TOML : `max_calls` (plafond d'appels `claude` par mission,
@@ -200,30 +264,33 @@ présenté au supérieur pour déléguer ; absent, seul l'intitulé est présent
 
 Les runs lancés depuis la TUI sont enregistrés dans `.essaim/runs/<id>/run.json` (ajoutez `.essaim/` à `.gitignore`).
 
+**Réglages** : `settings.toml` (langue) est stocké dans le dossier de configuration de la plateforme (par exemple `~/.config/essaim/` sous Linux).
+La variable `ESSAIM_CONFIG_DIR` remplace ce dossier.
+
 ## Limites connues
 
 - **Code de sortie 0 sur une réalisation refusée.** Au point de contrôle, un refus met `outcome.ok = conception.ok`
-  (`src/runtime/company_exec.rs:577-578`) : si la conception a réussi, la mission est « ok ». `essaim company run`
-  ne sort en `1` que si `!ok` (`src/main.rs:342-344`). Une réalisation refusée (Échap dans la TUI ; en ligne de commande,
+  (fonction `run_mission`, module `runtime::company_exec`) : si la conception a réussi, la mission est « ok ». `essaim company run`
+  ne sort en `1` que si la mission n'est pas `ok` (fonction `main`, branche `company run`). Une réalisation refusée (Échap dans la TUI ; en ligne de commande,
   réponse autre que `o`/`oui`/`y`/`yes`, ou stdin fermé sans `--yes`) sort donc en `0`.
-- **Pas de `--version`** : la commande `Cli` ne déclare pas de `version` (`src/main.rs:16`).
+- **Pas de `--version`** : la structure `Cli` (module `main`) ne déclare pas de `version`.
 - **Pas de version minimale de `claude`** : aucune vérification de version. Les options utilisées
   (`--bg`, `--agents`, `--json-schema`, `--permission-mode`, `agents --json --all`) doivent exister dans votre version.
-- **Unix uniquement** : `kill` est lancé par son nom (`src/runtime/claude_proc.rs:233`), le terminal intégré utilise
-  un pseudo-terminal (`portable-pty`), et le code ne contient aucune branche Windows.
-- **Vérification d'authentification** : une seule vérification réelle, sur le flux `-p`
-  (`src/runtime/claude_proc.rs:221-239` : refus si `apiKeySource` n'est pas `none`). Elle couvre les appels locaux
-  et `essaim company run`. Elle ne couvre ni les sessions `--bg` (`src/runtime/sessions.rs`), ni le
-  terminal intégré (`src/tui/term.rs`), ni les appels `claude agents`, `stop` et `rm`.
-  La barrière de suppression des variables est appliquée à deux endroits : `claude_command()`
-  (`src/runtime/claude_proc.rs:99-105`) et `TermSession::spawn` (`src/tui/term.rs:78-80`).
+- **Unix uniquement** : `kill` est lancé par son nom (fonction `spawn_with`, module `runtime::claude_proc`), le terminal intégré utilise
+  un pseudo-terminal (`portable-pty`, module `tui::term`), et le code ne contient aucune branche Windows.
+- **Vérification d'authentification** : une seule vérification réelle, sur le flux `-p` (fonction `spawn_with`,
+  module `runtime::claude_proc` : refus si `apiKeySource` n'est pas `none`). Elle couvre les appels locaux
+  et `essaim company run`. Elle ne couvre ni les sessions `--bg` (module `runtime::sessions`), ni le
+  terminal intégré (module `tui::term`), ni les appels `claude agents`, `stop` et `rm`.
+  La suppression des variables de facturation est appliquée à deux endroits : `claude_command()` (module `runtime::claude_proc`)
+  et `TermSession::spawn` (module `tui::term`). Les noms retirés sont `BILLING_ENV_VARS` (liste) et `BILLING_ENV_PREFIX` (préfixe `CLAUDE_CODE_USE_`).
 - **Environnement hérité** : chaque `claude` lancé hérite de tout l'environnement d'essaim (aucun `env_clear`),
-  sauf les cinq variables de `BILLING_ENV_VARS` (`src/runtime/claude_proc.rs:88-94`). Le terminal intégré ajoute
-  `TERM=xterm-256color` et `COLORTERM=truecolor` (`src/tui/term.rs:75-76`). `ESSAIM_CLAUDE_BIN` remplace le binaire
-  `claude` (`src/runtime/claude_proc.rs:100`, `src/tui/app.rs:649`). `VISUAL` ou `EDITOR` désigne l'éditeur, lancé sans shell
-  (`src/tui/mod.rs:24-27`). Essaim ne retire pas les réglages d'API placés dans les fichiers de configuration de
+  sauf les variables de facturation décrites ci-dessus. Le terminal intégré ajoute
+  `TERM=xterm-256color` et `COLORTERM=truecolor` (fonction `TermSession::spawn`). `ESSAIM_CLAUDE_BIN` remplace le binaire
+  `claude` (fonction `claude_command`, et lancement de la session intégrée dans le module `tui::app`). `VISUAL` ou `EDITOR` désigne l'éditeur, lancé sans shell
+  (fonction `open_in_editor`, module `tui`). Essaim ne retire pas les réglages d'API placés dans les fichiers de configuration de
   `claude` : cela n'est pas vérifié ici, et seul le contrôle `apiKeySource` (flux `-p`) le détecterait.
 - **Bash des postes ⚒** : la portée des règles `Bash(<commande>:*)` relève de Claude Code, non vérifiée ici.
-- Les entreprises se modifient dans un éditeur externe (`e` / `E`) ; l'onglet Entreprise propose aussi un formulaire de poste (`a` / `e` / `x`), qui réécrit le TOML et en supprime donc les commentaires.
+- Les entreprises se modifient dans un éditeur externe (`e` dans une zone entrée, option « simple ») ; l'onglet Entreprise propose aussi un formulaire de poste (`a` / `e` / `x`, dans l'organigramme), qui réécrit le TOML et en supprime donc les commentaires.
 - La délégation dynamique coûte jusqu'à ~2 appels par poste interne et par phase : surveille `max_calls` et ton quota.
 - Les « coûts » affichés sont notionnels (calculés par `claude`), non facturés avec l'abonnement.

@@ -16,7 +16,8 @@ pub struct NodeRecord {
     pub depth: usize,
     /// None = jamais terminé (run interrompu).
     pub status: Option<NodeStatus>,
-    pub cost: f64,
+    #[serde(default)]
+    pub tokens: u64,
     pub log: Vec<String>,
 }
 
@@ -28,7 +29,8 @@ pub struct RunRecord {
     pub started_ms: u64,
     /// None = en cours ou interrompu.
     pub finished: Option<bool>,
-    pub cost_usd: f64,
+    #[serde(default)]
+    pub tokens: u64,
     pub nodes: Vec<NodeRecord>,
 }
 
@@ -129,8 +131,8 @@ mod tests {
             pipeline: "p".into(),
             started_ms: 1_791_460_000_000,
             finished: ok,
-            cost_usd: 0.01,
-            nodes: vec![NodeRecord { id: "a".into(), agent: "x".into(), label: String::new(), depth: 0, status: Some(NodeStatus::Failed("boum".into())), cost: 0.01, log: vec!["l1".into()] }],
+            tokens: 0,
+            nodes: vec![NodeRecord { id: "a".into(), agent: "x".into(), label: String::new(), depth: 0, status: Some(NodeStatus::Failed("boum".into())), tokens: 0, log: vec!["l1".into()] }],
         }
     }
 

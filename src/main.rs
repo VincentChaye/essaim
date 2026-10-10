@@ -255,17 +255,17 @@ fn spawn_printer(mut rx: mpsc::UnboundedReceiver<RunEvent>, auto_yes: bool, edit
                     eprintln!("  [{}] outil {tool}", name(&labels, &id).trim())
                 }
                 RunEvent::Node { .. } => {}
-                RunEvent::NodeFinished { id, status, cost_usd } => {
+                RunEvent::NodeFinished { id, status, tokens } => {
                     let n = name(&labels, &id);
                     match status {
-                        NodeStatus::Succeeded => eprintln!("✔ {n} (coût notionnel {cost_usd:.4} $)"),
+                        NodeStatus::Succeeded => eprintln!("✔ {n} ({tokens} tokens)"),
                         NodeStatus::Failed(e) => eprintln!("✖ {n} : {e}"),
                         NodeStatus::Skipped(r) => eprintln!("⊘ {n} : {r}"),
                         NodeStatus::Cancelled => eprintln!("✖ {n} : annulé"),
                     }
                 }
-                RunEvent::RunFinished { ok, cost_usd } => {
-                    eprintln!("{} coût notionnel total {cost_usd:.4} $ (abonnement, non facturé)", if ok { "terminé —" } else { "échec —" })
+                RunEvent::RunFinished { ok, tokens } => {
+                    eprintln!("{} {tokens} tokens au total", if ok { "terminé —" } else { "échec —" })
                 }
             }
         }
