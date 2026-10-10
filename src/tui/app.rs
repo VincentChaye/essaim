@@ -72,6 +72,16 @@ pub enum EditWhat {
     Mission,
 }
 
+/// Prérequis d'une mission : cases à cocher parmi les autres missions (toutes entreprises confondues).
+#[derive(Debug, Clone)]
+pub struct LinkForm {
+    pub mission: String,
+    pub title: String,
+    /// (id, titre, coché)
+    pub rows: Vec<(String, String, bool)>,
+    pub sel: usize,
+}
+
 /// Choix entre édition simple (formulaire ou $EDITOR) et édition avec le modèle (conversation).
 #[derive(Debug, Clone)]
 pub struct EditChoice {
@@ -349,6 +359,8 @@ pub enum Mode {
     EditSeat(SeatForm),
     /// Choix du mode d'édition : simple ou avec le modèle.
     ChooseEdit(EditChoice),
+    /// Choix des missions à réussir avant la mission sélectionnée.
+    LinkMission(LinkForm),
     /// Action destructive ou irréversible à confirmer (suppression, arrêt, annulation, écrasement).
     ConfirmAction(PendingAction),
 }
@@ -367,6 +379,8 @@ pub enum PendingAction {
     QuitRun(String),
     /// Mission relancée alors qu'elle écraserait conception / rapport : (titre, reprise).
     StartMission(String, bool),
+    /// Mission débloquée par la réussite de la précédente : (id, titre).
+    NextMission(String, String),
     /// Fin de la session Claude intégrée.
     FinishTerm,
     /// Suppression d'une session background : (id, nom).
@@ -390,6 +404,7 @@ impl PendingAction {
             Self::CancelRun(name) => tf!("Annuler le run « {name} » ? (o/n)", "Cancel the run \"{name}\"? (o/n)"),
             Self::QuitRun(name) => tf!("Quitter et annuler le run « {name} » ? (o/n)", "Quit and cancel the run \"{name}\"? (o/n)"),
             Self::StartMission(title, _) => tf!("Relancer « {title} » depuis le début ? Le plan et le rapport précédents seront remplacés. (o/n)", "Restart \"{title}\" from scratch? The previous plan and report will be replaced. (o/n)"),
+            Self::NextMission(_, title) => tf!("Mission réussie. Lancer maintenant la suivante, « {title} » ? (o/n)", "Mission succeeded. Start the next one, \"{title}\", now? (o/n)"),
             Self::FinishTerm => tr("Terminer la session Claude en cours ? (o/n)", "End the current Claude session? (o/n)").into(),
             Self::StopSession(_, name) => tf!("Arrêter la session « {name} » ? (o/n)", "Stop the session \"{name}\"? (o/n)"),
         }
@@ -1188,6 +1203,7 @@ impl App {
             Mode::EditAgent(form) => self.key_form(form, k),
             Mode::EditSeat(form) => self.key_seat_form(form, k),
             Mode::ChooseEdit(c) => self.key_choose_edit(c, k),
+            Mode::LinkMission(f) => self.key_link(f, k),
             Mode::ConfirmAction(a) => match k.code {
                 KeyCode::Char('o' | 'O' | 'y' | 'Y') => self.run_action(a),
                 // Refus, Échap ou toute autre touche : par défaut, l'action n'a pas lieu.
@@ -1355,6 +1371,8 @@ impl App {
                         }
                     }
                     KeyCode::Char('m') => self.request_mission_brief(),
+                    KeyCode::Char('a') if self.zone == CompZone::Missions => self.open_link_form(),
+                    KeyCode::Char('v') if self.zone == CompZone::Missions => self.toggle_done(),
                     KeyCode::Char('o') => self.open_mission(),
                     KeyCode::Char('r') => self.start_mission(true),
                     KeyCode::Char('R') => self.start_mission(false),
@@ -1814,6 +1832,7 @@ impl App {
             }
             PendingAction::QuitRun(_) => self.quit_now(),
             PendingAction::StartMission(_, resume) => self.launch_mission(resume),
+            PendingAction::NextMission(id, _) => self.launch_next(&id),
             PendingAction::FinishTerm => self.finish_term(),
             PendingAction::RemoveSession(id, name) => {
                 self.status = tf!("suppression de « {name} »…", "deleting \"{name}\"…");
@@ -1861,6 +1880,91 @@ impl App {
         self.assistant_request = Some((AssistantKind::Mission, args));
     }
 
+    fn selected_mission(&self) -> Option<&Mission> {
+        self.visible_missions().contains(&self.mission_sel).then(|| self.missions.get(self.mission_sel)).flatten()
+    }
+
+    /// `a` : choisir les missions à réussir avant celle-ci.
+    fn open_link_form(&mut self) {
+        let Some(m) = self.selected_mission().cloned() else {
+            self.status = tr("aucune mission sélectionnée", "no mission selected").into();
+            return;
+        };
+        // Exclut la mission elle-même et celles qui en dépendent déjà (un lien créerait un cycle).
+        let rows: Vec<(String, String, bool)> = self
+            .missions
+            .iter()
+            .filter(|o| o.id != m.id && !missions::depends_on(&self.missions, &o.id, &m.id))
+            .map(|o| (o.id.clone(), o.title.clone(), m.after.contains(&o.id)))
+            .collect();
+        if rows.is_empty() {
+            self.status = tr("aucune autre mission à lier", "no other mission to link").into();
+            return;
+        }
+        self.mode = Mode::LinkMission(LinkForm { mission: m.id, title: m.title, rows, sel: 0 });
+    }
+
+    fn key_link(&mut self, mut f: LinkForm, k: KeyEvent) {
+        let n = f.rows.len();
+        match k.code {
+            KeyCode::Down | KeyCode::Char('j') => f.sel = (f.sel + 1) % n,
+            KeyCode::Up | KeyCode::Char('k') => f.sel = (f.sel + n - 1) % n,
+            KeyCode::Char(' ') | KeyCode::Char('x') => f.rows[f.sel].2 = !f.rows[f.sel].2,
+            KeyCode::Enter => {
+                let after: Vec<String> = f.rows.iter().filter(|r| r.2).map(|r| r.0.clone()).collect();
+                self.status = match missions::set_after(&self.root, &f.mission, &after) {
+                    Ok(()) if after.is_empty() => tr("mission sans prérequis", "mission without prerequisites").into(),
+                    Ok(()) => tf!("{} prérequis enregistré(s) — la mission est grisée tant qu'ils ne sont pas réussis", "{} prerequisite(s) saved — the mission is greyed out until they succeed", after.len()),
+                    Err(e) => erreur(&e),
+                };
+                self.missions = missions::list(&self.root);
+                return;
+            }
+            KeyCode::Esc => {
+                self.status = tr("Annulé.", "Cancelled.").into();
+                return;
+            }
+            _ => {}
+        }
+        self.mode = Mode::LinkMission(f);
+    }
+
+    /// `v` : marque (ou démarque) la mission comme réussie à la main, par exemple une mission faite avant les liens.
+    fn toggle_done(&mut self) {
+        let Some(m) = self.selected_mission().cloned() else { return };
+        missions::mark_done(&m.dir, !m.done);
+        self.missions = missions::list(&self.root);
+        self.status = if m.done { tr("mission démarquée (non réussie)", "mission unmarked (not succeeded)").into() } else { tr("mission marquée réussie", "mission marked as succeeded").into() };
+    }
+
+    /// Après une réussite : propose de lancer la mission qu'elle vient de débloquer (la plus ancienne s'il y en a plusieurs).
+    fn propose_next(&mut self, finished_dir: &std::path::Path) {
+        let Some(id) = finished_dir.file_name().map(|n| n.to_string_lossy().into_owned()) else { return };
+        if !self.missions.iter().any(|m| m.id == id && m.done) {
+            return;
+        }
+        let next = missions::unlocked_by(&self.missions, &id);
+        let Some(first) = next.first() else { return };
+        let (nid, title) = (first.id.clone(), first.title.clone());
+        if next.len() > 1 {
+            self.status = tf!("{} missions débloquées — la plus ancienne est proposée", "{} missions unlocked — the oldest is offered", next.len());
+        }
+        self.mode = Mode::ConfirmAction(PendingAction::NextMission(nid, title));
+    }
+
+    /// Lance la mission débloquée, avec son entreprise habituelle (sinon l'entreprise sélectionnée).
+    fn launch_next(&mut self, id: &str) {
+        let Some(pos) = self.missions.iter().position(|m| m.id == id) else { return };
+        if let Some(file) = self.missions[pos].company.clone() {
+            if let Some(ci) = self.companies.iter().position(|c| c.file == file) {
+                self.comp_sel = ci;
+            }
+        }
+        self.mission_sel = pos;
+        self.tab = Tab::Company;
+        self.start_mission(true);
+    }
+
     /// `r` / `R` sur l'onglet Entreprise : lance la mission sélectionnée avec l'entreprise sélectionnée.
     /// `resume` : une mission dont la conception est terminée repart de son plan au lieu de tout rejouer.
     /// Un lancement qui écraserait conception ou rapport existants demande d'abord confirmation.
@@ -1870,6 +1974,11 @@ impl App {
             return;
         }
         let selected = self.visible_missions().contains(&self.mission_sel).then(|| self.missions.get(self.mission_sel)).flatten();
+        if let Some(m) = selected.filter(|m| !m.waiting_for.is_empty()) {
+            let names: Vec<String> = m.waiting_for.iter().map(|id| self.missions.iter().find(|x| &x.id == id).map_or(id.clone(), |x| x.title.clone())).collect();
+            self.status = tf!("mission grisée : réussir d'abord « {} »", "mission greyed out: succeed first at \"{}\"", names.join("», «"));
+            return;
+        }
         if let Some(m) = selected {
             if (m.has_conception || m.has_report) && !(resume && m.resumable) {
                 self.mode = Mode::ConfirmAction(PendingAction::StartMission(m.title.clone(), resume));
@@ -1974,6 +2083,11 @@ impl App {
             self.checkpoint = None; // run terminé ou annulé pendant l'attente
             self.write_compte_rendu(&ev);
             self.missions = missions::list(&self.root); // conception.md / rapport.md viennent d'apparaître
+            if matches!(ev, RunEvent::RunFinished { ok: true, .. }) {
+                if let Some(dir) = self.run_ctx.as_ref().map(|(_, d)| d.clone()) {
+                    self.propose_next(&dir);
+                }
+            }
         }
         let Some(run) = &mut self.run else { return };
         let node = |run: &mut RunView, id: &str| run.nodes.iter().position(|n| n.id == id);

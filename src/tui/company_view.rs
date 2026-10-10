@@ -24,8 +24,13 @@ fn draw_missions(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .map(|&i| {
             let m = &app.missions[i];
-            let (flag, color) = if m.has_report {
-                (tr("✔ rapport", "✔ report"), Color::Green)
+            let waiting = !m.waiting_for.is_empty();
+            let (flag, color) = if waiting {
+                (tr("⏳ en attente", "⏳ waiting"), Color::DarkGray)
+            } else if m.done {
+                (tr("✔ réussie", "✔ succeeded"), Color::Green)
+            } else if m.has_report {
+                (tr("rapport (non réussie)", "report (not succeeded)"), Color::Yellow)
             } else if m.resumable {
                 (tr("plan validé · reprenable", "plan approved · resumable"), Color::Cyan)
             } else if m.has_conception {
@@ -33,8 +38,20 @@ fn draw_missions(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 (tr("brief", "brief"), Color::DarkGray)
             };
+            let title_of = |id: &str| app.missions.iter().find(|x| x.id == id).map(|x| x.title.clone());
             let open = app.mission_open.get(&m.id);
-            let mut lines = vec![Line::raw(format!("{} {}", if open.is_some() { "▾" } else { "▸" }, m.title)), Line::styled(format!("  {flag}"), Style::new().fg(color))];
+            let head = Style::new().fg(if waiting { Color::DarkGray } else { Color::Reset });
+            let mut lines = vec![Line::styled(format!("{} {}", if open.is_some() { "▾" } else { "▸" }, m.title), head), Line::styled(format!("  {flag}"), Style::new().fg(color))];
+            // Ordre de lancement : ce qu'il faut réussir avant, et ce que celle-ci débloque.
+            for a in &m.after {
+                if let Some(t) = title_of(a) {
+                    let ok = !m.waiting_for.contains(a);
+                    lines.push(Line::styled(format!("  ↳ {} {t}", if ok { tr("après ✔", "after ✔") } else { tr("après ✖", "after ✖") }), Style::new().fg(if ok { Color::Green } else { Color::DarkGray })));
+                }
+            }
+            for next in app.missions.iter().filter(|x| x.after.contains(&m.id)) {
+                lines.push(Line::styled(format!("  ↦ {} {}", tr("débloque", "unlocks"), next.title), Style::new().fg(Color::DarkGray)));
+            }
             if let Some(s) = open {
                 let mut sect = |label: &str, col: Color, items: &[String], none: &str| {
                     lines.push(Line::styled(format!("  {label}"), Style::new().fg(col).add_modifier(Modifier::BOLD)));
@@ -60,9 +77,9 @@ fn draw_missions(f: &mut Frame, area: Rect, app: &App) {
     let hint = if vis.is_empty() {
         tr(" m : cadrer ", " m: frame one ")
     } else if open {
-        tr(" ↑↓ · ← replier · r lancer ", " ↑↓ · ← fold · r run ")
+        tr(" ↑↓ · ← replier · r lancer · a prérequis · v réussie ", " ↑↓ · ← fold · r run · a prerequisites · v succeeded ")
     } else {
-        tr(" ↑↓ · → déplier · r lancer ", " ↑↓ · → unfold · r run ")
+        tr(" ↑↓ · → déplier · r lancer · a prérequis · v réussie ", " ↑↓ · → unfold · r run · a prerequisites · v succeeded ")
     };
     f.render_stateful_widget(
         List::new(items)

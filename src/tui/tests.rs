@@ -1145,7 +1145,7 @@ fn liste_des_missions_et_navigation() {
     press(&mut app, KeyCode::Char('2'));
     let s = screen(&app);
     assert!(s.contains("Missions (2)") && s.contains("Plus récente") && s.contains("Première"), "{s}");
-    assert!(s.contains("✔ rapport") && s.contains("brief"));
+    assert!(s.contains("rapport (non réussie)") && s.contains("brief"));
     assert_eq!(app.missions[0].title, "Plus récente", "la plus récente d'abord");
     press(&mut app, KeyCode::Char('t'));
     assert_eq!(app.mission_sel, 1);
@@ -2049,4 +2049,77 @@ async fn characterize_r4_descendants_survivent_a_l_annulation() {
     let _ = std::process::Command::new("kill").arg(&pid).status(); // nettoyage
     eprintln!("[R4] sous-processus {pid} : {}", if vivant { "CONFIRMÉE (survit à l'annulation)" } else { "INFIRMÉE" });
     assert!(vivant, "sous-processus {pid} tué par l'annulation : hypothèse R4 infirmée");
+}
+
+// ---------- missions liées (prérequis) ----------
+
+fn linked_app() -> (App, String, String) {
+    use crate::runtime::missions as m;
+    let root = tmp_root();
+    let (a, b) = (m::new_id(1), m::new_id(2));
+    for (id, t) in [(&a, "# Stabilisation"), (&b, "# Performance")] {
+        let dir = m::create(&root, id).unwrap();
+        m::write_output(&dir, "brief.md", t).unwrap();
+    }
+    write_agent(&root, "boss");
+    write_agent(&root, "poete");
+    std::fs::create_dir_all(root.join(".claude/companies")).unwrap();
+    std::fs::write(root.join(".claude/companies/acme.toml"), ACME).unwrap();
+    let mut app = new_app(&root);
+    press(&mut app, KeyCode::Char('2'));
+    app.zone = CompZone::Missions;
+    (app, a, b)
+}
+
+#[test]
+fn mission_liee_grisee_et_non_lancable_tant_que_le_prerequis_n_est_pas_reussi() {
+    let (mut app, a, b) = linked_app();
+    // Sélectionne « Performance » (b, la plus récente) et lui donne « Stabilisation » comme prérequis.
+    app.mission_sel = app.missions.iter().position(|m| m.id == b).unwrap();
+    press(&mut app, KeyCode::Char('a'));
+    assert!(matches!(app.mode, Mode::LinkMission(_)));
+    assert!(screen(&app).contains("Missions à réussir avant") && screen(&app).contains("Stabilisation"));
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Enter);
+    let mb = app.missions.iter().find(|m| m.id == b).unwrap();
+    assert_eq!(mb.waiting_for, vec![a.clone()]);
+    let s = screen(&app);
+    assert!(s.contains("en attente") && s.contains("après ✖ Stabilisation") && s.contains("débloque Performance"), "{s}");
+    // Lancer est refusé, sans run ni confirmation.
+    press(&mut app, KeyCode::Char('r'));
+    assert!(app.run.is_none() && app.status.contains("grisée") && app.status.contains("Stabilisation"), "{}", app.status);
+    // `v` marque le prérequis réussi : la mission n'attend plus.
+    app.mission_sel = app.missions.iter().position(|m| m.id == a).unwrap();
+    press(&mut app, KeyCode::Char('v'));
+    assert!(app.missions.iter().find(|m| m.id == b).unwrap().waiting_for.is_empty());
+}
+
+#[test]
+fn reussite_d_une_mission_propose_la_suivante() {
+    use crate::runtime::missions as m;
+    let (mut app, a, b) = linked_app();
+    m::set_after(&app.root, &b, std::slice::from_ref(&a)).unwrap();
+    let dir = m::dir_of(&app.root, &a);
+    m::mark_done(&dir, true);
+    app.missions = m::list(&app.root);
+    app.run = Some(run_view(&[]));
+    let company = crate::model::company::Company::parse("name = \"acme\"\n[[seat]]\nid = \"ceo\"\ntitle = \"CEO\"\nagent = \"a\"\n").unwrap();
+    app.run_ctx = Some((company, dir));
+    app.on_run_event(RunEvent::RunFinished { ok: true, tokens: 0 });
+    assert!(matches!(app.mode, Mode::ConfirmAction(PendingAction::NextMission(ref id, _)) if *id == b), "la suivante est proposée");
+    assert!(screen(&app).contains("Lancer maintenant la suivante"));
+}
+
+#[test]
+fn echec_ne_propose_rien_et_un_cycle_est_refuse() {
+    use crate::runtime::missions as m;
+    let (mut app, a, b) = linked_app();
+    m::set_after(&app.root, &b, std::slice::from_ref(&a)).unwrap();
+    assert!(m::set_after(&app.root, &a, std::slice::from_ref(&b)).is_err());
+    app.missions = m::list(&app.root);
+    app.run = Some(run_view(&[]));
+    let company = crate::model::company::Company::parse("name = \"acme\"\n[[seat]]\nid = \"ceo\"\ntitle = \"CEO\"\nagent = \"a\"\n").unwrap();
+    app.run_ctx = Some((company, m::dir_of(&app.root, &a)));
+    app.on_run_event(RunEvent::RunFinished { ok: false, tokens: 0 });
+    assert!(matches!(app.mode, Mode::Normal));
 }

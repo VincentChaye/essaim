@@ -15,6 +15,12 @@ pub struct Mission {
     pub resumable: bool,
     /// Entreprise (fichier) qui a lancé la mission ; `None` tant qu'aucune ne l'a lancée.
     pub company: Option<String>,
+    /// Missions (ids) à réussir avant celle-ci, quelle que soit leur entreprise.
+    pub after: Vec<String>,
+    /// Menée à terme avec succès (conception, et réalisation si l'entreprise en a une).
+    pub done: bool,
+    /// Prérequis existants et pas encore réussis : tant qu'il en reste, la mission est grisée et non lançable.
+    pub waiting_for: Vec<String>,
 }
 
 pub fn missions_dir(root: &Path) -> PathBuf {
@@ -71,11 +77,89 @@ pub fn list(root: &Path) -> Vec<Mission> {
                 has_report: dir.join("rapport.md").is_file(),
                 resumable: !dir.join("rapport.md").is_file() && resumable_plan(&dir).is_some(),
                 company: std::fs::read_to_string(dir.join(COMPANY_FILE)).ok().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()),
+                after: read_after(&dir),
+                done: dir.join(DONE_FILE).is_file(),
+                waiting_for: vec![],
                 dir,
             }
         })
         .collect();
     v.sort_by(|a, b| b.id.cmp(&a.id));
+    // Un prérequis supprimé ne bloque plus : seuls les prérequis existants et non réussis font attendre.
+    let state: std::collections::HashMap<String, bool> = v.iter().map(|m| (m.id.clone(), m.done)).collect();
+    for m in &mut v {
+        m.waiting_for = m.after.iter().filter(|a| state.get(*a) == Some(&false)).cloned().collect();
+    }
+    v
+}
+
+const AFTER_FILE: &str = "after";
+const DONE_FILE: &str = "reussie";
+
+fn read_after(dir: &Path) -> Vec<String> {
+    let text = std::fs::read_to_string(dir.join(AFTER_FILE)).unwrap_or_default();
+    let mut out: Vec<String> = vec![];
+    for l in text.lines().map(str::trim).filter(|l| is_valid_id(l)) {
+        if !out.iter().any(|x| x == l) {
+            out.push(l.to_string());
+        }
+    }
+    out
+}
+
+/// Lie la mission à ses prérequis (remplace la liste). Refuse un id invalide, elle-même, ou un cycle.
+pub fn set_after(root: &Path, id: &str, after: &[String]) -> Result<()> {
+    anyhow::ensure!(is_valid_id(id), "identifiant de mission invalide");
+    let all = list(root);
+    for a in after {
+        anyhow::ensure!(is_valid_id(a), "identifiant de mission invalide");
+        anyhow::ensure!(a != id, "une mission ne peut pas dépendre d'elle-même");
+        anyhow::ensure!(!depends_on(&all, a, id), "cycle : « {a} » dépend déjà de cette mission");
+    }
+    let dir = dir_of(root, id);
+    std::fs::create_dir_all(&dir)?;
+    if after.is_empty() {
+        let _ = std::fs::remove_file(dir.join(AFTER_FILE));
+    } else {
+        write_private(&dir.join(AFTER_FILE), after.join("\n").as_bytes())?;
+    }
+    Ok(())
+}
+
+/// `id` dépend-elle (directement ou non) de `target` ?
+pub fn depends_on(all: &[Mission], id: &str, target: &str) -> bool {
+    let mut stack = vec![id.to_string()];
+    let mut seen: Vec<String> = vec![];
+    while let Some(cur) = stack.pop() {
+        if seen.contains(&cur) {
+            continue;
+        }
+        if let Some(m) = all.iter().find(|m| m.id == cur) {
+            for a in &m.after {
+                if a == target {
+                    return true;
+                }
+                stack.push(a.clone());
+            }
+        }
+        seen.push(cur);
+    }
+    false
+}
+
+/// Marque la mission réussie (ou efface la marque au démarrage d'un nouveau run).
+pub fn mark_done(dir: &Path, done: bool) {
+    if done {
+        let _ = std::fs::write(dir.join(DONE_FILE), "");
+    } else {
+        let _ = std::fs::remove_file(dir.join(DONE_FILE));
+    }
+}
+
+/// Missions que la réussite de `id` vient de débloquer : elles l'attendaient, plus rien ne les retient, et elles ne sont pas encore réussies.
+pub fn unlocked_by<'a>(all: &'a [Mission], id: &str) -> Vec<&'a Mission> {
+    let mut v: Vec<&Mission> = all.iter().filter(|m| !m.done && m.after.iter().any(|a| a == id) && m.waiting_for.is_empty()).collect();
+    v.sort_by(|a, b| a.id.cmp(&b.id));
     v
 }
 
@@ -356,6 +440,38 @@ mod tests {
         assert!(create(&root, "").is_err());
         assert!(write_output(&root, "../x.md", "x").is_err());
         assert!(list(&tmp()).is_empty());
+    }
+
+    #[test]
+    fn liens_entre_missions_attente_cycle_et_deblocage() {
+        let root = tmp();
+        let mk = |ms: u64, t: &str| {
+            let id = new_id(ms);
+            let dir = create(&root, &id).unwrap();
+            write_output(&dir, "brief.md", t).unwrap();
+            (id, dir)
+        };
+        let (a, da) = mk(1, "# A");
+        let (b, _) = mk(2, "# B");
+        let (c, _) = mk(3, "# C");
+        set_after(&root, &b, std::slice::from_ref(&a)).unwrap();
+        set_after(&root, &c, &[a.clone(), b.clone()]).unwrap();
+        let l = list(&root);
+        let get = |id: &str| l.iter().find(|m| m.id == id).unwrap().clone();
+        assert_eq!(get(&b).waiting_for, vec![a.clone()], "B attend A");
+        assert_eq!(get(&c).waiting_for.len(), 2);
+        assert!(set_after(&root, &a, std::slice::from_ref(&c)).is_err(), "cycle A→C→B→A refusé");
+        assert!(set_after(&root, &a, std::slice::from_ref(&a)).is_err());
+        // A réussit : B est débloquée, C attend encore B.
+        mark_done(&da, true);
+        let l = list(&root);
+        assert_eq!(unlocked_by(&l, &a).iter().map(|m| m.id.clone()).collect::<Vec<_>>(), vec![b.clone()]);
+        assert_eq!(l.iter().find(|m| m.id == c).unwrap().waiting_for, vec![b.clone()]);
+        // Un prérequis supprimé ne bloque plus.
+        std::fs::remove_dir_all(dir_of(&root, &b)).unwrap();
+        assert!(list(&root).iter().find(|m| m.id == c).unwrap().waiting_for.is_empty());
+        mark_done(&da, false);
+        assert!(!list(&root).iter().find(|m| m.id == a).unwrap().done);
     }
 
     #[test]

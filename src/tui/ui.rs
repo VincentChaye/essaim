@@ -131,6 +131,25 @@ pub fn draw(f: &mut Frame, app: &App) {
             ];
             f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::bordered().title(tr(" Mode d'édition ", " Edit mode ")).border_style(Style::new().fg(Color::Cyan))), area);
         }
+        Mode::LinkMission(form) => {
+            let h = (form.rows.len() as u16 + 5).min(f.area().height.saturating_sub(2)).max(7);
+            let area = centered(f.area(), 78, h);
+            f.render_widget(Clear, area);
+            let mut lines = vec![Line::from(tf!("« {} » ne peut être lancée qu'après la réussite de :", "\"{}\" can only run after these succeed:", form.title)), Line::raw("")];
+            for (i, (_, title, on)) in form.rows.iter().enumerate() {
+                let st = if i == form.sel { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+                lines.push(Line::styled(format!(" [{}] {title}", if *on { "x" } else { " " }), st));
+            }
+            f.render_widget(
+                Paragraph::new(lines).block(
+                    Block::bordered()
+                        .title(tr(" Missions à réussir avant ", " Missions to succeed first "))
+                        .title_bottom(tr(" ↑↓ · espace cocher · Entrée enregistrer · Échap annuler ", " ↑↓ · space toggle · Enter save · Esc cancel "))
+                        .border_style(Style::new().fg(Color::Cyan)),
+                ),
+                area,
+            );
+        }
         Mode::ConfirmAction(a) => {
             let users = match a {
                 PendingAction::DeleteAgent(name) => app.seats_using_agent(name),
@@ -183,6 +202,7 @@ fn help_text(app: &App) -> &'static str {
         (Mode::EditAgent(_), _) => "Tab champ suivant · ←→ choisir le modèle · Ctrl+S enregistrer · Esc annuler",
         (Mode::EditSeat(_), _) => "↑↓/Tab changer de champ · ←→ choisir · Entrée sur un bouton · Ctrl+S enregistrer · Esc annuler",
         (Mode::ChooseEdit(_), _) => "←→ choisir · 1 simple · 2 avec le modèle · Entrée valider · Échap annuler",
+        (Mode::LinkMission(_), _) => "↑↓ choisir · espace cocher · Entrée enregistrer · Échap annuler",
         (Mode::ConfirmAction(_), _) => "o confirmer · autre touche (n, Échap) annuler",
         (_, Tab::Agents) => "↑↓ choisir · n créer avec l'assistant · N formulaire · e éditer · D supprimer · q quitter",
         (_, Tab::Company) => "←↑↓→ zones · Entrée entrer · Échap sortir · dans une zone : e éditer (a ajouter · x retirer dans l'organigramme) · r lancer · Ctrl+K toutes les touches",
@@ -203,6 +223,7 @@ fn help_text_en(app: &App) -> &'static str {
         (Mode::EditAgent(_), _) => "Tab next field · ←→ pick model · Ctrl+S save · Esc cancel",
         (Mode::EditSeat(_), _) => "↑↓/Tab change field · ←→ pick · Enter on a button · Ctrl+S save · Esc cancel",
         (Mode::ChooseEdit(_), _) => "←→ pick · 1 simple · 2 with the model · Enter confirm · Esc cancel",
+        (Mode::LinkMission(_), _) => "↑↓ pick · space toggle · Enter save · Esc cancel",
         (Mode::ConfirmAction(_), _) => "y confirm · any other key (n, Esc) cancels",
         (_, Tab::Agents) => "↑↓ pick · n create with assistant · N form · e edit · D delete · q quit",
         (_, Tab::Company) => "←↑↓→ zones · Enter enter · Esc leave · in a zone: e edit (a add · x remove in the org chart) · r run · Ctrl+K all keys",

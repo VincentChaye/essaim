@@ -78,8 +78,9 @@ pub fn parse_line(line: &str) -> Result<Vec<ClaudeEvent>> {
                     .iter()
                     .filter(|b| b["type"] == "tool_result")
                     .map(|b| ClaudeEvent::ToolResult {
-                        // `is_error` absent = résultat douteux : jamais un succès implicite (R2/R5).
-                        is_error: b["is_error"].as_bool().unwrap_or(true),
+                        // Un tool_result réussi n'a pas de champ `is_error` (vu sur le flux réel : tests/fixtures) :
+                        // seul `true` explicite est une erreur d'outil. (Le `result` final, lui, garde « absent = échec ».)
+                        is_error: b["is_error"].as_bool().unwrap_or(false),
                     })
                     .collect()
             })

@@ -896,6 +896,9 @@ pub async fn run_mission(
     mut cancel: watch::Receiver<bool>,
 ) -> Result<MissionOutcome> {
     let calls = Arc::new(AtomicU32::new(0));
+    if let Some(d) = &opts.mission_dir {
+        missions::mark_done(d, false); // un run neuf invalide l'ancien succès
+    }
     let save = |name: &str, text: &str| {
         if let Some(d) = &opts.mission_dir {
             let _ = missions::write_output(d, name, text);
@@ -979,6 +982,10 @@ pub async fn run_mission(
             // Réalisation refusée : la mission s'arrête sur le plan, sans que ce soit un échec.
             outcome.ok = conception.ok;
         }
+    }
+    // Réussie = menée à terme : conception ok, et réalisation faite si l'entreprise en a une (un plan refusé n'est pas un succès).
+    if let Some(d) = &opts.mission_dir {
+        missions::mark_done(d, outcome.ok && (!has_builders || outcome.realisation.is_some()));
     }
     let _ = tx.send(RunEvent::RunFinished { ok: outcome.ok, tokens: outcome.tokens });
     Ok(outcome)

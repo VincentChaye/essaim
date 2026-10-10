@@ -375,6 +375,10 @@ async fn main() -> Result<()> {
                         }
                         (None, None) => anyhow::bail!("indiquez --brief \"…\" ou --mission <id>"),
                     };
+                    if let Some(m) = missions::list(&root).into_iter().find(|m| m.id == mission_id).filter(|m| !m.waiting_for.is_empty()) {
+                        let names: Vec<String> = m.waiting_for.iter().map(|id| format!("{id} ({})", missions::list(&root).into_iter().find(|x| &x.id == id).map(|x| x.title).unwrap_or_default())).collect();
+                        anyhow::bail!("mission {mission_id} en attente : réussir d'abord {}", names.join(", "));
+                    }
                     if resume && missions::resumable_plan(&missions::dir_of(&root, &mission_id)).is_none() {
                         anyhow::bail!("mission {mission_id} non reprenable : aucune conception menée à terme (relancez sans --resume)");
                     }
@@ -412,6 +416,12 @@ async fn main() -> Result<()> {
                         }
                     }
                     eprintln!("Livrables : {}", mission_dir.display());
+                    if out.ok {
+                        let all = missions::list(&PathBuf::from(&mission_dir).ancestors().nth(3).map(PathBuf::from).unwrap_or_default());
+                        for n in missions::unlocked_by(&all, &mission_id) {
+                            eprintln!("➜ mission débloquée : {} — essaim company run <entreprise> --mission {}", n.title, n.id);
+                        }
+                    }
                     println!("{}", out.report);
                     if !out.ok {
                         std::process::exit(1);

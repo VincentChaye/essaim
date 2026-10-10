@@ -55,6 +55,8 @@ Sans \fB\-\-yes\fR, un plan consolidé demande \fB[o/N/e]\fR : \fBo\fR lance la 
 toute autre réponse arrête.
 Si le point de contrôle est désactivé (\fBcheckpoint = false\fR dans le TOML), il n'y a ni invite ni pause : la réalisation démarre après la conception.
 .PP
+Missions liées : une mission peut exiger la réussite d'autres missions (fichier \fBafter\fR du dossier de la mission, touche \fBa\fR dans la TUI), quelle que soit leur entreprise. Tant qu'un prérequis n'est pas réussi, elle est grisée et \fBcompany run --mission\fR la refuse.
+.PP
 Blocages : un poste bloqué (tests rouges, permission refusée, prérequis absent) n'est jamais compté comme réussi. Son supérieur lance jusqu'à \fBmax_fix_rounds\fR tours de correction (défaut 2), puis remonte le blocage de niveau en niveau jusqu'au CEO ; si le CEO échoue, le run attend une décision (relancer, discuter avec le CEO, arrêter). Avec \fB--yes\fR, la mission s'arrête.
 Avertissement d'exécution dans ce cas : \fB[À CONFIRMER]\fR (texte et canal à fixer).
 .SH INTERFACE

@@ -218,6 +218,21 @@ Une **entreprise** (`.claude/companies/<nom>.toml`) place des agents dans un org
    pour les commandes de `allow_bash` (règles `Bash(<commande>:*)`) ; le reste est refusé (`--permission-mode dontAsk`).
    La portée exacte de ces règles relève de Claude Code et n'est pas vérifiée ici.
 
+### Missions liées
+
+Des missions peuvent dépendre les unes des autres, même si elles sont lancées par des entreprises différentes.
+Onglet Entreprise, zone Missions : `a` coche les missions à réussir **avant** la mission sélectionnée (les cycles sont
+refusés). Les liens sont stockés dans `.essaim/missions/<id>/after`.
+
+- Une mission dont un prérequis n'est pas réussi est **grisée** (« en attente ») et ne se lance pas (`r`/`R` expliquent
+  quoi réussir d'abord ; `essaim company run --mission` refuse aussi). Chaque mission affiche `↳ après ✔/✖ …` et
+  `↦ débloque …` : c'est l'ordre de lancement.
+- Une mission est **réussie** quand son run se termine sans échec ni blocage, avec sa réalisation faite si l'entreprise
+  en a une (un plan refusé au point de contrôle n'est pas un succès). Marque `.essaim/missions/<id>/reussie`.
+- À la réussite, essaim propose de lancer la mission débloquée (`o` la lance avec son entreprise habituelle). En CLI, la
+  commande à lancer est affichée.
+- `v` marque ou démarque une mission comme réussie à la main (utile pour une mission terminée avant l'existence des liens).
+
 ### Blocages : corriger, remonter, puis décider avec le CEO
 
 Un poste n'est « fait » que s'il l'affirme **et** que rien ne l'a empêché de finir : chaque appel de travail ou de
