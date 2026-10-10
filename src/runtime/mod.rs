@@ -6,3 +6,4 @@ pub mod missions;
 pub mod scope;
 pub mod sessions;
 pub mod store;
+pub mod textutil;
