@@ -93,6 +93,10 @@ pub(super) fn node_status(kind: Kind, r: &NodeResult) -> NodeStatus {
 
 /// Schéma JSON de la délégation : `to` restreint aux ids des subordonnés directs.
 pub(super) fn delegation_schema(kid_ids: &[String], with_scope: bool) -> String {
+    delegation_value(kid_ids, with_scope).to_string()
+}
+
+fn delegation_value(kid_ids: &[String], with_scope: bool) -> Value {
     let mut props = json!({
         "to": {"type": "string", "enum": kid_ids},
         "task": {"type": "string"}
@@ -113,12 +117,11 @@ pub(super) fn delegation_schema(kid_ids: &[String], with_scope: bool) -> String 
         },
         "required": ["assignments"]
     })
-    .to_string()
 }
 
 /// Schéma du plan de correction : `plan`, puis des affectations correctives ou une remontée (`escalate`).
 pub(super) fn fix_schema(kid_ids: &[String], with_scope: bool) -> String {
-    let mut v: Value = serde_json::from_str(&delegation_schema(kid_ids, with_scope)).expect("schéma valide");
+    let mut v = delegation_value(kid_ids, with_scope);
     v["properties"]["assignments"].as_object_mut().map(|a| a.remove("minItems"));
     v["properties"]["plan"] = json!({"type": "string"});
     v["properties"]["escalate"] = json!({"type": "string"});

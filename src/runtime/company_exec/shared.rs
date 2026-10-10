@@ -45,9 +45,9 @@ impl Shared {
         *self.cancel.borrow()
     }
 
-    fn spec(&self, i: usize, phase: Phase, kind: Kind, prompt: String, schema: Option<String>, kids: &[usize], sc: &[String]) -> RunSpec {
+    fn spec(&self, i: usize, phase: Phase, kind: Kind, prompt: String, schema: Option<String>, kids: &[usize], sc: &[String]) -> Result<RunSpec> {
         let seat = &self.company.seats[i];
-        let mut agent = self.agents.iter().find(|a| a.name == seat.agent).expect("agent validé").clone();
+        let mut agent = self.agents.iter().find(|a| a.name == seat.agent).cloned().ok_or_else(|| anyhow::anyhow!("agent « {} » introuvable", seat.agent))?;
         if seat.model.is_some() {
             agent.model = seat.model.clone();
         }
@@ -72,7 +72,7 @@ impl Shared {
             }
             _ => {}
         }
-        RunSpec {
+        Ok(RunSpec {
             prompt,
             cwd: self.opts.base_dir.clone(),
             agents,
@@ -83,7 +83,7 @@ impl Shared {
             append_system_prompt: Some(role_card(self.opts.lang, &self.company, i, &self.brief, phase, kids, sc)),
             json_schema: schema,
             ..Default::default()
-        }
+        })
     }
 
     /// Un appel `claude` : plafond d'appels, parallélisme borné, événements, coût.
@@ -110,7 +110,7 @@ impl Shared {
             agent: seat.agent.clone(),
             depth: self.company.depth(i),
         });
-        let spec = self.spec(i, phase, kind, prompt, schema, kids, sc);
+        let spec = self.spec(i, phase, kind, prompt, schema, kids, sc)?;
         let _permit = self.sem.acquire().await?;
         if self.cancelled() {
             bail!("cancelled");
