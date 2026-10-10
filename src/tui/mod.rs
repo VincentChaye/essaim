@@ -7,6 +7,7 @@ pub mod markdown;
 pub mod settings;
 pub mod term;
 pub mod ui;
+pub mod ui_util;
 pub mod widgets_util;
 
 #[cfg(test)]
