@@ -448,6 +448,26 @@ reports_to = "ciso"
         std::env::temp_dir().join(format!("essaim-mission-{}", uuid::Uuid::new_v4()))
     }
 
+    /// R1 : un livrable qui ne peut pas être écrit n'est plus avalé : le run se ferme en échec et l'erreur remonte.
+    #[tokio::test]
+    async fn echec_d_ecriture_du_livrable_ferme_le_run_en_echec() {
+        let base = tmpdir();
+        std::fs::create_dir_all(&base).unwrap();
+        let bloque = base.join("bloque");
+        std::fs::write(&bloque, "x").unwrap(); // un fichier à la place d'un dossier : la création du dossier de mission échoue
+        let opts = CompanyOptions { base_dir: base.clone(), mission_dir: Some(bloque.join("mission")), lang: Lang::Fr, resume: false };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_ctx, crx) = watch::channel(false);
+        let res = run_mission(&company(), &agents(), "Brief", &opts, fake(Arc::new(Probe::default()), Behavior::default()), tx, crx).await;
+        assert!(res.is_err(), "l'erreur d'écriture remonte à l'appelant");
+        let mut evs = vec![];
+        while let Ok(e) = rx.try_recv() {
+            evs.push(e);
+        }
+        assert!(matches!(evs.last(), Some(RunEvent::RunFinished { ok: false, .. })), "le run est clos en échec");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     // ----------------------------------------------------------- conception
 
     #[tokio::test]

@@ -82,10 +82,17 @@ pub async fn run_mission(
     if let Some(d) = &opts.mission_dir {
         missions::mark_done(d, false); // un run neuf invalide l'ancien succès
     }
-    let save = |name: &str, text: &str| {
-        if let Some(d) = &opts.mission_dir {
-            let _ = missions::write_output(d, name, text);
+    let save = |name: &str, text: &str| -> Result<()> {
+        match &opts.mission_dir {
+            Some(d) => missions::write_output(d, name, text),
+            None => Ok(()),
         }
+    };
+    // Échec d'écriture (livrable ou marque de conception) : le run se ferme en échec, puis l'erreur remonte à l'appelant.
+    let fail = |e: anyhow::Error, tokens: u64| {
+        // Envoi sans succès possible seulement si le récepteur est fermé : le run se termine de toute façon.
+        let _ = tx.send(RunEvent::RunFinished { ok: false, tokens });
+        e
     };
 
     let resumed_plan = if opts.resume { opts.mission_dir.as_deref().and_then(missions::resumable_plan) } else { None };
@@ -102,10 +109,10 @@ pub async fn run_mission(
                 return Err(e);
             }
         };
-        save("conception.md", &c.report);
+        save("conception.md", &c.report).map_err(|e| fail(e, c.tokens))?;
         if c.ok && !*cancel.borrow() {
             if let Some(d) = &opts.mission_dir {
-                let _ = missions::mark_conception_done(d);
+                missions::mark_conception_done(d).map_err(|e| fail(e, c.tokens))?;
             }
         }
         c
@@ -148,7 +155,7 @@ pub async fn run_mission(
             let task = realisation_task(&plan);
             match run_phase(company, agents, brief, Phase::Realisation, &task, opts, runner, tx.clone(), cancel.clone(), calls).await {
                 Ok(r) => {
-                    save("rapport.md", &r.report);
+                    save("rapport.md", &r.report).map_err(|e| fail(e, outcome.tokens + r.tokens))?;
                     outcome.ok = conception.ok && r.ok;
                     outcome.report = r.report.clone();
                     outcome.tokens += r.tokens;
