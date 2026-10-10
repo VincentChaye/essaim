@@ -20,6 +20,12 @@ pub(super) fn cost_guard(cost: &Mutex<u64>) -> MutexGuard<'_, u64> {
     cost.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Envoi d'un événement vers l'interface. Un récepteur fermé signifie que l'interface a quitté : l'événement
+/// n'a alors plus de destinataire, l'ignorer est voulu.
+pub(super) fn emit(tx: &mpsc::UnboundedSender<RunEvent>, ev: RunEvent) {
+    let _ = tx.send(ev);
+}
+
 pub(super) struct Shared {
     pub(super) company: Company,
     pub(super) agents: Vec<AgentDef>,
@@ -110,7 +116,7 @@ impl Shared {
             (Kind::Report, _) => "reports",
             (Kind::Fix, _) => "fixes",
         };
-        let _ = self.tx.send(RunEvent::Label {
+        emit(&self.tx, RunEvent::Label {
             id: id.clone(),
             label: format!("{} · {verb}{}", seat.title, if phase == Phase::Realisation { " ⚒" } else { "" }),
             agent: seat.agent.clone(),
@@ -121,29 +127,27 @@ impl Shared {
         if self.cancelled() {
             bail!("cancelled");
         }
-        let _ = self.tx.send(RunEvent::NodeStarted { id: id.clone() });
+        emit(&self.tx, RunEvent::NodeStarted { id: id.clone() });
 
         let (ctx, mut crx) = mpsc::unbounded_channel::<ClaudeEvent>();
         let (etx, eid) = (self.tx.clone(), id.clone());
         let fwd = tokio::spawn(async move {
             while let Some(event) = crx.recv().await {
-                let _ = etx.send(RunEvent::Node { id: eid.clone(), event });
+                emit(&etx, RunEvent::Node { id: eid.clone(), event });
             }
         });
         let job = NodeJob { id: id.clone(), spec };
         let res = (self.runner)(job, ctx, self.cancel.clone()).await;
+        // Jointure du relais d'événements : son erreur (panique du relais) n'altère ni le résultat ni le coût.
         let _ = fwd.await;
 
         let (status, used) = match &res {
             Ok(r) => (node_status(kind, r), r.tokens),
-            Err(e) if self.cancelled() => {
-                let _ = e;
-                (NodeStatus::Cancelled, 0)
-            }
+            Err(_) if self.cancelled() => (NodeStatus::Cancelled, 0),
             Err(e) => (NodeStatus::Failed(e.to_string()), 0),
         };
         *cost_guard(&self.cost) += used;
-        let _ = self.tx.send(RunEvent::NodeFinished { id, status, tokens: used });
+        emit(&self.tx, RunEvent::NodeFinished { id, status, tokens: used });
         res
     }
 
@@ -209,7 +213,7 @@ impl Shared {
             return EscalationReply::Stop;
         }
         let (rtx, mut rrx) = mpsc::unbounded_channel::<EscalationReply>();
-        let _ = self.tx.send(RunEvent::Escalation { summary, reply: rtx });
+        emit(&self.tx, RunEvent::Escalation { summary, reply: rtx });
         let mut cancel = self.cancel.clone();
         tokio::select! {
             r = rrx.recv() => r.unwrap_or(EscalationReply::Stop),

@@ -1,7 +1,7 @@
 //! Pilotage d'une mission : phase de conception, point de contrôle, phase de réalisation, clôture du run.
 
 use super::seat::run_seat;
-use super::shared::{Shared, cost_guard};
+use super::shared::{Shared, cost_guard, emit};
 use super::{CompanyOptions, MissionOutcome, Phase, PhaseOutcome};
 use crate::model::agent::AgentDef;
 use crate::model::company::Company;
@@ -90,8 +90,7 @@ pub async fn run_mission(
     };
     // Échec d'écriture (livrable ou marque de conception) : le run se ferme en échec, puis l'erreur remonte à l'appelant.
     let fail = |e: anyhow::Error, tokens: u64| {
-        // Envoi sans succès possible seulement si le récepteur est fermé : le run se termine de toute façon.
-        let _ = tx.send(RunEvent::RunFinished { ok: false, tokens });
+        emit(&tx, RunEvent::RunFinished { ok: false, tokens });
         e
     };
 
@@ -105,7 +104,7 @@ pub async fn run_mission(
         let c = match run_phase(company, agents, brief, Phase::Conception, CONCEPTION_TASK, opts, runner.clone(), tx.clone(), cancel.clone(), calls.clone()).await {
             Ok(c) => c,
             Err(e) => {
-                let _ = tx.send(RunEvent::RunFinished { ok: false, tokens: 0 });
+                emit(&tx, RunEvent::RunFinished { ok: false, tokens: 0 });
                 return Err(e);
             }
         };
@@ -135,7 +134,7 @@ pub async fn run_mission(
         // Point de contrôle : le plan est validé avant de toucher au projet.
         let approved = if company.checkpoint {
             let (rtx, mut rrx) = mpsc::unbounded_channel::<bool>();
-            let _ = tx.send(RunEvent::Checkpoint { plan: conception.report.clone(), reply: rtx });
+            emit(&tx, RunEvent::Checkpoint { plan: conception.report.clone(), reply: rtx });
             tokio::select! {
                 r = rrx.recv() => r.unwrap_or(false),
                 _ = cancelled(&mut cancel) => false,
@@ -164,7 +163,7 @@ pub async fn run_mission(
                 }
                 Err(e) => {
                     outcome.ok = false;
-                    let _ = tx.send(RunEvent::RunFinished { ok: false, tokens: outcome.tokens });
+                    emit(&tx, RunEvent::RunFinished { ok: false, tokens: outcome.tokens });
                     return Err(e);
                 }
             }
@@ -177,6 +176,6 @@ pub async fn run_mission(
     if let Some(d) = &opts.mission_dir {
         missions::mark_done(d, outcome.ok && (!has_builders || outcome.realisation.is_some()));
     }
-    let _ = tx.send(RunEvent::RunFinished { ok: outcome.ok, tokens: outcome.tokens });
+    emit(&tx, RunEvent::RunFinished { ok: outcome.ok, tokens: outcome.tokens });
     Ok(outcome)
 }
