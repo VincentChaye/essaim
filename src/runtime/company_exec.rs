@@ -7,7 +7,7 @@ use crate::tui::settings::Lang;
 use crate::model::agent::AgentDef;
 use crate::model::company::Company;
 use crate::runtime::claude_proc::{ClaudeEvent, RunSpec};
-use crate::runtime::executor::{NodeJob, NodeResult, NodeStatus, RunEvent, Runner, cancelled};
+use crate::runtime::executor::{EscalationReply, NodeJob, NodeResult, NodeStatus, RunEvent, Runner, cancelled};
 use crate::runtime::{missions, scope};
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
@@ -49,6 +49,8 @@ enum Kind {
     Delegate,
     Work,
     Report,
+    /// Plan de correction après l'échec ou le blocage de subordonnés.
+    Fix,
 }
 
 impl Kind {
@@ -57,6 +59,7 @@ impl Kind {
             Kind::Delegate => "delegate",
             Kind::Work => "work",
             Kind::Report => "report",
+            Kind::Fix => "fix",
         }
     }
 }
@@ -79,6 +82,8 @@ pub struct PhaseOutcome {
     pub ok: bool,
     /// Rapport du boss (plan consolidé en conception).
     pub report: String,
+    /// Blocages restés sans solution à la fin de la phase (vide si `ok`).
+    pub blockers: Vec<Blocker>,
     pub tokens: u64,
     pub calls: u32,
 }
@@ -119,9 +124,157 @@ struct Shared {
     cost: Mutex<u64>,
 }
 
+/// Ce qui empêche une tâche d'aboutir : le supérieur le lit pour corriger ou rediriger.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Blocker {
+    /// tests | permission | prerequisite | bug | scope | other
+    pub kind: String,
+    pub detail: String,
+    /// Ce qu'il faudrait pour lever le blocage.
+    pub needs: String,
+}
+
+impl Blocker {
+    pub fn line(&self) -> String {
+        let needs = if self.needs.trim().is_empty() { String::new() } else { format!(" — needs: {}", self.needs.trim()) };
+        format!("[{}] {}{needs}", self.kind, self.detail.trim())
+    }
+}
+
+/// Résultat réel d'un poste : une tâche n'est « faite » que si l'agent l'affirme, sans refus ni blocage restant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Done,
+    Blocked,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+struct Outcome {
+    status: Status,
+    report: String,
+    blockers: Vec<Blocker>,
+}
+
+impl Outcome {
+    fn failed(msg: impl Into<String>) -> Self {
+        let msg = msg.into();
+        let detail = msg.lines().next().unwrap_or("").trim().to_string();
+        Outcome { status: Status::Failed, blockers: vec![Blocker { kind: "other".into(), detail, needs: String::new() }], report: msg }
+    }
+}
+
 struct SeatOut {
-    ok: bool,
+    status: Status,
     text: String,
+    blockers: Vec<Blocker>,
+}
+
+impl SeatOut {
+    fn ok(&self) -> bool {
+        self.status == Status::Done
+    }
+    fn failed(msg: impl Into<String>) -> Self {
+        Outcome::failed(msg).into()
+    }
+    /// Texte remonté au supérieur : le rapport, puis les blocages s'il y en a.
+    fn for_supervisor(&self) -> String {
+        if self.ok() || self.blockers.is_empty() {
+            return self.text.clone();
+        }
+        let list: Vec<String> = self.blockers.iter().map(|b| format!("- {}", b.line())).collect();
+        format!("{}\nBlockers:\n{}", self.text, list.join("\n"))
+    }
+}
+
+impl From<Outcome> for SeatOut {
+    fn from(o: Outcome) -> Self {
+        SeatOut { status: o.status, text: o.report, blockers: o.blockers }
+    }
+}
+
+/// Schéma de sortie des appels de travail et de rapport.
+pub fn outcome_schema() -> String {
+    json!({
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "enum": ["done", "blocked", "failed"]},
+            "report": {"type": "string"},
+            "blockers": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["tests", "permission", "prerequisite", "bug", "scope", "other"]},
+                        "detail": {"type": "string"},
+                        "needs": {"type": "string"}
+                    },
+                    "required": ["kind", "detail"]
+                }
+            }
+        },
+        "required": ["status", "report"]
+    })
+    .to_string()
+}
+
+/// Lit le résultat d'un appel de travail/rapport. `None` : sortie structurée absente ou illisible.
+/// Un refus de permission est toujours un blocage, même si l'agent se déclare « done ».
+fn parse_outcome(r: &NodeResult) -> Option<Outcome> {
+    if r.is_error {
+        return Some(Outcome::failed(r.output.clone()));
+    }
+    let v = r.structured.as_ref()?;
+    let mut status = match v["status"].as_str()? {
+        "done" => Status::Done,
+        "blocked" => Status::Blocked,
+        "failed" => Status::Failed,
+        _ => return None,
+    };
+    let text = |x: &Value| x.as_str().unwrap_or_default().trim().to_string();
+    let mut blockers: Vec<Blocker> = v["blockers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|b| Blocker { kind: text(&b["kind"]).chars().take(20).collect(), detail: text(&b["detail"]), needs: text(&b["needs"]) })
+        .filter(|b| !b.detail.is_empty())
+        .collect();
+    let mut seen: Vec<&String> = vec![];
+    let mut denied: Vec<Blocker> = vec![];
+    for d in &r.denials {
+        if !seen.contains(&d) && denied.len() < 5 {
+            seen.push(d);
+            denied.push(Blocker { kind: "permission".into(), detail: format!("refused by permissions: {d}"), needs: "authorize it (allow_bash / scope) or give it to a seat that has it".into() });
+        }
+    }
+    if !denied.is_empty() {
+        blockers.extend(denied);
+        if status == Status::Done {
+            status = Status::Blocked;
+        }
+    }
+    let report = text(&v["report"]);
+    if status != Status::Done && blockers.is_empty() {
+        let detail = report.lines().next().unwrap_or("not completed").to_string();
+        blockers.push(Blocker { kind: "other".into(), detail, needs: String::new() });
+    }
+    Some(Outcome { status, report, blockers })
+}
+
+/// Statut affiché d'un nœud, d'après son résultat.
+fn node_status(kind: Kind, r: &NodeResult) -> NodeStatus {
+    if r.is_error {
+        return NodeStatus::Failed(r.output.clone());
+    }
+    if !matches!(kind, Kind::Work | Kind::Report) {
+        return NodeStatus::Succeeded;
+    }
+    match parse_outcome(r) {
+        Some(o) if o.status == Status::Done => NodeStatus::Succeeded,
+        Some(o) if o.status == Status::Blocked => NodeStatus::Blocked(o.blockers.iter().map(Blocker::line).collect::<Vec<_>>().join("\n")),
+        Some(o) => NodeStatus::Failed(o.report),
+        None => NodeStatus::Failed("structured result missing".into()),
+    }
 }
 
 // ---------------------------------------------------------------- prompts (fonctions pures)
@@ -146,7 +299,12 @@ pub fn role_card(lang: Lang, c: &Company, i: usize, brief: &str, phase: Phase, k
         for &k in kids {
             let ks = &c.seats[k];
             let expertise = ks.expertise.clone().unwrap_or_default();
-            out.push_str(&format!("- {} · {}{}\n", ks.id, ks.title, if expertise.is_empty() { String::new() } else { format!(" · {expertise}") }));
+            let tools = match (ks.builds, ks.allow_bash.is_empty()) {
+                (false, _) => String::new(),
+                (true, true) => " · builds".to_string(),
+                (true, false) => format!(" · builds, shell: {}", ks.allow_bash.join(", ")),
+            };
+            out.push_str(&format!("- {} · {}{}{tools}\n", ks.id, ks.title, if expertise.is_empty() { String::new() } else { format!(" · {expertise}") }));
         }
     }
     if phase == Phase::Realisation && !scope.is_empty() {
@@ -166,7 +324,7 @@ pub fn role_card(lang: Lang, c: &Company, i: usize, brief: &str, phase: Phase, k
         Phase::Realisation => out.push_str("\nREALISATION PHASE: the plan is approved, we now build in the project.\n"),
     }
     out.push_str(&format!(
-        "\nRules: be concise and actionable; stay within your seat's remit; do not repeat the brief; clearly flag what is missing or what really failed. The user's language is {}: write everything you produce in it.",
+        "\nRules: be concise and actionable; stay within your seat's remit; do not repeat the brief; clearly flag what is missing or what really failed. Never claim a success you could not verify: when you cannot complete your task, say so (status blocked) with the exact cause and what is needed, instead of working around it. The user's language is {}: write everything you produce in it.",
         lang.name()
     ));
     out
@@ -190,9 +348,10 @@ pub fn delegate_prompt(task: &str, phase: Phase, scope: Option<&[String]>) -> St
 }
 
 pub fn work_prompt(task: &str, phase: Phase) -> String {
+    let end = " Answer only through the structured output: status \"done\" ONLY if the task is really complete (and verified as far as your tools allow); otherwise \"blocked\" with `blockers` (kind, exact cause, what is needed). Never report \"done\" with a known problem.";
     match phase {
-        Phase::Conception => format!("Task:\n{task}\n\nProduce your deliverable as text (analysis, specification, recommendations). You do not have to modify the project."),
-        Phase::Realisation => format!("Task:\n{task}\n\nCarry it out in the project, only within your scope, then summarize precisely what you did.\n\nStart by writing the requested files. If a tool or command is refused, do not stop: continue with what is allowed and state in your summary what you could not verify or run."),
+        Phase::Conception => format!("Task:\n{task}\n\nProduce your deliverable as text (analysis, specification, recommendations) in `report`. You do not have to modify the project; use \"blocked\" only if you cannot produce your analysis (missing access or information).{end}"),
+        Phase::Realisation => format!("Task:\n{task}\n\nCarry it out in the project, only within your scope, verify it with the commands you are allowed (tests, build), then summarize precisely what you did in `report`.\n\nIf a tool or command is refused, a test fails or a prerequisite is missing: first fix what is within your scope; if you cannot, STOP and report it as blocked. Do not silently work around it and do not continue as if it worked.{end}"),
     }
 }
 
@@ -210,7 +369,7 @@ pub fn report_prompt(task: &str, results: &[(String, String, String, bool, Strin
             if *ok { t } else { format!("[FAILED: {t}]") }
         ));
     }
-    out.push_str("\nWrite your summary report for your supervisor: conclusions, decisions, points of attention, missing elements. Explicitly mention any FAILURE and its impact.");
+    out.push_str("\nWrite your summary report for your supervisor: conclusions, decisions, points of attention, missing elements. Explicitly mention any FAILURE and its impact. Answer through the structured output: status \"done\" only if every part of the task is really complete and verified (a subordinate's problem that was fixed in a later result counts as resolved); otherwise \"blocked\" with the remaining `blockers`.");
     out
 }
 
@@ -237,6 +396,53 @@ pub fn delegation_schema(kid_ids: &[String], with_scope: bool) -> String {
         "required": ["assignments"]
     })
     .to_string()
+}
+
+/// Schéma du plan de correction : `plan`, puis des affectations correctives ou une remontée (`escalate`).
+pub fn fix_schema(kid_ids: &[String], with_scope: bool) -> String {
+    let mut v: Value = serde_json::from_str(&delegation_schema(kid_ids, with_scope)).expect("schéma valide");
+    v["properties"]["assignments"].as_object_mut().map(|a| a.remove("minItems"));
+    v["properties"]["plan"] = json!({"type": "string"});
+    v["properties"]["escalate"] = json!({"type": "string"});
+    v["required"] = json!(["plan"]);
+    v.to_string()
+}
+
+/// `failed`: (title, id, assigned task, ok = false, texte avec blocages).
+pub fn fix_prompt(task: &str, failed: &[(String, String, String, bool, String)], scope: Option<&[String]>, decision: Option<&str>) -> String {
+    let mut out = format!("Original task your supervisor gave you:\n{task}\n\nThese subordinates could NOT complete their work:\n");
+    for (title, id, sub_task, _, text) in failed {
+        let mut t = text.clone();
+        if t.chars().count() > MAX_CHILD_CHARS {
+            t = t.chars().take(MAX_CHILD_CHARS).collect::<String>() + "\n[… truncated]";
+        }
+        out.push_str(&format!("\n### {title} ({id})\nAssigned task: {sub_task}\n[{t}]\n"));
+    }
+    out.push_str("\nYou are responsible for getting this fixed, properly. Write a short correction plan in `plan` (root cause, then the steps). Then give corrective, self-contained tasks in `assignments` to the subordinate(s) best placed to fix it: possibly a different one than who failed (e.g. the one that has the missing tool or permission, or the specialist team). If nobody in your branch can fix it (a permission or tool nobody has, a prerequisite that does not exist, a decision that is not yours), assign nothing and explain precisely in `escalate` what is needed: your supervisor will take over. Do not play the problem down.");
+    if let Some(sc) = scope {
+        out.push_str(&format!("\n\nYour file scope: `{}`. Each assignment needs a `scope` (project-relative patterns, ALL included in yours).", sc.join("`, `")));
+    }
+    if let Some(d) = decision.filter(|d| !d.trim().is_empty()) {
+        out.push_str(&format!("\n\nDecision from the user who requested the mission (follow it):\n{}", d.trim()));
+    }
+    out.push_str("\n\nAnswer only through the structured output.");
+    out
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FixPlan {
+    Assign { plan: String, assignments: Vec<Assignment> },
+    /// Personne ne peut corriger dans cette branche : on remonte, avec la raison.
+    Escalate(String),
+}
+
+/// Lit le plan de correction : des affectations valides priment ; sinon la remontée.
+pub fn parse_fix(v: &Value, c: &Company, kids: &[usize], parent_scope: Option<&[String]>) -> FixPlan {
+    let reason = v["escalate"].as_str().map(str::trim).filter(|r| !r.is_empty());
+    match parse_assignments(v, c, kids, parent_scope) {
+        Ok(assignments) => FixPlan::Assign { plan: v["plan"].as_str().unwrap_or_default().to_string(), assignments },
+        Err(e) => FixPlan::Escalate(reason.map(String::from).unwrap_or_else(|| e.to_string())),
+    }
 }
 
 /// Lit la sortie structurée : ignore les destinataires inconnus, fusionne les doublons.
@@ -361,6 +567,7 @@ impl Shared {
             (Kind::Work, Phase::Conception) => "analyses",
             (Kind::Work, Phase::Realisation) => "builds",
             (Kind::Report, _) => "reports",
+            (Kind::Fix, _) => "fixes",
         };
         let _ = self.tx.send(RunEvent::Label {
             id: id.clone(),
@@ -387,8 +594,7 @@ impl Shared {
         let _ = fwd.await;
 
         let (status, used) = match &res {
-            Ok(r) if !r.is_error => (NodeStatus::Succeeded, r.tokens),
-            Ok(r) => (NodeStatus::Failed(r.output.clone()), r.tokens),
+            Ok(r) => (node_status(kind, r), r.tokens),
             Err(e) if self.cancelled() => {
                 let _ = e;
                 (NodeStatus::Cancelled, 0)
@@ -420,63 +626,207 @@ impl Shared {
         }
         Err(last)
     }
+
+    /// Appel de travail ou de rapport : sortie structurée obligatoire, un nouvel essai si elle manque.
+    async fn act(self: &Arc<Self>, i: usize, phase: Phase, kind: Kind, prompt: String, kids: &[usize], sc: &[String]) -> Outcome {
+        for _ in 0..2 {
+            match self.call(i, phase, kind, prompt.clone(), Some(outcome_schema()), kids, sc).await {
+                Ok(r) => {
+                    if let Some(o) = parse_outcome(&r) {
+                        return o;
+                    }
+                }
+                Err(e) => return Outcome::failed(e.to_string()),
+            }
+        }
+        Outcome::failed("structured result missing")
+    }
+
+    /// Plan de correction du poste `i` pour les subordonnés en échec ; remonte si personne ne peut corriger.
+    #[allow(clippy::too_many_arguments)]
+    async fn fix(self: &Arc<Self>, i: usize, phase: Phase, task: &str, failed: &[(String, String, String, bool, String)], kids: &[usize], sc: &[String], decision: Option<&str>) -> FixPlan {
+        let ids: Vec<String> = kids.iter().map(|&k| self.company.seats[k].id.clone()).collect();
+        let real = phase == Phase::Realisation;
+        let parent_scope = real.then_some(sc);
+        for _ in 0..2 {
+            match self.call(i, phase, Kind::Fix, fix_prompt(task, failed, parent_scope, decision), Some(fix_schema(&ids, real)), kids, sc).await {
+                Ok(res) if !res.is_error => {
+                    if let Some(v) = &res.structured {
+                        return parse_fix(v, &self.company, kids, parent_scope);
+                    }
+                }
+                Ok(res) => return FixPlan::Escalate(res.output),
+                Err(e) => return FixPlan::Escalate(e.to_string()),
+            }
+        }
+        FixPlan::Escalate("structured output missing".into())
+    }
+
+    /// Le CEO n'a pas pu régler le blocage : pause, l'utilisateur décide (relancer, arrêter, ou en discuter d'abord).
+    async fn ask_user(self: &Arc<Self>, summary: String) -> EscalationReply {
+        if self.cancelled() || self.calls.load(Ordering::SeqCst) >= self.company.max_calls {
+            return EscalationReply::Stop;
+        }
+        let (rtx, mut rrx) = mpsc::unbounded_channel::<EscalationReply>();
+        let _ = self.tx.send(RunEvent::Escalation { summary, reply: rtx });
+        let mut cancel = self.cancel.clone();
+        tokio::select! {
+            r = rrx.recv() => r.unwrap_or(EscalationReply::Stop),
+            _ = cancelled(&mut cancel) => EscalationReply::Stop,
+        }
+    }
+
+    /// Décision écrite par l'utilisateur pendant la discussion avec le CEO.
+    fn resolution(&self) -> Option<String> {
+        let d = self.opts.mission_dir.as_ref()?;
+        std::fs::read_to_string(d.join(missions::RESOLUTION_FILE)).ok().filter(|t| !t.trim().is_empty())
+    }
+}
+
+/// Exécute des affectations : en conception tout en parallèle ; en réalisation par lots sans chevauchement de
+/// fichiers, l'un après l'autre. Un lot qui échoue arrête les suivants (on ne construit pas sur une base cassée).
+/// Renvoie les affectations menées (avec leur résultat) et celles jamais démarrées.
+async fn run_batch(sh: &Arc<Shared>, phase: Phase, todo: Vec<Assignment>) -> (Vec<(Assignment, SeatOut)>, Vec<Assignment>) {
+    let lots: Vec<Vec<usize>> = match phase {
+        Phase::Conception => vec![(0..todo.len()).collect()],
+        Phase::Realisation => scope::batches(&todo.iter().map(|a| a.scope.clone()).collect::<Vec<_>>()),
+    };
+    let mut outs: Vec<Option<SeatOut>> = (0..todo.len()).map(|_| None).collect();
+    let mut started = vec![false; todo.len()];
+    for lot in lots {
+        if sh.cancelled() {
+            break;
+        }
+        let mut set: JoinSet<(usize, SeatOut)> = JoinSet::new();
+        for &n in &lot {
+            started[n] = true;
+            let a = &todo[n];
+            let (sh2, to, t, s2) = (sh.clone(), a.to, a.task.clone(), a.scope.clone());
+            set.spawn(async move { (n, run_seat(sh2, to, phase, t, s2).await) });
+        }
+        while let Some(joined) = set.join_next().await {
+            if let Ok((n, out)) = joined {
+                outs[n] = Some(out);
+            }
+        }
+        if lot.iter().any(|&n| outs[n].as_ref().is_none_or(|o| !o.ok())) {
+            break;
+        }
+    }
+    let (mut ran, mut pending) = (vec![], vec![]);
+    for ((a, out), was_started) in todo.into_iter().zip(outs).zip(started) {
+        match (out, was_started) {
+            (Some(o), _) => ran.push((a, o)),
+            (None, true) => ran.push((a, SeatOut::failed("the node was interrupted"))),
+            (None, false) => pending.push(a),
+        }
+    }
+    (ran, pending)
+}
+
+/// Rangée du rapport d'un supérieur : (titre, id, tâche, ok, texte avec blocages).
+fn result_row(sh: &Shared, a: &Assignment, out: &SeatOut) -> (String, String, String, bool, String) {
+    let s = &sh.company.seats[a.to];
+    (s.title.clone(), s.id.clone(), a.task.clone(), out.ok(), out.for_supervisor())
+}
+
+/// Texte de l'escalade vers l'utilisateur : ce qui bloque, par poste, et pourquoi le CEO ne peut pas régler.
+pub fn escalation_summary(problems: &[(String, String)], reason: Option<&str>) -> String {
+    let mut out = tf!("Le CEO n'a pas pu lever ces blocages :", "The CEO could not clear these blockers:").to_string();
+    for (title, text) in problems {
+        out.push_str(&format!("\n\n### {title}\n{text}"));
+    }
+    if let Some(r) = reason.filter(|r| !r.trim().is_empty()) {
+        out.push_str(&format!("\n\n{}\n{}", tf!("Raison de la remontée :", "Why it was escalated:"), r.trim()));
+    }
+    out
 }
 
 fn run_seat(sh: Arc<Shared>, i: usize, phase: Phase, task: String, sc: Vec<String>) -> Pin<Box<dyn Future<Output = SeatOut> + Send>> {
     Box::pin(async move {
         let kids = sh.kids(i, phase);
-        let fail = |e: String| SeatOut { ok: false, text: e };
 
         // Feuille : travail direct.
         if kids.is_empty() {
-            return match sh.call(i, phase, Kind::Work, work_prompt(&task, phase), None, &kids, &sc).await {
-                Ok(r) if !r.is_error => SeatOut { ok: true, text: r.output },
-                Ok(r) => fail(r.output),
-                Err(e) => fail(e.to_string()),
-            };
+            return sh.act(i, phase, Kind::Work, work_prompt(&task, phase), &kids, &sc).await.into();
         }
 
-        // Poste interne : délégation → travail des subordonnés → rapport de synthèse.
+        // Poste interne : délégation → travail des subordonnés → (correction des échecs) → rapport de synthèse.
         let assignments = match sh.delegate(i, phase, &task, &kids, &sc).await {
             Ok(a) => a,
-            Err(e) => return fail(format!("delegation impossible: {e}")),
+            Err(e) => return SeatOut::failed(format!("delegation impossible: {e}")),
         };
-        // Conception : tout en parallèle. Réalisation : lots sans chevauchement de fichiers, l'un après l'autre.
-        let lots: Vec<Vec<usize>> = match phase {
-            Phase::Conception => vec![(0..assignments.len()).collect()],
-            Phase::Realisation => scope::batches(&assignments.iter().map(|a| a.scope.clone()).collect::<Vec<_>>()),
-        };
-        let mut outs: Vec<Option<SeatOut>> = (0..assignments.len()).map(|_| None).collect();
-        for lot in lots {
-            let mut set: JoinSet<(usize, SeatOut)> = JoinSet::new();
-            for n in lot {
-                let a = &assignments[n];
-                let (sh2, to, t, s2) = (sh.clone(), a.to, a.task.clone(), a.scope.clone());
-                set.spawn(async move { (n, run_seat(sh2, to, phase, t, s2).await) });
-            }
-            while let Some(joined) = set.join_next().await {
-                if let Ok((n, out)) = joined {
-                    outs[n] = Some(out);
+        let is_root = sh.company.root() == Some(i);
+        let mut history: Vec<(String, String, String, bool, String)> = vec![];
+        let mut todo = assignments;
+        let mut rounds_left = sh.company.max_fix_rounds;
+        let mut decision: Option<String> = None;
+        let mut reason: Option<String> = None;
+        // Problèmes non résolus à la fin : (titre, texte avec blocages, blocages).
+        let mut unresolved: Vec<(String, String, Vec<Blocker>)> = vec![];
+        loop {
+            let (ran, pending) = run_batch(&sh, phase, todo).await;
+            let mut failed_rows = vec![];
+            unresolved.clear();
+            for (a, out) in &ran {
+                let row = result_row(&sh, a, out);
+                if !out.ok() {
+                    let title = row.0.clone();
+                    unresolved.push((title.clone(), row.4.clone(), out.blockers.iter().map(|b| Blocker { detail: format!("{title}: {}", b.detail), ..b.clone() }).collect()));
+                    failed_rows.push(row.clone());
                 }
+                history.push(row);
+            }
+            for a in &pending {
+                let title = sh.company.seats[a.to].title.clone();
+                let msg = "not started: a previous batch is blocked".to_string();
+                unresolved.push((title.clone(), msg.clone(), vec![Blocker { kind: "prerequisite".into(), detail: format!("{title}: {msg}"), needs: String::new() }]));
+            }
+            // Résolution : correctifs dans la branche, puis remontée ; le CEO en dernier recours s'adresse à l'utilisateur.
+            let next = loop {
+                if unresolved.is_empty() || sh.cancelled() {
+                    break None;
+                }
+                if rounds_left > 0 {
+                    rounds_left -= 1;
+                    match sh.fix(i, phase, &task, &failed_rows, &kids, &sc, decision.as_deref()).await {
+                        FixPlan::Assign { assignments, .. } => {
+                            let mut next = assignments;
+                            next.extend(pending.iter().cloned());
+                            break Some(next);
+                        }
+                        FixPlan::Escalate(r) => {
+                            reason = Some(r);
+                            rounds_left = 0;
+                        }
+                    }
+                } else if is_root {
+                    let shown: Vec<(String, String)> = unresolved.iter().map(|(t, x, _)| (t.clone(), x.clone())).collect();
+                    match sh.ask_user(escalation_summary(&shown, reason.as_deref())).await {
+                        EscalationReply::Retry => {
+                            rounds_left = sh.company.max_fix_rounds.max(1);
+                            decision = sh.resolution();
+                        }
+                        EscalationReply::Stop => break None,
+                    }
+                } else {
+                    break None;
+                }
+            };
+            match next {
+                Some(n) => todo = n,
+                None => break,
             }
         }
-        let mut all_ok = true;
-        let results: Vec<(String, String, String, bool, String)> = assignments
-            .iter()
-            .zip(outs)
-            .map(|(a, out)| {
-                let out = out.unwrap_or(SeatOut { ok: false, text: "the node was interrupted".into() });
-                all_ok &= out.ok;
-                let s = &sh.company.seats[a.to];
-                (s.title.clone(), s.id.clone(), a.task.clone(), out.ok, out.text)
-            })
-            .collect();
 
-        match sh.call(i, phase, Kind::Report, report_prompt(&task, &results), None, &kids, &sc).await {
-            Ok(r) if !r.is_error => SeatOut { ok: all_ok, text: r.output },
-            Ok(r) => fail(r.output),
-            Err(e) => fail(e.to_string()),
+        let rep = sh.act(i, phase, Kind::Report, report_prompt(&task, &history), &kids, &sc).await;
+        let mut blockers: Vec<Blocker> = unresolved.iter().flat_map(|(_, _, b)| b.clone()).collect();
+        if unresolved.is_empty() && rep.status == Status::Done {
+            return SeatOut { status: Status::Done, text: rep.report, blockers: vec![] };
         }
+        blockers.extend(rep.blockers);
+        let status = if unresolved.is_empty() && rep.status == Status::Failed { Status::Failed } else { Status::Blocked };
+        SeatOut { status, text: rep.report, blockers }
     })
 }
 
@@ -514,7 +864,8 @@ pub async fn run_phase(
     let out = run_seat(sh.clone(), root, phase, root_task.to_string(), root_scope).await;
     let cost = *sh.cost.lock().unwrap();
     let used = sh.calls.load(Ordering::SeqCst).min(company.max_calls).saturating_sub(before);
-    Ok(PhaseOutcome { ok: out.ok, report: out.text, tokens: cost, calls: used })
+    let ok = out.ok();
+    Ok(PhaseOutcome { ok, report: out.text, blockers: if ok { vec![] } else { out.blockers }, tokens: cost, calls: used })
 }
 
 const CONCEPTION_TASK: &str = "Lead the design phase of the mission described in the brief: have each domain framed by the right lead.";
@@ -553,7 +904,7 @@ pub async fn run_mission(
 
     let resumed_plan = if opts.resume { opts.mission_dir.as_deref().and_then(missions::resumable_plan) } else { None };
     let conception = if let Some(plan) = resumed_plan {
-        PhaseOutcome { ok: true, report: plan, tokens: 0, calls: 0 }
+        PhaseOutcome { ok: true, report: plan, blockers: vec![], tokens: 0, calls: 0 }
     } else {
         if let Some(d) = &opts.mission_dir {
             missions::clear_conception_mark(d); // un run neuf invalide l'ancien plan
@@ -586,7 +937,8 @@ pub async fn run_mission(
 
     let has_builders = company.seats.iter().any(|s| s.builds);
     let cancelled_now = *cancel.borrow();
-    if has_builders && !cancelled_now {
+    // Conception non réussie : on ne construit jamais sur une base bloquée (l'utilisateur a déjà pu intervenir).
+    if has_builders && !cancelled_now && conception.ok {
         // Point de contrôle : le plan est validé avant de toucher au projet.
         let approved = if company.checkpoint {
             let (rtx, mut rrx) = mpsc::unbounded_channel::<bool>();
@@ -696,6 +1048,8 @@ reports_to = "ciso"
         timeline: Mutex<Vec<String>>,
         now: AtomicUsize,
         peak: AtomicUsize,
+        /// Passages par identifiant d'appel.
+        seen: Mutex<std::collections::HashMap<String, usize>>,
     }
 
     #[derive(Default, Clone)]
@@ -708,6 +1062,14 @@ reports_to = "ciso"
         overlap: bool,
         /// Ces postes attribuent un périmètre hors du leur.
         escape: Vec<&'static str>,
+        /// Ces appels se déclarent « blocked » à chaque fois.
+        blocked: Vec<&'static str>,
+        /// Ces appels se déclarent « blocked » à leur premier passage seulement.
+        blocked_once: Vec<&'static str>,
+        /// Ces appels disent « done » mais ont subi un refus de permission.
+        deny: Vec<&'static str>,
+        /// Ces postes réassignent la correction à tous leurs subordonnés (sinon : ils remontent).
+        fix_assign: Vec<&'static str>,
     }
 
     fn enum_ids(schema: &str) -> Vec<String> {
@@ -779,8 +1141,41 @@ reports_to = "ciso"
                             .collect();
                         NodeResult { structured: Some(json!({"assignments": items})), output: "{}".into(), tokens: 0, ..Default::default() }
                     }
-                    "work" => NodeResult { output: format!("travail({seat})"), tokens: 0, ..Default::default() },
-                    _ => NodeResult { output: format!("rapport({seat})"), tokens: 0, ..Default::default() },
+                    "work" | "report" => {
+                        let n = {
+                            let mut seen = p.seen.lock().unwrap();
+                            let c = seen.entry(job.id.clone()).or_insert(0);
+                            *c += 1;
+                            *c
+                        };
+                        let text = if kind == "work" { format!("travail({seat})") } else { format!("rapport({seat})") };
+                        let blocked = b.blocked.contains(&job.id.as_str()) || (n == 1 && b.blocked_once.contains(&job.id.as_str()));
+                        let structured = if blocked {
+                            json!({"status": "blocked", "report": text, "blockers": [{"kind": "tests", "detail": format!("tests rouges chez {seat}"), "needs": "corriger"}]})
+                        } else {
+                            json!({"status": "done", "report": text, "blockers": []})
+                        };
+                        let denials = if b.deny.contains(&job.id.as_str()) { vec!["Bash(git status)".to_string()] } else { vec![] };
+                        NodeResult { structured: Some(structured), output: text, denials, ..Default::default() }
+                    }
+                    "fix" if b.fix_assign.contains(&seat.as_str()) => {
+                        let schema = job.spec.json_schema.as_deref().unwrap();
+                        let with_scope = schema.contains("\"scope\"");
+                        let parent = parent_scope(&job.spec.prompt);
+                        let dir = parent.first().map(|s| s.trim_end_matches("/**").to_string()).filter(|s| s != "**").unwrap_or_else(|| "src".into());
+                        let items: Vec<Value> = enum_ids(schema)
+                            .iter()
+                            .map(|k| {
+                                let mut a = json!({"to": k, "task": format!("correctif pour {k}")});
+                                if with_scope {
+                                    a["scope"] = json!([format!("{dir}/{k}/**")]);
+                                }
+                                a
+                            })
+                            .collect();
+                        NodeResult { structured: Some(json!({"plan": "plan de correction", "assignments": items})), output: "{}".into(), ..Default::default() }
+                    }
+                    _ => NodeResult { structured: Some(json!({"plan": "personne ne peut corriger ici", "escalate": "aucun poste compétent dans cette branche"})), output: "{}".into(), ..Default::default() },
                 })
             })
         })
@@ -794,6 +1189,8 @@ reports_to = "ciso"
         mission_dir: Option<PathBuf>,
         cancel_after_ms: Option<u64>,
         resume: bool,
+        /// Réponses successives aux escalades vers l'utilisateur (défaut : arrêter).
+        escalations: Vec<EscalationReply>,
     }
 
     async fn run_cfg(c: &Company, p: Arc<Probe>, b: Behavior, cfg: Cfg) -> (MissionOutcome, Vec<RunEvent>) {
@@ -802,10 +1199,14 @@ reports_to = "ciso"
         let events = Arc::new(Mutex::new(Vec::<RunEvent>::new()));
         let ev2 = events.clone();
         let answer = cfg.answer;
+        let mut script = cfg.escalations.clone().into_iter();
         let collector = tokio::spawn(async move {
             while let Some(e) = rx.recv().await {
                 if let (RunEvent::Checkpoint { reply, .. }, Some(a)) = (&e, answer) {
                     let _ = reply.send(a);
+                }
+                if let RunEvent::Escalation { reply, .. } = &e {
+                    let _ = reply.send(script.next().unwrap_or(EscalationReply::Stop));
                 }
                 ev2.lock().unwrap().push(e);
             }
@@ -1214,6 +1615,135 @@ reports_to = "ciso"
         assert_eq!(p.started.lock().unwrap().len(), 14);
         assert!(!out.ok);
         assert_eq!(out.calls, 14);
+    }
+
+    // ----------------------------------------------------------- blocages : correction et escalade
+
+    #[tokio::test]
+    async fn blocage_corrige_par_le_manager_la_phase_reussit() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { blocked_once: vec!["dev1/conception/work"], fix_assign: vec!["mgr"], ..Default::default() };
+        let (out, evs) = run(&company(), p.clone(), b, false).await;
+        assert!(out.ok, "le correctif a réussi : {:?}", out.conception.blockers);
+        let started = p.started.lock().unwrap().clone();
+        assert_eq!(started.iter().filter(|id| *id == "mgr/conception/fix").count(), 1);
+        assert_eq!(started.iter().filter(|id| *id == "dev1/conception/work").count(), 2, "relancé une fois");
+        assert!(evs.iter().any(|e| matches!(e, RunEvent::NodeFinished { id, status: NodeStatus::Blocked(_), .. } if id == "dev1/conception/work")));
+        let prompts = p.prompts.lock().unwrap();
+        let fix = &prompts.iter().find(|(id, _, _)| id == "mgr/conception/fix").unwrap().1;
+        assert!(fix.contains("could NOT complete") && fix.contains("tests rouges chez dev1") && fix.contains("correction plan"), "{fix}");
+        let rep = &prompts.iter().find(|(id, _, _)| id == "mgr/conception/report").unwrap().1;
+        assert!(rep.contains("correctif pour dev1") || rep.contains("travail(dev1)"), "{rep}");
+    }
+
+    #[tokio::test]
+    async fn blocage_non_reglable_remonte_au_superieur_qui_corrige() {
+        let p = Arc::new(Probe::default());
+        // mgr ne peut rien faire (il remonte) ; cto prend la main et réassigne.
+        let b = Behavior { blocked: vec!["dev1/conception/work"], fix_assign: vec!["cto"], ..Default::default() };
+        let (out, _) = run(&company(), p.clone(), b, false).await;
+        assert!(!out.ok, "dev1 reste bloqué malgré les correctifs");
+        let started = p.started.lock().unwrap().clone();
+        assert!(started.iter().any(|id| id == "mgr/conception/fix"), "le manager essaie d'abord");
+        assert!(started.iter().any(|id| id == "cto/conception/fix"), "puis le supérieur reçoit le blocage");
+        let prompts = p.prompts.lock().unwrap();
+        let cto = &prompts.iter().find(|(id, _, _)| id == "cto/conception/fix").unwrap().1;
+        assert!(cto.contains("Engineering Manager") && cto.contains("tests rouges chez dev1"), "{cto}");
+    }
+
+    #[tokio::test]
+    async fn ceo_bloque_previent_l_utilisateur_et_s_arrete_sur_stop() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { blocked: vec!["dev1/conception/work"], ..Default::default() };
+        let (out, evs) = run(&company(), p.clone(), b, false).await;
+        assert!(!out.ok);
+        let summary = evs.iter().find_map(|e| match e { RunEvent::Escalation { summary, .. } => Some(summary.clone()), _ => None }).expect("escalade vers l'utilisateur");
+        assert!(summary.contains("tests rouges chez dev1"), "{summary}");
+        assert!(!out.conception.blockers.is_empty() && out.conception.blockers.iter().any(|b| b.kind == "tests"));
+        assert!(matches!(evs.last(), Some(RunEvent::RunFinished { ok: false, .. })));
+    }
+
+    #[tokio::test]
+    async fn relance_apres_discussion_injecte_la_decision_de_l_utilisateur() {
+        let dir = tmpdir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("resolution.md"), "DECISION: autoriser git").unwrap();
+        let p = Arc::new(Probe::default());
+        let b = Behavior { blocked: vec!["dev1/conception/work"], ..Default::default() };
+        let cfg = Cfg { answer: Some(true), mission_dir: Some(dir), escalations: vec![EscalationReply::Retry], ..Default::default() };
+        let (out, evs) = run_cfg(&company(), p.clone(), b, cfg).await;
+        assert!(!out.ok);
+        assert_eq!(evs.iter().filter(|e| matches!(e, RunEvent::Escalation { .. })).count(), 2, "relance puis nouveau blocage");
+        let prompts = p.prompts.lock().unwrap();
+        let fixes: Vec<&String> = prompts.iter().filter(|(id, _, _)| id == "ceo/conception/fix").map(|(_, pr, _)| pr).collect();
+        assert!(fixes.len() >= 2 && !fixes[0].contains("DECISION") && fixes.iter().skip(1).all(|f| f.contains("DECISION: autoriser git")), "{fixes:?}");
+    }
+
+    #[tokio::test]
+    async fn refus_de_permission_est_un_blocage_meme_si_l_agent_dit_done() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { deny: vec!["dev1/conception/work"], ..Default::default() };
+        let (out, evs) = run(&company(), p.clone(), b, false).await;
+        assert!(!out.ok);
+        let blocked = evs.iter().find_map(|e| match e { RunEvent::NodeFinished { id, status: NodeStatus::Blocked(m), .. } if id == "dev1/conception/work" => Some(m.clone()), _ => None });
+        assert!(blocked.is_some_and(|m| m.contains("[permission]") && m.contains("git status")));
+    }
+
+    #[tokio::test]
+    async fn lot_bloque_les_suivants_ne_demarrent_pas() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { overlap: true, blocked: vec!["dev1/realisation/work", "dev2/realisation/work"], ..Default::default() };
+        let (out, _) = run(&company_build(), p.clone(), b, false).await;
+        assert!(!out.ok);
+        let started = p.started.lock().unwrap().clone();
+        let n = started.iter().filter(|id| *id == "dev1/realisation/work" || *id == "dev2/realisation/work").count();
+        assert_eq!(n, 1, "le second lot n'est pas lancé sur une base bloquée : {started:?}");
+    }
+
+    #[tokio::test]
+    async fn conception_bloquee_ne_lance_pas_la_realisation() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { blocked: vec!["dev1/conception/work"], ..Default::default() };
+        let (out, _) = run(&company_build(), p.clone(), b, false).await;
+        assert!(!out.ok && out.realisation.is_none() && out.approved.is_none());
+        assert!(!p.started.lock().unwrap().iter().any(|id| id.contains("/realisation/")));
+    }
+
+    #[tokio::test]
+    async fn tours_de_correction_bornes_par_max_fix_rounds() {
+        let mut c = company();
+        c.max_fix_rounds = 1;
+        let p = Arc::new(Probe::default());
+        let b = Behavior { blocked: vec!["dev1/conception/work"], fix_assign: vec!["mgr"], ..Default::default() };
+        let (out, _) = run(&c, p.clone(), b, false).await;
+        assert!(!out.ok);
+        let started = p.started.lock().unwrap().clone();
+        assert_eq!(started.iter().filter(|id| *id == "mgr/conception/fix").count(), 1);
+        assert_eq!(started.iter().filter(|id| *id == "dev1/conception/work").count(), 2);
+    }
+
+    #[test]
+    fn lecture_du_plan_de_correction() {
+        let c = Company::parse(SRC).unwrap();
+        let kids = c.children(c.index_of("ceo").unwrap());
+        let ok = json!({"plan": "p", "assignments": [{"to": "cto", "task": "corriger"}]});
+        assert!(matches!(parse_fix(&ok, &c, &kids, None), FixPlan::Assign { .. }));
+        let esc = json!({"plan": "p", "escalate": "il manque un droit"});
+        assert_eq!(parse_fix(&esc, &c, &kids, None), FixPlan::Escalate("il manque un droit".into()));
+        assert!(matches!(parse_fix(&json!({"plan": "p"}), &c, &kids, None), FixPlan::Escalate(_)), "rien à assigner : on remonte");
+    }
+
+    #[test]
+    fn sortie_sans_statut_ou_refus_jamais_un_succes() {
+        let r = |structured: Option<Value>, denials: Vec<String>| NodeResult { structured, denials, output: "txt".into(), ..Default::default() };
+        assert!(parse_outcome(&r(None, vec![])).is_none(), "sortie structurée absente");
+        assert!(parse_outcome(&r(Some(json!({"status": "oups", "report": "x"})), vec![])).is_none());
+        let o = parse_outcome(&r(Some(json!({"status": "done", "report": "ok"})), vec!["Bash(git push)".into()])).unwrap();
+        assert_eq!(o.status, Status::Blocked);
+        assert_eq!(o.blockers[0].kind, "permission");
+        let o = parse_outcome(&r(Some(json!({"status": "blocked", "report": "KO"})), vec![])).unwrap();
+        assert_eq!(o.blockers.len(), 1, "un blocage est toujours expliqué");
+        assert_eq!(parse_outcome(&NodeResult { is_error: true, output: "boum".into(), ..Default::default() }).unwrap().status, Status::Failed);
     }
 
     // ----------------------------------------------------------- briques pures

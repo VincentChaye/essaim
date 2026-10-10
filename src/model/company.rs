@@ -13,6 +13,9 @@ fn default_max_calls() -> u32 {
 fn default_max_parallel() -> usize {
     2
 }
+fn default_max_fix_rounds() -> u32 {
+    2
+}
 fn default_checkpoint() -> bool {
     true
 }
@@ -62,6 +65,9 @@ pub struct Company {
     /// Pause pour valider le plan avant la réalisation.
     #[serde(default = "default_checkpoint")]
     pub checkpoint: bool,
+    /// Tours de correction qu'un poste peut lancer dans sa branche avant de remonter le blocage à son supérieur.
+    #[serde(default = "default_max_fix_rounds")]
+    pub max_fix_rounds: u32,
     #[serde(default, rename = "seat")]
     pub seats: Vec<Seat>,
 }

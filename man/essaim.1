@@ -54,6 +54,8 @@ reprend une mission interrompue (une conception menée à terme n'est pas rejou�
 Sans \fB\-\-yes\fR, un plan consolidé demande \fB[o/N/e]\fR : \fBo\fR lance la réalisation, \fBe\fR modifie le plan avec le boss,
 toute autre réponse arrête.
 Si le point de contrôle est désactivé (\fBcheckpoint = false\fR dans le TOML), il n'y a ni invite ni pause : la réalisation démarre après la conception.
+.PP
+Blocages : un poste bloqué (tests rouges, permission refusée, prérequis absent) n'est jamais compté comme réussi. Son supérieur lance jusqu'à \fBmax_fix_rounds\fR tours de correction (défaut 2), puis remonte le blocage de niveau en niveau jusqu'au CEO ; si le CEO échoue, le run attend une décision (relancer, discuter avec le CEO, arrêter). Avec \fB--yes\fR, la mission s'arrête.
 Avertissement d'exécution dans ce cas : \fB[À CONFIRMER]\fR (texte et canal à fixer).
 .SH INTERFACE
 .SS Navigation

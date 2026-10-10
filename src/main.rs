@@ -8,7 +8,7 @@ use model::{agent, company::Company};
 use runtime::claude_proc::ClaudeEvent;
 use runtime::company_exec::{CompanyOptions, note_refus, run_mission};
 use runtime::missions;
-use runtime::executor::{NodeStatus, RunEvent, claude_runner};
+use runtime::executor::{EscalationReply, NodeStatus, RunEvent, claude_runner};
 use std::path::PathBuf;
 use tokio::sync::{mpsc, watch};
 
@@ -208,6 +208,23 @@ impl PlanEdit {
     }
 }
 
+impl PlanEdit {
+    /// Session `claude` interactive avec le boss d'une mission bloquée : il écrit sa décision dans `resolution.md`.
+    async fn discuss(&self, blockage: &str) {
+        let Some(boss) = self.company.root() else { return };
+        let seat = &self.company.seats[boss];
+        let prompt = self.agents.iter().find(|a| a.name == seat.agent).map(|a| a.prompt.clone()).unwrap_or_default();
+        let rel = |name: &str| self.mission_dir.strip_prefix(&self.root).unwrap_or(&self.mission_dir).join(name).display().to_string();
+        let args = tui::assistant::escalation_args(self.lang, &self.company.name, &seat.title, &prompt, &self.company.outline(), &rel("brief.md"), &rel(missions::RESOLUTION_FILE), blockage);
+        eprintln!("\n── discussion avec le boss : /exit pour revenir au blocage ──");
+        match runtime::claude_proc::claude_command().args(&args).current_dir(&self.root).status().await {
+            Ok(st) if st.success() => {}
+            Ok(st) => eprintln!("⚠ la session s'est terminée avec {st}"),
+            Err(e) => eprintln!("⚠ impossible de lancer claude : {e}"),
+        }
+    }
+}
+
 /// Affiche l'avancement d'un run sur stderr (libellés hiérarchiques inclus).
 fn spawn_printer(mut rx: mpsc::UnboundedReceiver<RunEvent>, auto_yes: bool, edit: Option<PlanEdit>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -250,6 +267,29 @@ fn spawn_printer(mut rx: mpsc::UnboundedReceiver<RunEvent>, auto_yes: bool, edit
                     };
                     let _ = reply.send(go);
                 }
+                RunEvent::Escalation { summary, reply } => {
+                    let go = loop {
+                        eprintln!("\n──────── Mission bloquée : le boss n'a pas pu la débloquer ────────\n{summary}\n────────────────────────────────────────────────────────");
+                        if auto_yes {
+                            eprintln!("--yes : jamais de poursuite automatique sur un blocage, la mission s'arrête.");
+                            break EscalationReply::Stop;
+                        }
+                        eprint!("[r = relancer la correction / e = en discuter avec le boss / N = arrêter] ");
+                        let answer = tokio::task::spawn_blocking(|| {
+                            let mut line = String::new();
+                            let _ = std::io::stdin().read_line(&mut line);
+                            line.trim().to_lowercase()
+                        })
+                        .await
+                        .unwrap_or_default();
+                        match (answer.as_str(), &edit) {
+                            ("e" | "discuter", Some(ed)) => ed.discuss(&summary).await,
+                            ("r" | "relancer", _) => break EscalationReply::Retry,
+                            _ => break EscalationReply::Stop,
+                        }
+                    };
+                    let _ = reply.send(go);
+                }
                 RunEvent::NodeStarted { id } => eprintln!("▶ {}", name(&labels, &id)),
                 RunEvent::Node { id, event: ClaudeEvent::ToolUse { name: tool, .. } } => {
                     eprintln!("  [{}] outil {tool}", name(&labels, &id).trim())
@@ -260,6 +300,7 @@ fn spawn_printer(mut rx: mpsc::UnboundedReceiver<RunEvent>, auto_yes: bool, edit
                     match status {
                         NodeStatus::Succeeded => eprintln!("✔ {n} ({tokens} tokens)"),
                         NodeStatus::Failed(e) => eprintln!("✖ {n} : {e}"),
+                        NodeStatus::Blocked(b) => eprintln!("⚠ {n} bloqué : {}", b.replace('\n', " ; ")),
                         NodeStatus::Skipped(r) => eprintln!("⊘ {n} : {r}"),
                         NodeStatus::Cancelled => eprintln!("✖ {n} : annulé"),
                     }
@@ -362,6 +403,13 @@ async fn main() -> Result<()> {
                     printer.await?;
                     if let Some(note) = note_refus(out.approved) {
                         eprintln!("{note}");
+                    }
+                    let blockers: Vec<_> = out.conception.blockers.iter().chain(out.realisation.iter().flat_map(|r| r.blockers.iter())).collect();
+                    if !blockers.is_empty() {
+                        eprintln!("⚠ Mission bloquée, blocages non levés :");
+                        for b in blockers {
+                            eprintln!("  - {}", b.line());
+                        }
                     }
                     eprintln!("Livrables : {}", mission_dir.display());
                     println!("{}", out.report);

@@ -36,4 +36,17 @@ agent = "developer"
 reports_to = "appsec"
 expertise = "correctifs de sécurité ciblés, tests de non-régression"
 builds = true
-allow_bash = ["cargo test", "cargo clippy", "cargo audit"]
+allow_bash = [
+    "cargo test",
+    "cargo clippy",
+    "cargo audit",
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "git add",
+    "git commit",
+    "wc",
+    "grep",
+    "diff",
+]

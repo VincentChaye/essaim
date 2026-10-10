@@ -218,6 +218,32 @@ Une **entreprise** (`.claude/companies/<nom>.toml`) place des agents dans un org
    pour les commandes de `allow_bash` (règles `Bash(<commande>:*)`) ; le reste est refusé (`--permission-mode dontAsk`).
    La portée exacte de ces règles relève de Claude Code et n'est pas vérifiée ici.
 
+### Blocages : corriger, remonter, puis décider avec le CEO
+
+Un poste n'est « fait » que s'il l'affirme **et** que rien ne l'a empêché de finir : chaque appel de travail ou de
+rapport rend un statut structuré (`done` / `blocked` / `failed`) avec ses blocages (`tests`, `permission`,
+`prerequisite`, `bug`, `scope`, `other`) et ce qu'il faudrait pour les lever. Un refus de permission (`Bash(git status)`
+refusé…) est toujours un blocage, même si l'agent se déclare « done ». Un poste bloqué n'est plus ✔ mais ⚠.
+
+1. **Correction dans la branche** : le supérieur reçoit l'échec, écrit un plan de correction (cause, étapes) et réassigne
+   des tâches correctives, éventuellement à un autre subordonné (celui qui a l'outil manquant, l'équipe spécialisée).
+   Au plus `max_fix_rounds` tours (défaut 2), toujours bornés par `max_calls`.
+2. **Remontée** : s'il n'a personne de compétent, il remonte le blocage (`blocked`) à son propre supérieur, qui peut
+   rediriger vers une autre équipe de l'entreprise, et ainsi de suite jusqu'au CEO.
+3. **CEO → vous** : si le CEO n'y arrive pas non plus, le run se met en pause (« Mission bloquée ») :
+   `e` ouvre une session avec le CEO (il explique le blocage, propose un plan, peut créer ou ajuster un poste, un agent
+   ou une permission, et écrit votre décision dans `.essaim/missions/<id>/resolution.md`) · `Entrée` relance la correction
+   avec cette décision · `Échap` arrête la mission. En CLI : `[r / e / N]` ; avec `--yes`, la mission s'arrête
+   (jamais de poursuite automatique sur un blocage).
+
+Lots de réalisation : si un lot reste bloqué, les suivants ne démarrent pas. Une conception bloquée ne lance pas la
+réalisation. Le compte rendu affiche « ⚠ bloquée » et la liste des blocages.
+
+**Outillage selon la taille** : dans une petite entreprise sans équipe spécialisée, les postes ⚒ ont eux-mêmes `git`
+(lecture, `add`, `commit`), `wc`, `grep`, `diff` dans `allow_bash` ; avec une équipe spécialisée (release, ops), seul ce
+poste les a et les managers lui routent le besoin (la fiche de poste indique à chaque manager qui a quels outils).
+
+
 **Point de contrôle** (`checkpoint`, défaut `true`). Quand il est actif, le plan consolidé est affiché avant toute
 réalisation et demande validation. En ligne de commande, sans `--yes`, essaim pose la question
 « Lancer la réalisation (les postes ⚒ vont modifier le projet) ? [o/N/e = modifier le plan avec le boss] » ; `o`, `oui`, `y` ou `yes`
@@ -227,7 +253,7 @@ Un avertissement d'exécution signalera ce cas : **À CONFIRMER** (texte exact e
 
 Livrables : `.essaim/missions/<id>/{brief,conception,rapport}.md`. `rapport.md` n'existe que si la réalisation
 a été lancée et s'est terminée. Garde-fous dans le TOML : `max_calls` (plafond d'appels `claude` par mission,
-partagé entre les phases, défaut 40), `max_parallel` (défaut 2), `checkpoint` (défaut `true`). L'estimation
+partagé entre les phases, défaut 40), `max_parallel` (défaut 2), `checkpoint` (défaut `true`), `max_fix_rounds` (défaut 2). L'estimation
 d'appels est affichée avant le lancement.
 
 ```toml

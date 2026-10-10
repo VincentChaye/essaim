@@ -3,7 +3,7 @@ use crate::model::company::{Company, Seat, graph_nav};
 use crate::model::roles;
 use crate::runtime::claude_proc::ClaudeEvent;
 use crate::runtime::company_exec::{CompanyOptions, run_mission};
-use crate::runtime::executor::{NodeStatus, RunEvent, claude_runner};
+use crate::runtime::executor::{EscalationReply, NodeStatus, RunEvent, claude_runner};
 use crate::runtime::missions::{self, Mission};
 use crate::runtime::sessions::{self, Session};
 use crate::runtime::store::{self, NodeRecord, RunRecord};
@@ -58,6 +58,8 @@ pub enum AssistantKind {
     Edit,
     /// Discussion sur le compte rendu d'une mission pour en tirer des actions.
     Debrief,
+    /// Discussion avec le CEO d'une mission bloquée, pour décider comment la débloquer.
+    Escalation,
 }
 
 /// Élément dont on choisit le mode d'édition (touche `e`).
@@ -449,6 +451,13 @@ pub struct CheckpointState {
     pub scroll: u16,
 }
 
+/// Mission bloquée que le CEO n'a pas pu débloquer : le run attend la décision de l'utilisateur.
+pub struct EscalationState {
+    pub summary: String,
+    pub reply: mpsc::UnboundedSender<EscalationReply>,
+    pub scroll: u16,
+}
+
 pub struct RunView {
     pub name: String,
     pub nodes: Vec<NodeView>,
@@ -486,6 +495,7 @@ pub struct App {
     pub zone_in: bool,
     pub run: Option<RunView>,
     pub checkpoint: Option<CheckpointState>,
+    pub escalation: Option<EscalationState>,
     /// Entreprise et dossier de la mission du run en cours : permettent de réviser le plan au point de contrôle.
     pub run_ctx: Option<(Company, PathBuf)>,
     pub mission_view: Option<MissionView>,
@@ -553,6 +563,7 @@ impl App {
             zone_in: true,
             run: None,
             checkpoint: None,
+            escalation: None,
             run_ctx: None,
             mission_view: None,
             mission_open: Default::default(),
@@ -667,7 +678,7 @@ impl App {
             AssistantKind::Agent => self.agents.iter().map(|a| a.name.clone()).collect(),
             AssistantKind::Mission | AssistantKind::Debrief => self.missions.iter().map(|m| m.id.clone()).collect(),
             AssistantKind::Company => self.company_files(),
-            AssistantKind::Plan | AssistantKind::Edit | AssistantKind::Debrief => vec![],
+            AssistantKind::Plan | AssistantKind::Edit | AssistantKind::Escalation => vec![],
         }
     }
 
@@ -716,6 +727,7 @@ impl App {
                 };
             }
             AssistantKind::Plan => self.after_plan_revision(),
+            AssistantKind::Escalation => self.after_escalation_chat(),
             AssistantKind::Edit => {
                 self.status = match agent::invalid_files(&self.root).first() {
                     Some((file, err)) => tf!("⚠ {file} est illisible : {err}", "⚠ {file} is unreadable: {err}"),
@@ -774,6 +786,50 @@ impl App {
         let rel = |name: &str| dir.strip_prefix(&self.root).unwrap_or(&dir).join(name).display().to_string();
         let args = super::assistant::plan_revision_args(self.lang, &company.name, &seat.title, &prompt, &company.outline(), &rel("brief.md"), &rel("conception.md"));
         self.assistant_request = Some((AssistantKind::Plan, args));
+    }
+
+    /// Au retour de la discussion avec le CEO : dit si une décision a été écrite pour le prochain tour de correction.
+    fn after_escalation_chat(&mut self) {
+        let written = self.run_ctx.as_ref().is_some_and(|(_, d)| d.join(missions::RESOLUTION_FILE).is_file());
+        self.status = if written {
+            tr("décision enregistrée — Entrée relance la correction avec elle, Échap arrête", "decision saved — Enter retries the correction with it, Esc stops").into()
+        } else {
+            tr("aucune décision écrite — Entrée relance quand même, Échap arrête, e rouvre la discussion", "no decision written — Enter retries anyway, Esc stops, e reopens the discussion").into()
+        };
+    }
+
+    /// `e` sur un blocage : le CEO en discute avec l'utilisateur et écrit sa décision.
+    fn request_escalation_chat(&mut self) {
+        let Some((company, dir)) = self.run_ctx.clone() else { return };
+        let Some(es) = self.escalation.as_ref() else { return };
+        let Some(boss) = company.root() else { return };
+        let seat = &company.seats[boss];
+        let prompt = self.agents.iter().find(|a| a.name == seat.agent).map(|a| a.prompt.clone()).unwrap_or_default();
+        let rel = |name: &str| dir.strip_prefix(&self.root).unwrap_or(&dir).join(name).display().to_string();
+        let args = super::assistant::escalation_args(self.lang, &company.name, &seat.title, &prompt, &company.outline(), &rel("brief.md"), &rel(missions::RESOLUTION_FILE), &es.summary);
+        self.assistant_request = Some((AssistantKind::Escalation, args));
+    }
+
+    fn key_escalation(&mut self, k: KeyEvent) {
+        let Some(es) = self.escalation.as_mut() else { return };
+        match k.code {
+            KeyCode::Enter => {
+                let _ = es.reply.send(EscalationReply::Retry);
+                self.escalation = None;
+                self.status = tr("correction relancée", "correction retried").into();
+            }
+            KeyCode::Esc => {
+                let _ = es.reply.send(EscalationReply::Stop);
+                self.escalation = None;
+                self.status = tr("mission arrêtée sur le blocage", "mission stopped on the blockage").into();
+            }
+            KeyCode::Char('e') => self.request_escalation_chat(),
+            KeyCode::Down | KeyCode::Char('j') => es.scroll = es.scroll.saturating_add(1),
+            KeyCode::Up | KeyCode::Char('k') => es.scroll = es.scroll.saturating_sub(1),
+            KeyCode::PageDown => es.scroll = es.scroll.saturating_add(10),
+            KeyCode::PageUp => es.scroll = es.scroll.saturating_sub(10),
+            _ => {}
+        }
     }
 
     /// Charge la langue mémorisée ; sans réglage, le menu de langue s'ouvre avant tout le reste.
@@ -957,6 +1013,7 @@ impl App {
                     AssistantKind::Plan => ("révision du plan", Tab::Run),
                     AssistantKind::Edit => ("modification", self.tab),
                     AssistantKind::Debrief => ("compte rendu", Tab::Company),
+                    AssistantKind::Escalation => ("discussion avec le CEO", Tab::Run),
                 };
                 (Some(k), args, title.to_string(), origin)
             }
@@ -1120,6 +1177,10 @@ impl App {
         // Le point de contrôle ne concerne que l'onglet Run (il y bascule à son arrivée).
         if self.checkpoint.is_some() && self.tab == Tab::Run {
             self.key_checkpoint(k);
+            return;
+        }
+        if self.escalation.is_some() && self.tab == Tab::Run {
+            self.key_escalation(k);
             return;
         }
         self.status.clear();
@@ -1880,6 +1941,9 @@ impl App {
                     let verdict = match (out.ok, out.approved) {
                         (_, Some(false)) => tr("arrêtée sur le plan (réalisation refusée)", "stopped at the plan (realisation refused)"),
                         (true, _) => tr("terminée", "completed"),
+                        (false, _) if !out.conception.ok || out.realisation.as_ref().is_some_and(|r| !r.blockers.is_empty()) => {
+                            tr("bloquée : blocages non levés (voir le compte rendu)", "blocked: blockers not cleared (see the report)")
+                        }
                         (false, _) => tr("terminée avec des échecs", "completed with failures"),
                     };
                     let _ = notice_tx.send(AppEvent::Notice(tf!("mission {verdict} — livrables dans {dir}", "mission {verdict} — deliverables in {dir}")));
@@ -1899,7 +1963,14 @@ impl App {
             self.set_tab(Tab::Run);
             return;
         }
+        if let RunEvent::Escalation { summary, reply } = ev {
+            self.escalation = Some(EscalationState { summary, reply, scroll: 0 });
+            self.status = tr("mission bloquée : e discute avec le CEO, Entrée relance la correction, Échap arrête", "mission blocked: e talks with the CEO, Enter retries the correction, Esc stops").into();
+            self.set_tab(Tab::Run);
+            return;
+        }
         if matches!(ev, RunEvent::RunFinished { .. }) {
+            self.escalation = None;
             self.checkpoint = None; // run terminé ou annulé pendant l'attente
             self.write_compte_rendu(&ev);
             self.missions = missions::list(&self.root); // conception.md / rapport.md viennent d'apparaître
@@ -1922,7 +1993,7 @@ impl App {
                     }
                 }
             }
-            RunEvent::Checkpoint { .. } => {} // traité avant le match
+            RunEvent::Checkpoint { .. } | RunEvent::Escalation { .. } => {} // traités avant le match
             RunEvent::NodeStarted { id } => {
                 if let Some(i) = node(run, &id) {
                     run.nodes[i].state = NodeState::Running;
@@ -1945,7 +2016,7 @@ impl App {
             RunEvent::NodeFinished { id, status, tokens } => {
                 if let Some(i) = node(run, &id) {
                     let n = &mut run.nodes[i];
-                    if let NodeStatus::Failed(m) | NodeStatus::Skipped(m) = &status {
+                    if let NodeStatus::Failed(m) | NodeStatus::Blocked(m) | NodeStatus::Skipped(m) = &status {
                         n.log.push(format!("— {m}"));
                     }
                     n.tokens = tokens;
@@ -1978,6 +2049,7 @@ impl App {
                 status: match &n.state {
                     NodeState::Done(NodeStatus::Succeeded) => "✔".into(),
                     NodeState::Done(NodeStatus::Failed(_)) => "✖".into(),
+                    NodeState::Done(NodeStatus::Blocked(_)) => "⚠".into(),
                     NodeState::Done(NodeStatus::Skipped(_)) => "⊘".into(),
                     _ => "—".into(),
                 },
@@ -1988,15 +2060,16 @@ impl App {
             .nodes
             .iter()
             .filter_map(|n| match &n.state {
-                NodeState::Done(NodeStatus::Failed(m)) | NodeState::Done(NodeStatus::Skipped(m)) => Some((n.label.clone(), m.clone())),
+                NodeState::Done(NodeStatus::Failed(m) | NodeStatus::Blocked(m) | NodeStatus::Skipped(m)) => Some((n.label.clone(), m.clone())),
                 _ => None,
             })
             .collect();
+        let blocked = run.nodes.iter().any(|n| matches!(n.state, NodeState::Done(NodeStatus::Blocked(_))));
         let final_report = if realised { read("rapport.md") } else { read("conception.md") };
         let title = run.name.split(" · ").nth(1).unwrap_or(&run.name).to_string();
         let date = RunRecord { id: String::new(), pipeline: String::new(), started_ms: self.run_started_ms, finished: None, tokens: 0, nodes: vec![] }.started_label();
         let md = missions::compte_rendu(
-            &missions::ReportData { title: &title, company: &company.name, date: &date, ok: *ok, realised, tokens: *tokens, steps, issues, final_report: &final_report },
+            &missions::ReportData { title: &title, company: &company.name, date: &date, ok: *ok, blocked, realised, tokens: *tokens, steps, issues, final_report: &final_report },
             self.lang == Lang::Fr,
         );
         let _ = missions::write_output(dir, "compte-rendu.md", &md);

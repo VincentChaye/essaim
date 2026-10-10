@@ -36,7 +36,19 @@ agent = "developer"
 reports_to = "cto"
 expertise = "corrections ciblées, refactorings, tests"
 builds = true
-allow_bash = ["cargo test", "cargo clippy"]
+allow_bash = [
+    "cargo test",
+    "cargo clippy",
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "git add",
+    "git commit",
+    "wc",
+    "grep",
+    "diff",
+]
 
 [[seat]]
 id = "tech-writer"

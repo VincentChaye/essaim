@@ -28,9 +28,20 @@ pub enum ClaudeEvent {
         duration_ms: u64,
         /// Sortie structurée (avec `--json-schema`), déjà validée par `claude`.
         structured: Option<Value>,
+        /// Appels d'outils refusés par les permissions (« Bash(git status) »…) : jamais passés sous silence.
+        denials: Vec<String>,
     },
     /// Ligne ignorée (rate_limit_event, etc.) ou non reconnue.
     Other,
+}
+
+/// « Outil(entrée) » d'un refus de permission, court et lisible.
+fn denial_label(d: &Value) -> String {
+    let tool = d["tool_name"].as_str().unwrap_or("?");
+    let input = &d["tool_input"];
+    let arg = ["command", "file_path", "path", "pattern"].iter().find_map(|k| input[*k].as_str()).unwrap_or_default();
+    let arg: String = arg.chars().take(80).collect();
+    if arg.is_empty() { tool.to_string() } else { format!("{tool}({arg})") }
 }
 
 /// Parse une ligne NDJSON en une liste d'événements (un message `assistant`
@@ -83,6 +94,7 @@ pub fn parse_line(line: &str) -> Result<Vec<ClaudeEvent>> {
                 .sum(),
             duration_ms: v["duration_ms"].as_u64().unwrap_or(0),
             structured: Some(v["structured_output"].clone()).filter(|x| !x.is_null()),
+            denials: v["permission_denials"].as_array().map(|a| a.iter().map(denial_label).collect()).unwrap_or_default(),
         }],
         _ => vec![ClaudeEvent::Other],
     })
@@ -334,6 +346,7 @@ impl ClaudeProc {
                                     tokens: 0,
                                     duration_ms: 0,
                                     structured: None,
+                                    denials: vec![],
                                 });
                                 if let Some(pid) = guard.take() {
                                     kill_group(pid).await;

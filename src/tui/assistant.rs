@@ -69,6 +69,7 @@ name = "<name>"        # identical to the file name, without .toml
 max_calls = 40         # cap on claude calls per mission
 max_parallel = 2
 checkpoint = true      # pause to approve the plan before realisation
+max_fix_rounds = 2     # correction rounds a seat may run in its branch before escalating a blocker
 
 [[seat]]
 id = "ceo"             # unique; letters, digits, - and _
@@ -210,6 +211,53 @@ Rules: start no realisation and delegate nothing yourself; modify no file other 
         system,
         "--".into(),
         "I want to revise the consolidated plan before realisation. Summarize it, then ask me what to change.".into(),
+    ]
+}
+
+/// `claude` arguments for the session where the user talks with the boss of a blocked mission: the boss explains
+/// the blockage, agrees on a way out with the user and writes the decision to `resolution_path` (read by the
+/// next correction round). It may also create/adjust seats, agents or permissions the team lacks. Plan mode:
+/// every write is approved by the user first.
+#[allow(clippy::too_many_arguments)]
+pub fn escalation_args(lang: Lang, company: &str, boss_title: &str, boss_prompt: &str, outline: &[String], brief_path: &str, resolution_path: &str, blockage: &str) -> Vec<String> {
+    let blockage: String = blockage.chars().take(6000).collect();
+    let system = format!(
+        r###"You are "{boss_title}" of the company "{company}". A mission is BLOCKED: your team tried to correct the problem inside the hierarchy and nobody could, so the run is paused and escalated to you and to the user who requested the mission.
+
+{boss_prompt}
+
+Your company's org chart (level, seat · id → agent):
+{org}
+
+The blockage reported by your team:
+{blockage}
+
+Files (paths relative to the current directory):
+- the mission brief: {brief_path}
+- the decision file to write: {resolution_path}
+
+Steps, in order:
+1. Explain the blockage to the user plainly: what is blocked, why, what was already tried, what is missing (a permission, a tool, a prerequisite, a decision, a seat or agent that does not exist).
+2. Propose a clean correction plan, then discuss it with the user (AskUserQuestion fits for precise choices). Do not ask what you can decide alone. Do not minimize the problem and do not propose to skip it.
+3. If something must be created or adjusted for the team (a seat or its allow_bash in .claude/companies/*.toml, an agent in .claude/agents/*.md), do it once the user approves. Never touch the project's source code yourself: the team does that when the correction is retried.
+4. Write {resolution_path} IN FULL: the decisions agreed with the user, the correction plan, and who should do what. This file is handed to you as the requester's decision at the next correction round.
+5. Tell the user they can leave the session (/exit) to go back to the run: Enter retries the correction, Esc stops the mission. If you changed a company file, tell them the new organization only applies to a new run (stop, then resume the mission).
+
+Rules: modify no file other than {resolution_path}, company files and agent files; start no realisation yourself.
+
+{note}"###,
+        org = outline.join("\n"),
+        note = lang_note(lang),
+    );
+    vec![
+        "--permission-mode".into(),
+        "plan".into(),
+        "--name".into(),
+        format!("essaim: blocage ({company})"),
+        "--append-system-prompt".into(),
+        system,
+        "--".into(),
+        "The mission is blocked. Explain the blockage and let us find a way out.".into(),
     ]
 }
 

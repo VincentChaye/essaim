@@ -11,6 +11,8 @@ use tokio::sync::{mpsc, watch};
 pub enum NodeStatus {
     Succeeded,
     Failed(String),
+    /// La tâche n'a pas pu aboutir (tests rouges, refus de permission, prérequis absent…) : à corriger ou escalader.
+    Blocked(String),
     Skipped(String),
     Cancelled,
 }
@@ -29,9 +31,18 @@ pub enum RunEvent {
     NodeStarted { id: String },
     /// Pause avant la réalisation : le plan consolidé attend une validation (`true` = lancer, `false` = arrêter).
     Checkpoint { plan: String, reply: mpsc::UnboundedSender<bool> },
+    /// Pause : le CEO n'a pas pu résoudre un blocage. L'utilisateur relance la correction, arrête, ou en discute d'abord avec le CEO.
+    Escalation { summary: String, reply: mpsc::UnboundedSender<EscalationReply> },
     Node { id: String, event: ClaudeEvent },
     NodeFinished { id: String, status: NodeStatus, tokens: u64 },
     RunFinished { ok: bool, tokens: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscalationReply {
+    /// Nouveau tour de correction du CEO (avec la décision de l'utilisateur, s'il y en a une).
+    Retry,
+    Stop,
 }
 
 /// Tâche confiée à un `Runner`.
@@ -48,6 +59,8 @@ pub struct NodeResult {
     pub is_error: bool,
     /// Sortie structurée si le nœud utilisait `--json-schema`.
     pub structured: Option<serde_json::Value>,
+    /// Appels refusés par les permissions pendant ce nœud.
+    pub denials: Vec<String>,
 }
 
 /// Exécute un nœud. Injectable pour tester l'ordonnancement sans lancer `claude`.
@@ -96,8 +109,8 @@ pub async fn run_local(
         tokio::select! {
             ev = crx.recv() => match ev {
                 Some(ev) => {
-                    if let ClaudeEvent::Result { text, is_error, tokens, structured, .. } = &ev {
-                        res = NodeResult { output: text.clone(), tokens: *tokens, is_error: *is_error, structured: structured.clone() };
+                    if let ClaudeEvent::Result { text, is_error, tokens, structured, denials, .. } = &ev {
+                        res = NodeResult { output: text.clone(), tokens: *tokens, is_error: *is_error, structured: structured.clone(), denials: denials.clone() };
                     }
                     let _ = tx.send(ev);
                 }

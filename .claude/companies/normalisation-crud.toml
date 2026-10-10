@@ -22,7 +22,20 @@ agent = "developer"
 reports_to = "cto"
 expertise = "modèle, runtime, persistance (src/model, src/runtime)"
 builds = true
-allow_bash = ["cargo build", "cargo test", "cargo clippy"]
+allow_bash = [
+    "cargo build",
+    "cargo test",
+    "cargo clippy",
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "git add",
+    "git commit",
+    "wc",
+    "grep",
+    "diff",
+]
 
 [[seat]]
 id = "dev-tui"
@@ -31,7 +44,20 @@ agent = "developer"
 reports_to = "cto"
 expertise = "interface, confirmations, saisie (src/tui)"
 builds = true
-allow_bash = ["cargo build", "cargo test", "cargo clippy"]
+allow_bash = [
+    "cargo build",
+    "cargo test",
+    "cargo clippy",
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "git add",
+    "git commit",
+    "wc",
+    "grep",
+    "diff",
+]
 
 [[seat]]
 id = "vp-quality"

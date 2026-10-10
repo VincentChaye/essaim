@@ -150,6 +150,9 @@ pub fn summarize(dir: &Path) -> Summary {
 
 const COMPANY_FILE: &str = "company";
 
+/// Décisions prises avec le CEO quand une mission est bloquée : relues au tour de correction suivant.
+pub const RESOLUTION_FILE: &str = "resolution.md";
+
 /// Rattache la mission à l'entreprise qui la réalise.
 pub fn set_company(dir: &Path, company_file: &str) -> Result<()> {
     std::fs::create_dir_all(dir)?;
@@ -183,7 +186,7 @@ pub fn read_brief(m: &Mission) -> Result<String> {
 }
 
 pub fn write_output(dir: &Path, name: &str, text: &str) -> Result<()> {
-    anyhow::ensure!(matches!(name, "conception.md" | "rapport.md" | "brief.md" | "compte-rendu.md"), "nom de livrable inattendu : {name}");
+    anyhow::ensure!(matches!(name, "conception.md" | "rapport.md" | "brief.md" | "compte-rendu.md" | "resolution.md"), "nom de livrable inattendu : {name}");
     std::fs::create_dir_all(dir)?;
     // Livrables = texte du projet et de la mission : réservés à l'utilisateur (0600).
     write_private(&dir.join(name), text.as_bytes())?;
@@ -204,6 +207,8 @@ pub struct ReportData<'a> {
     pub company: &'a str,
     pub date: &'a str,
     pub ok: bool,
+    /// Au moins un poste est resté bloqué : le verdict dit « bloquée », pas seulement « échecs ».
+    pub blocked: bool,
     pub realised: bool,
     pub tokens: u64,
     pub steps: Vec<StepLine>,
@@ -217,6 +222,7 @@ pub struct ReportData<'a> {
 pub fn compte_rendu(d: &ReportData, fr: bool) -> String {
     let t = |a: &'static str, b: &'static str| if fr { a } else { b };
     let verdict = match (d.ok, d.realised) {
+        (false, _) if d.blocked => t("⚠ bloquée : des blocages n'ont pas été levés (voir « Points d'attention »)", "⚠ blocked: some blockers were not cleared (see \"Points of attention\")"),
         (true, true) => t("✔ terminée", "✔ completed"),
         (true, false) => t("✔ conception terminée, réalisation non lancée", "✔ design completed, realisation not started"),
         (false, _) => t("✖ terminée avec des échecs ou interrompue", "✖ finished with failures or interrupted"),
@@ -259,7 +265,7 @@ mod tests {
     #[test]
     fn compte_rendu_resume_la_mission() {
         let d = ReportData {
-            title: "Site", company: "Acme", date: "01/01 10:00", ok: false, realised: true, tokens: 1234,
+            title: "Site", company: "Acme", date: "01/01 10:00", ok: false, blocked: false, realised: true, tokens: 1234,
             steps: vec![StepLine { label: "CEO · reports".into(), agent: "boss".into(), status: "✔".into(), tokens: 10 }],
             issues: vec![("Dev · builds".into(), "boum\nsuite".into())],
             final_report: "Tout est fait.",

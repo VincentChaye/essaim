@@ -42,6 +42,15 @@ allow_bash = [
     "cargo test",
     "cargo bench",
     "cargo clippy",
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "git add",
+    "git commit",
+    "wc",
+    "grep",
+    "diff",
 ]
 
 [[seat]]
@@ -69,6 +78,15 @@ allow_bash = [
     "cargo build",
     "cargo test",
     "cargo clippy",
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "git add",
+    "git commit",
+    "wc",
+    "grep",
+    "diff",
 ]
 
 [[seat]]
@@ -111,6 +129,15 @@ allow_bash = [
     "cargo build",
     "cargo test",
     "cargo clippy",
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "git add",
+    "git commit",
+    "wc",
+    "grep",
+    "diff",
 ]
 
 [[seat]]

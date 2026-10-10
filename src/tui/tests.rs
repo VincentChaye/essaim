@@ -1184,6 +1184,53 @@ fn r_refuse_pendant_un_run_et_sans_entreprise_valide() {
     assert!(app.run.is_none() && app.status.contains("invalide"));
 }
 
+// ---------- mission bloquée (escalade vers l'utilisateur) ----------
+
+fn escalation_app() -> (App, mpsc::UnboundedReceiver<crate::runtime::executor::EscalationReply>) {
+    let root = tmp_root();
+    let mut app = new_app(&root);
+    app.run = Some(run_view(&[]));
+    let (reply, rx) = mpsc::unbounded_channel();
+    app.on_run_event(RunEvent::Escalation { summary: "BLOCAGE: tests rouges chez dev1".into(), reply });
+    (app, rx)
+}
+
+#[test]
+fn escalade_affiche_le_blocage_et_donne_la_main() {
+    use crate::runtime::executor::EscalationReply;
+    let (mut app, mut rx) = escalation_app();
+    assert_eq!(app.tab, Tab::Run);
+    let s = screen(&app);
+    assert!(s.contains("Mission bloquée") && s.contains("tests rouges chez dev1") && s.contains("discuter avec le CEO"));
+    press(&mut app, KeyCode::Char('q'));
+    assert!(!app.quit && app.escalation.is_some(), "les autres touches ne font rien pendant l'attente");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(rx.try_recv().ok(), Some(EscalationReply::Retry));
+    assert!(app.escalation.is_none());
+
+    let (mut app, mut rx) = escalation_app();
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(rx.try_recv().ok(), Some(EscalationReply::Stop));
+}
+
+#[test]
+fn e_ouvre_la_discussion_avec_le_ceo() {
+    let (mut app, _rx) = escalation_app();
+    let dir = app.root.join(".essaim/missions/43");
+    std::fs::create_dir_all(&dir).unwrap();
+    let company = crate::model::company::Company::parse("name = \"acme\"\n[[seat]]\nid = \"ceo\"\ntitle = \"CEO\"\nagent = \"a\"\n").unwrap();
+    app.run_ctx = Some((company, dir.clone()));
+    press(&mut app, KeyCode::Char('e'));
+    let (kind, args) = app.assistant_request.take().expect("session CEO demandée");
+    assert_eq!(kind, AssistantKind::Escalation);
+    let sys = args.iter().find(|a| a.contains("BLOCKED")).unwrap();
+    assert!(sys.contains("tests rouges chez dev1") && sys.contains("resolution.md"));
+    // Au retour, la décision écrite est signalée ; le run reste en attente.
+    std::fs::write(dir.join("resolution.md"), "on autorise git").unwrap();
+    app.after_assistant(AssistantKind::Escalation, &[]);
+    assert!(app.status.contains("décision enregistrée") && app.escalation.is_some());
+}
+
 // ---------- point de contrôle (interface) ----------
 
 fn checkpoint_app() -> (App, mpsc::UnboundedReceiver<bool>) {
@@ -1873,25 +1920,25 @@ fn e_propose_edition_simple_ou_avec_le_modele() {
 // Un test `characterize_*` fige le comportement ACTUEL. Quand il documente un bug, il réussit tant que le bug existe ;
 // après correctif (étape B), son assertion est basculée vers le comportement attendu, indiqué en commentaire.
 
-/// E1 : la portée d'écriture n'exclut pas `.claude` ni `.git/hooks` à n'importe quelle profondeur.
+/// E1 : la portée d'écriture exclut `.claude` et `.git/hooks` à n'importe quelle profondeur (corrigé).
 #[test]
-fn characterize_e1_portee_n_exclut_pas_claude_ni_git_hooks_profonds() {
+fn characterize_e1_portee_exclut_claude_et_git_hooks_profonds() {
     use crate::runtime::scope::{is_sensitive, write_rules};
     let motif = |s: &str| vec![s.to_string()];
-    // Comportement actuel, attendu après correctif : aucune règle d'écriture pour `**/.claude` (réservé à toute profondeur).
-    assert_eq!(write_rules(&motif("**/.claude/**")), vec!["Edit(**/.claude/**)", "Write(**/.claude/**)"]);
-    // Comportement actuel, attendu après correctif : `src/.git/hooks/**` est réservé comme `.git/hooks/**`.
-    assert!(!is_sensitive("src/.git/hooks/pre-commit"));
-    assert!(!write_rules(&motif("src/.git/hooks/**")).is_empty());
+    // `**/.claude` est réservé à toute profondeur : aucune règle d'écriture.
+    assert!(write_rules(&motif("**/.claude/**")).is_empty());
+    // `src/.git/hooks/**` est réservé comme `.git/hooks/**`.
+    assert!(is_sensitive("src/.git/hooks/pre-commit"));
+    assert!(write_rules(&motif("src/.git/hooks/**")).is_empty());
 }
 
-/// R2 : un résultat `claude` dont `is_error` est absent du JSON est traité comme un succès.
+/// R2 : un résultat `claude` dont `is_error` est absent du JSON n'est jamais un succès (corrigé).
 #[test]
-fn characterize_r2_resultat_sans_is_error_compte_comme_succes() {
+fn characterize_r2_resultat_sans_is_error_n_est_pas_un_succes() {
     use crate::runtime::claude_proc::parse_line;
-    // Comportement actuel, attendu après correctif : un sous-type d'erreur (`error_max_turns`) donne `is_error: true`.
+    // Un sous-type d'erreur (`error_max_turns`) sans `is_error` donne `is_error: true`.
     let evs = parse_line(r#"{"type":"result","subtype":"error_max_turns","result":""}"#).unwrap();
-    assert!(matches!(&evs[0], ClaudeEvent::Result { is_error: false, .. }), "{evs:?}");
+    assert!(matches!(&evs[0], ClaudeEvent::Result { is_error: true, .. }), "{evs:?}");
 }
 
 /// R1 : une ligne stream-json invalide est ignorée sans aucun événement d'erreur.

@@ -94,6 +94,16 @@ pub fn draw(f: &mut Frame, app: &App) {
         f.render_widget(Paragraph::new(cp.plan.clone()).wrap(Wrap { trim: false }).scroll((cp.scroll, 0)).block(block), area);
     }
 
+    if let Some(es) = app.escalation.as_ref().filter(|_| app.tab == Tab::Run) {
+        let area = centered(f.area(), 88, (f.area().height * 8 / 10).max(10));
+        f.render_widget(Clear, area);
+        let block = Block::bordered()
+            .title(tr(" Mission bloquée — le CEO n'a pas pu la débloquer ", " Mission blocked — the CEO could not clear it "))
+            .title_bottom(tr(" e : discuter avec le CEO · Entrée : relancer la correction · Échap : arrêter la mission · ↑↓ défiler ", " e: talk with the CEO · Enter: retry the correction · Esc: stop the mission · ↑↓ scroll "))
+            .border_style(Style::new().fg(Color::Red));
+        f.render_widget(Paragraph::new(es.summary.clone()).wrap(Wrap { trim: false }).scroll((es.scroll, 0)).block(block), area);
+    }
+
     if app.settings_menu.is_some() {
         draw_settings(f, app);
     }
@@ -337,6 +347,7 @@ fn status_span(state: &NodeState, tick: u64) -> Span<'static> {
         NodeState::Running => Span::styled(SPINNER[tick as usize % 10], Style::new().fg(Color::Cyan)),
         NodeState::Done(NodeStatus::Succeeded) => Span::styled("✔", Style::new().fg(Color::Green)),
         NodeState::Done(NodeStatus::Failed(_)) | NodeState::Done(NodeStatus::Cancelled) => Span::styled("✖", Style::new().fg(Color::Red)),
+        NodeState::Done(NodeStatus::Blocked(_)) => Span::styled("⚠", Style::new().fg(Color::Yellow)),
         NodeState::Done(NodeStatus::Skipped(_)) => Span::styled("⊘", Style::new().fg(Color::Yellow)),
     }
 }
@@ -382,6 +393,7 @@ fn draw_history(f: &mut Frame, area: Rect, app: &App) {
                 let (icon, color) = match &n.status {
                     Some(NodeStatus::Succeeded) => ("✔", Color::Green),
                     Some(NodeStatus::Failed(_)) | Some(NodeStatus::Cancelled) => ("✖", Color::Red),
+                    Some(NodeStatus::Blocked(_)) => ("⚠", Color::Yellow),
                     Some(NodeStatus::Skipped(_)) => ("⊘", Color::Yellow),
                     None => ("·", Color::DarkGray),
                 };

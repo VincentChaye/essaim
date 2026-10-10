@@ -85,7 +85,7 @@ fn redacted(rec: &RunRecord) -> RunRecord {
         for l in &mut n.log {
             *l = redact_secrets(l);
         }
-        if let Some(NodeStatus::Failed(t) | NodeStatus::Skipped(t)) = n.status.as_mut() {
+        if let Some(NodeStatus::Failed(t) | NodeStatus::Blocked(t) | NodeStatus::Skipped(t)) = n.status.as_mut() {
             *t = redact_secrets(t);
         }
     }
