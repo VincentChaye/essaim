@@ -42,6 +42,8 @@ enum Kind {
     Report,
     /// Plan de correction après l'échec ou le blocage de subordonnés.
     Fix,
+    /// Revue du résultat par le CEO : vérification contre l'objectif, éventuelle redescente.
+    Review,
 }
 
 impl Kind {
@@ -51,6 +53,7 @@ impl Kind {
             Kind::Work => "work",
             Kind::Report => "report",
             Kind::Fix => "fix",
+            Kind::Review => "review",
         }
     }
 }
@@ -99,6 +102,8 @@ pub struct Assignment {
     pub task: String,
     /// Périmètre de fichiers (phase de réalisation uniquement).
     pub scope: Vec<String>,
+    /// Modèle choisi par le délégant pour ce poste (feuille) ou par défaut pour les feuilles de sa branche.
+    pub model: Option<String>,
 }
 
 /// Ce qui empêche une tâche d'aboutir : le supérieur le lit pour corriger ou rediriger.
@@ -267,6 +272,12 @@ reports_to = "ciso"
         deny: Vec<&'static str>,
         /// Ces postes réassignent la correction à tous leurs subordonnés (sinon : ils remontent).
         fix_assign: Vec<&'static str>,
+        /// Le CEO rejette sa première revue en relançant une redescente (la suivante accepte).
+        review_redo_once: bool,
+        /// Le CEO rejette toujours sa revue sans pouvoir rien relancer.
+        review_unmet: bool,
+        /// (poste délégant, destinataire, modèle) : le délégant choisit le modèle de ce destinataire.
+        models: Vec<(&'static str, &'static str, &'static str)>,
     }
 
     fn enum_ids(schema: &str) -> Vec<String> {
@@ -323,6 +334,9 @@ reports_to = "ciso"
                             .iter()
                             .map(|k| {
                                 let mut a = json!({"to": k, "task": format!("task for {k}")});
+                                if let Some((_, _, m)) = b.models.iter().find(|(from, to, _)| *from == seat && to == k) {
+                                    a["model"] = json!(m);
+                                }
                                 if with_scope {
                                     let sc = if b.escape.contains(&seat.as_str()) {
                                         "docs/**".to_string()
@@ -354,6 +368,33 @@ reports_to = "ciso"
                         };
                         let denials = if b.deny.contains(&job.id.as_str()) { vec!["Bash(git status)".to_string()] } else { vec![] };
                         NodeResult { structured: Some(structured), output: text, denials, ..Default::default() }
+                    }
+                    "review" => {
+                        let n = {
+                            let mut seen = p.seen.lock().unwrap();
+                            let c = seen.entry(job.id.clone()).or_insert(0);
+                            *c += 1;
+                            *c
+                        };
+                        if b.review_unmet {
+                            NodeResult { structured: Some(json!({"accepted": false, "findings": "critère X non atteint"})), output: "{}".into(), ..Default::default() }
+                        } else if b.review_redo_once && n == 1 {
+                            let schema = job.spec.json_schema.as_deref().unwrap();
+                            let with_scope = schema.contains("\"scope\"");
+                            let items: Vec<Value> = enum_ids(schema)
+                                .iter()
+                                .map(|k| {
+                                    let mut a = json!({"to": k, "task": format!("complément pour {k}")});
+                                    if with_scope {
+                                        a["scope"] = json!([format!("src/{k}/**")]);
+                                    }
+                                    a
+                                })
+                                .collect();
+                            NodeResult { structured: Some(json!({"accepted": false, "findings": "il manque un livrable", "assignments": items})), output: "{}".into(), ..Default::default() }
+                        } else {
+                            NodeResult { structured: Some(json!({"accepted": true, "findings": "ok"})), output: "{}".into(), ..Default::default() }
+                        }
                     }
                     "fix" if b.fix_assign.contains(&seat.as_str()) => {
                         let schema = job.spec.json_schema.as_deref().unwrap();
@@ -491,9 +532,9 @@ reports_to = "ciso"
         let (out, evs) = run(&company(), p.clone(), Behavior::default(), false).await;
         assert!(out.ok);
         assert_eq!(out.report, "rapport(ceo)");
-        // 4 postes internes × 2 appels + 3 feuilles = 11 (= estimation de conception).
-        assert_eq!(p.started.lock().unwrap().len(), 11);
-        assert_eq!(out.calls, 11);
+        // 4 postes internes × 2 appels + 3 feuilles + 1 revue du CEO = 12 (= estimation de conception).
+        assert_eq!(p.started.lock().unwrap().len(), 12);
+        assert_eq!(out.calls, 12);
         assert_eq!(out.tokens, 0);
         assert!(out.realisation.is_none() && out.approved.is_none(), "pas de poste de réalisation");
         assert!(!evs.iter().any(|e| matches!(e, RunEvent::Checkpoint { .. })));
@@ -575,7 +616,7 @@ reports_to = "ciso"
         let spec = |id: &str| specs.iter().find(|(i, _)| i == id).unwrap().1.clone();
         assert_eq!(spec("dev1/conception/work").tools.as_deref(), Some("Read,Grep,Glob"));
         assert_eq!(spec("mgr/conception/delegate").tools.as_deref(), Some(""));
-        assert_eq!(spec("mgr/conception/report").tools.as_deref(), Some(""));
+        assert_eq!(spec("mgr/conception/report").tools.as_deref(), Some("Read,Grep,Glob,Bash"), "un supérieur lit et vérifie, jamais d'écriture");
         assert!(spec("dev1/conception/work").allowed_tools.is_empty() && spec("dev1/conception/work").permission_mode.is_none());
     }
 
@@ -599,7 +640,7 @@ reports_to = "ciso"
         assert!(out.ok);
         let started = p.started.lock().unwrap().clone();
         assert!(!started.iter().any(|id| id.starts_with("ciso/") || id.starts_with("sec/")), "{started:?}");
-        assert_eq!(started.len(), 2 + 2 + 2 + 1 + 1, "ceo, cto, mgr (2 appels chacun) + dev1, dev2 (1 chacun)");
+        assert_eq!(started.len(), 2 + 2 + 2 + 1 + 1 + 1, "ceo, cto, mgr (2 appels chacun) + dev1, dev2 (1 chacun) + revue du ceo");
     }
 
     #[tokio::test]
@@ -661,11 +702,11 @@ reports_to = "ciso"
         assert!(out.ok, "{:?}", out.report);
         let started = p.started.lock().unwrap().clone();
         let real: Vec<&String> = started.iter().filter(|id| id.contains("/realisation/")).collect();
-        // ceo, cto, mgr (2 appels) + dev1, dev2 (1) = 8 ; ciso et sec ne participent pas.
-        assert_eq!(real.len(), 8, "{real:?}");
+        // ceo, cto, mgr (2 appels) + dev1, dev2 (1) + revue du ceo = 9 ; ciso et sec ne participent pas.
+        assert_eq!(real.len(), 9, "{real:?}");
         assert!(!real.iter().any(|id| id.starts_with("ciso/") || id.starts_with("sec/")));
         assert!(real.iter().any(|id| *id == "dev1/realisation/work") && real.iter().any(|id| *id == "dev2/realisation/work"));
-        assert_eq!(out.calls, 11 + 8);
+        assert_eq!(out.calls, 12 + 9);
         assert!(out.realisation.is_some());
         assert!(!evs.iter().any(|e| matches!(e, RunEvent::Checkpoint { .. })), "checkpoint = false");
     }
@@ -689,7 +730,7 @@ reports_to = "ciso"
         assert!(d2.allowed_tools.contains(&"Edit(src/cto/mgr/dev2/**)".to_string()));
         // Les managers ne touchent à rien.
         assert_eq!(spec("mgr/realisation/delegate").tools.as_deref(), Some(""));
-        assert!(spec("mgr/realisation/report").allowed_tools.is_empty());
+        assert!(!spec("mgr/realisation/report").allowed_tools.iter().any(|r| r.starts_with("Edit") || r.starts_with("Write")), "un supérieur n'écrit jamais");
         // La fiche de poste rappelle le périmètre et les commandes.
         let sys = p.prompts.lock().unwrap().iter().find(|(id, _, _)| id == "dev1/realisation/work").unwrap().2.clone();
         assert!(sys.contains("File scope assigned to you: src/cto/mgr/dev1/**"));
@@ -847,6 +888,133 @@ reports_to = "ciso"
         assert_eq!(p.started.lock().unwrap().len(), 14);
         assert!(!out.ok);
         assert_eq!(out.calls, 14);
+    }
+
+    // ----------------------------------------------------------- modèle choisi par les délégants
+
+    #[tokio::test]
+    async fn le_delegant_choisit_le_modele_des_feuilles() {
+        let p = Arc::new(Probe::default());
+        let mut c = company();
+        let dev2 = c.index_of("dev2").unwrap();
+        c.seats[dev2].model = Some("opus".into()); // épinglé dans le .toml : le choix dynamique ne le change pas
+        // Le CEO met la branche du CTO en haiku ; le manager relève dev1 en sonnet.
+        let b = Behavior { models: vec![("ceo", "cto", "haiku"), ("mgr", "dev1", "sonnet")], ..Default::default() };
+        let (out, evs) = run(&c, p.clone(), b, false).await;
+        assert!(out.ok);
+        let specs = p.specs.lock().unwrap();
+        let model = |id: &str| specs.iter().find(|(i, _)| i == id).map(|(_, s)| s.agents["a"]["model"].as_str().map(String::from)).unwrap();
+        assert_eq!(model("dev1/conception/work").as_deref(), Some("sonnet"), "choix du manager sur sa feuille");
+        assert_eq!(model("dev2/conception/work").as_deref(), Some("opus"), "modèle épinglé du poste");
+        assert_eq!(model("cto/conception/report"), None, "un manager garde son modèle");
+        let prompts = p.prompts.lock().unwrap();
+        let del = &prompts.iter().find(|(id, _, _)| id == "ceo/conception/delegate").unwrap().1;
+        assert!(del.contains("cheapest level"), "{del}");
+        let sys = &prompts.iter().find(|(id, _, _)| id == "mgr/conception/delegate").unwrap().2;
+        assert!(sys.contains("model pinned: opus"), "{sys}");
+        assert!(evs.iter().any(|e| matches!(e, RunEvent::Label { id, label, .. } if id == "dev1/conception/work" && label.contains("[sonnet]"))));
+    }
+
+    #[tokio::test]
+    async fn modele_de_branche_herite_par_les_feuilles_sans_choix() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { models: vec![("ceo", "cto", "haiku")], ..Default::default() };
+        let (_, _) = run(&company(), p.clone(), b, false).await;
+        let specs = p.specs.lock().unwrap();
+        let m = |id: &str| specs.iter().find(|(i, _)| i == id).map(|(_, s)| s.agents["a"]["model"].as_str().map(String::from)).unwrap();
+        assert_eq!(m("dev1/conception/work").as_deref(), Some("haiku"));
+        assert_eq!(m("dev2/conception/work").as_deref(), Some("haiku"));
+        assert_eq!(m("sec/conception/work"), None, "autre branche : modèle par défaut de l'agent");
+    }
+
+    // ----------------------------------------------------------- revue du CEO : vérification et redescente
+
+    #[tokio::test]
+    async fn revue_acceptee_une_seule_fois_par_le_ceo() {
+        let p = Arc::new(Probe::default());
+        let (out, _) = run(&company(), p.clone(), Behavior::default(), false).await;
+        assert!(out.ok);
+        let started = p.started.lock().unwrap().clone();
+        assert_eq!(started.iter().filter(|id| id.ends_with("/review")).collect::<Vec<_>>(), vec!["ceo/conception/review"], "seul le CEO relit");
+        let prompts = p.prompts.lock().unwrap();
+        let review = &prompts.iter().find(|(id, _, _)| id == "ceo/conception/review").unwrap().1;
+        assert!(review.contains("success criteria") && review.contains("rapport(cto)"), "{review}");
+    }
+
+    #[tokio::test]
+    async fn revue_non_conforme_relance_une_redescente_puis_le_rapport_final() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { review_redo_once: true, ..Default::default() };
+        let (out, _) = run(&company(), p.clone(), b, false).await;
+        assert!(out.ok, "la redescente a comblé le manque : {:?}", out.conception.blockers);
+        let started = p.started.lock().unwrap().clone();
+        assert_eq!(started.iter().filter(|id| *id == "cto/conception/delegate").count(), 2, "le CTO reçoit une tâche complémentaire");
+        assert_eq!(started.iter().filter(|id| *id == "ceo/conception/review").count(), 1, "max_review_rounds = 1");
+        let prompts = p.prompts.lock().unwrap();
+        let rep = &prompts.iter().rev().find(|(id, _, _)| id == "ceo/conception/report").unwrap().1;
+        assert!(rep.contains("complément pour cto"), "le rapport final contient la redescente : {rep}");
+    }
+
+    #[tokio::test]
+    async fn revue_sans_solution_remonte_a_l_utilisateur() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { review_unmet: true, ..Default::default() };
+        let (out, evs) = run(&company(), p.clone(), b, false).await;
+        assert!(!out.ok, "objectif non atteint = jamais ✔");
+        let summary = evs.iter().find_map(|e| match e { RunEvent::Escalation { summary, .. } => Some(summary.clone()), _ => None }).expect("escalade");
+        assert!(summary.contains("critère X non atteint"), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn revue_desactivee_a_zero_tour() {
+        let p = Arc::new(Probe::default());
+        let mut c = company();
+        c.max_review_rounds = 0;
+        let (out, _) = run(&c, p.clone(), Behavior::default(), false).await;
+        assert!(out.ok && !p.started.lock().unwrap().iter().any(|id| id.ends_with("/review")));
+    }
+
+    #[tokio::test]
+    async fn superieurs_verifient_sans_ecrire() {
+        let p = Arc::new(Probe::default());
+        let (_, _) = run(&company_build(), p.clone(), Behavior::default(), false).await;
+        let specs = p.specs.lock().unwrap();
+        let spec = |id: &str| specs.iter().find(|(i, _)| i == id).map(|(_, s)| s.clone()).unwrap();
+        let rev = spec("ceo/realisation/review");
+        let tools = rev.tools.as_deref().unwrap();
+        assert!(tools.contains("Bash") && !tools.contains("Edit") && !tools.contains("Write"), "{tools}");
+        assert!(rev.allowed_tools.iter().any(|r| r == "Bash(cargo test:*)"), "commandes de vérification héritées des feuilles : {:?}", rev.allowed_tools);
+        assert!(rev.allowed_tools.iter().any(|r| r == "Bash(git status:*)"));
+        assert!(!rev.allowed_tools.iter().any(|r| r.starts_with("Edit") || r.starts_with("Write")));
+        assert_eq!(rev.permission_mode.as_deref(), Some("dontAsk"));
+        assert_eq!(spec("mgr/realisation/delegate").tools.as_deref(), Some(""), "la délégation reste du raisonnement pur");
+    }
+
+    #[tokio::test]
+    async fn assistants_legers_en_lecture_seule_avec_un_modele_moindre() {
+        let p = Arc::new(Probe::default());
+        let mut c = company_build();
+        let dev1 = c.index_of("dev1").unwrap();
+        c.seats[dev1].helpers = Some("haiku".into());
+        c.validate(&["a".to_string()]).unwrap();
+        let (_, _) = run(&c, p.clone(), Behavior::default(), false).await;
+        let specs = p.specs.lock().unwrap();
+        let spec = |id: &str| specs.iter().find(|(i, _)| i == id).map(|(_, s)| s.clone()).unwrap();
+        let d1 = spec("dev1/realisation/work");
+        let h = &d1.agents["essaim-assistant"];
+        assert_eq!(h["model"], "haiku");
+        let ht: Vec<&str> = h["tools"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+        assert!(ht.contains(&"Bash") && !ht.contains(&"Edit") && !ht.contains(&"Write"), "{ht:?}");
+        assert!(d1.tools.as_deref().unwrap().split(',').any(|t| t == "Agent"));
+        let prompts = p.prompts.lock().unwrap();
+        assert!(prompts.iter().find(|(id, _, _)| id == "dev1/realisation/work").unwrap().2.contains("light assistants"));
+        // dev2 n'a pas d'assistants : ni sous-agent, ni outil Agent.
+        let d2 = spec("dev2/realisation/work");
+        assert!(!d2.agents.contains_key("essaim-assistant") && !d2.tools.as_deref().unwrap().contains("Agent"));
+        // Un modèle farfelu est refusé.
+        let mut bad = company_build();
+        bad.seats[dev1].helpers = Some("ha iku;".into());
+        assert!(bad.validate(&["a".to_string()]).is_err());
     }
 
     // ----------------------------------------------------------- blocages : correction et escalade

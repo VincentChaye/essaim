@@ -1,5 +1,6 @@
 pub mod app;
 pub mod assistant;
+pub mod clipboard;
 pub mod company_view;
 pub mod editor;
 pub mod manual;

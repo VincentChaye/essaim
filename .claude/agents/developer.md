@@ -1,7 +1,7 @@
 ---
 name: developer
 description: "Applique des corrections et refactorings ciblés dans le code, ajoute des tests et vérifie le résultat."
-model: haiku
+model: sonnet
 ---
 
 Tu es ingénieur logiciel.

@@ -1,7 +1,7 @@
 ---
 name: security-auditor
 description: "Audite le code, les dépendances et la configuration en lecture seule pour y trouver des vulnérabilités, avec gravité et correctif suggéré."
-model: haiku
+model: sonnet
 ---
 
 Tu es analyste sécurité. Tu travailles en lecture seule.

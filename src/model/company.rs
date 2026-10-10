@@ -16,6 +16,9 @@ fn default_max_parallel() -> usize {
 fn default_max_fix_rounds() -> u32 {
     2
 }
+fn default_max_review_rounds() -> u32 {
+    1
+}
 fn default_checkpoint() -> bool {
     true
 }
@@ -41,6 +44,10 @@ pub struct Seat {
     /// Commandes shell autorisées pour ce poste (ex. « cargo test »).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_bash: Vec<String>,
+    /// Modèle des assistants légers (ex. « haiku ») : le poste leur confie des tâches mécaniques et entièrement
+    /// spécifiées (inventaires, lancement de commandes, résumés de sortie), sans décision ; absent = pas d'assistants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub helpers: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -52,6 +59,21 @@ fn is_false(b: &bool) -> bool {
 pub fn is_safe_command(c: &str) -> bool {
     let c = c.trim();
     !c.is_empty() && !c.contains([',', '(', ')', '*', ':']) && !c.chars().any(char::is_control)
+}
+
+/// Commandes de vérification accessibles à tout supérieur (lecture seule).
+const READ_ONLY_COMMANDS: [&str; 8] = ["git status", "git diff", "git log", "git show", "wc", "grep", "diff", "ls"];
+
+/// Préfixes des commandes d'un poste ⚒ qui ne font que vérifier (tests, compilation, lecture) : un supérieur peut les rejouer.
+const VERIFY_PREFIXES: [&str; 14] = [
+    "cargo test", "cargo build", "cargo check", "cargo clippy", "cargo bench", "go test", "go build", "go vet", "npm test", "npm run test", "pytest", "make test",
+    "git status", "git diff",
+];
+
+fn is_verification(cmd: &str) -> bool {
+    let c = cmd.trim();
+    let matches = |p: &str| c == p || c.strip_prefix(p).is_some_and(|r| r.starts_with(' '));
+    READ_ONLY_COMMANDS.iter().chain(VERIFY_PREFIXES.iter()).chain(["git log", "git show"].iter()).any(|p| matches(p))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -68,6 +90,10 @@ pub struct Company {
     /// Tours de correction qu'un poste peut lancer dans sa branche avant de remonter le blocage à son supérieur.
     #[serde(default = "default_max_fix_rounds")]
     pub max_fix_rounds: u32,
+    /// Revues du CEO : après les rapports, il vérifie le résultat contre l'objectif et peut relancer une redescente
+    /// (tâches complémentaires non prévues au départ). 0 = pas de revue.
+    #[serde(default = "default_max_review_rounds")]
+    pub max_review_rounds: u32,
     #[serde(default, rename = "seat")]
     pub seats: Vec<Seat>,
 }
@@ -298,6 +324,27 @@ impl Company {
             .collect()
     }
 
+    /// Commandes de vérification d'un supérieur : lecture seule, plus les tests / compilations / lectures déjà permis à ses
+    /// subordonnés (jamais d'écriture : un supérieur coordonne et contrôle, il ne code pas).
+    pub fn verify_commands(&self, i: usize) -> Vec<String> {
+        let mut out: Vec<String> = READ_ONLY_COMMANDS.iter().map(|c| c.to_string()).collect();
+        let mut stack = self.children(i);
+        let mut seen = vec![false; self.seats.len()];
+        while let Some(d) = stack.pop() {
+            if std::mem::replace(&mut seen[d], true) {
+                continue;
+            }
+            stack.extend(self.children(d));
+            for cmd in &self.seats[d].allow_bash {
+                let cmd = cmd.trim().to_string();
+                if is_verification(&cmd) && !out.contains(&cmd) {
+                    out.push(cmd);
+                }
+            }
+        }
+        out
+    }
+
     /// Postes mobilisés en phase de réalisation : les `builds` et tous leurs supérieurs.
     pub fn build_branch(&self) -> Vec<bool> {
         let mut flags = vec![false; self.seats.len()];
@@ -324,7 +371,9 @@ impl Company {
         };
         let branch = self.build_branch();
         let realisation = if branch.iter().any(|b| *b) { cost(&|i| branch[i]) } else { 0 };
-        CallEstimate { conception: cost(&|_| true), realisation }
+        // + la revue du CEO (un appel par phase, si activée et si le CEO a des subordonnés).
+        let review = u32::from(self.max_review_rounds > 0);
+        CallEstimate { conception: cost(&|_| true) + review, realisation: if realisation > 0 { realisation + review } else { 0 } }
     }
 
     /// Validation complète : ids, hiérarchie, agents, postes de réalisation.
@@ -371,6 +420,11 @@ impl Company {
                 }
                 if self.parent(i).is_none() {
                     bail!("{}", tf!("poste {} : le boss ne peut pas être un poste de réalisation", "seat {}: the boss cannot be a realisation seat", s.id));
+                }
+            }
+            if let Some(m) = &s.helpers {
+                if m.is_empty() || !m.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')) {
+                    bail!("{}", tf!("poste {} : « helpers » attend un nom de modèle (ex. haiku)", "seat {}: \"helpers\" expects a model name (e.g. haiku)", s.id));
                 }
             }
             if !s.allow_bash.is_empty() && !s.builds {
@@ -528,10 +582,11 @@ reports_to = "ciso"
         assert_eq!(ids, vec!["ceo", "cto", "mgr", "dev1", "dev2"], "ciso et sec ne participent pas à la réalisation");
         let e = c.estimate_calls();
         // Conception : ceo, cto, ciso, mgr = 2 chacun ; dev1, dev2, sec = 1 chacun.
-        assert_eq!(e.conception, 4 * 2 + 3);
+        // + 1 revue du CEO.
+        assert_eq!(e.conception, 4 * 2 + 3 + 1);
         // Réalisation : ceo, cto, mgr = 2 chacun ; dev1, dev2 = 1 chacun.
-        assert_eq!(e.realisation, 3 * 2 + 2);
-        assert_eq!(e.total(), 11 + 8);
+        assert_eq!(e.realisation, 3 * 2 + 2 + 1);
+        assert_eq!(e.total(), 12 + 9);
     }
 
     #[test]

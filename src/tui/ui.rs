@@ -79,7 +79,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         f.render_widget(Clear, area);
         let block = Block::bordered()
             .title(tf!(" Mission · {} ", " Mission · {} ", v.title))
-            .title_bottom(tr(" d discuter du compte rendu avec le modèle · ↑↓ défiler · espace/b page · Échap : fermer ", " d discuss the report with the model · ↑↓ scroll · space/b page · Esc: close "))
+            .title_bottom(tr(" c copier · d discuter du compte rendu avec le modèle · ↑↓ défiler · espace/b page · Échap : fermer ", " c copy · d discuss the report with the model · ↑↓ scroll · space/b page · Esc: close "))
             .border_style(Style::new().fg(Color::Cyan));
         f.render_widget(Paragraph::new(v.text.clone()).scroll((v.scroll, 0)).block(block), area);
     }
@@ -89,7 +89,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         f.render_widget(Clear, area);
         let block = Block::bordered()
             .title(tr(" Plan consolidé — lancer la réalisation ? ", " Consolidated plan — start realisation? "))
-            .title_bottom(tr(" Entrée : lancer (les postes ⚒ modifient le projet) · e : modifier le plan avec le boss · Échap : arrêter ici · ↑↓ défiler ", " Enter: start (⚒ seats modify the project) · e: revise the plan with the boss · Esc: stop here · ↑↓ scroll "))
+            .title_bottom(tr(" Entrée : lancer (les postes ⚒ modifient le projet) · c : copier · e : modifier le plan avec le boss · Échap : arrêter ici · ↑↓ défiler ", " Enter: start (⚒ seats modify the project) · c: copy · e: revise the plan with the boss · Esc: stop here · ↑↓ scroll "))
             .border_style(Style::new().fg(Color::Yellow));
         f.render_widget(Paragraph::new(cp.plan.clone()).wrap(Wrap { trim: false }).scroll((cp.scroll, 0)).block(block), area);
     }
@@ -99,7 +99,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         f.render_widget(Clear, area);
         let block = Block::bordered()
             .title(tr(" Mission bloquée — le CEO n'a pas pu la débloquer ", " Mission blocked — the CEO could not clear it "))
-            .title_bottom(tr(" e : discuter avec le CEO · Entrée : relancer la correction · Échap : arrêter la mission · ↑↓ défiler ", " e: talk with the CEO · Enter: retry the correction · Esc: stop the mission · ↑↓ scroll "))
+            .title_bottom(tr(" c : copier · e : discuter avec le CEO · Entrée : relancer la correction · Échap : arrêter la mission · ↑↓ défiler ", " c: copy · e: talk with the CEO · Enter: retry the correction · Esc: stop the mission · ↑↓ scroll "))
             .border_style(Style::new().fg(Color::Red));
         f.render_widget(Paragraph::new(es.summary.clone()).wrap(Wrap { trim: false }).scroll((es.scroll, 0)).block(block), area);
     }
@@ -207,7 +207,7 @@ fn help_text(app: &App) -> &'static str {
         (_, Tab::Agents) => "↑↓ choisir · n créer avec l'assistant · N formulaire · e éditer · D supprimer · q quitter",
         (_, Tab::Company) => "←↑↓→ zones · Entrée entrer · Échap sortir · dans une zone : e éditer (a ajouter · x retirer dans l'organigramme) · r lancer · Ctrl+K toutes les touches",
         (_, Tab::Run) if app.show_history => "↑↓ choisir · Entrée ouvrir · D supprimer · h retour · Tab onglet · q quitter",
-        (_, Tab::Run) => "↑↓ nœud · s annuler le run · h historique · Tab onglet · q quitter",
+        (_, Tab::Run) => "↑↓ nœud · c copier le journal (C tous) · s annuler le run · h historique · Tab onglet · q quitter",
         (_, Tab::Terminal) => match &app.term {
             None => "n dans Agents ou Entreprise ouvre un assistant ici · Tab onglet · q quitter",
             Some(t) if t.exited => "session terminée — appuyez sur une touche pour fermer",
@@ -228,7 +228,7 @@ fn help_text_en(app: &App) -> &'static str {
         (_, Tab::Agents) => "↑↓ pick · n create with assistant · N form · e edit · D delete · q quit",
         (_, Tab::Company) => "←↑↓→ zones · Enter enter · Esc leave · in a zone: e edit (a add · x remove in the org chart) · r run · Ctrl+K all keys",
         (_, Tab::Run) if app.show_history => "↑↓ pick · Enter open · D delete · h back · Tab tab · q quit",
-        (_, Tab::Run) => "↑↓ node · s cancel run · h history · Tab tab · q quit",
+        (_, Tab::Run) => "↑↓ node · c copy log (C all) · s cancel run · h history · Tab tab · q quit",
         (_, Tab::Terminal) => match &app.term {
             None => "n in Agents or Company opens an assistant here · Tab tab · q quit",
             Some(t) if t.exited => "session ended — press any key to close",

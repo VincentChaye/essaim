@@ -287,6 +287,7 @@ impl SeatForm {
             expertise: None,
             builds: false,
             allow_bash: vec![],
+            helpers: None,
         });
         let (depth, is_leaf) = match (seat, parent) {
             (Some(i), _) => (c.depth(i), c.is_leaf(i)),
@@ -349,6 +350,8 @@ impl SeatForm {
             expertise: Some(t(5)).filter(|e| !e.is_empty()),
             builds: t(6) == "oui",
             allow_bash: t(7).split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(),
+            // Non éditable dans le formulaire (TOML) : conservé tel quel à l'enregistrement.
+            helpers: self.initial.helpers.clone(),
         }
     }
 }
@@ -456,6 +459,8 @@ pub struct MissionView {
     pub title: String,
     pub dir: PathBuf,
     pub text: Vec<ratatui::text::Line<'static>>,
+    /// Markdown brut, pour `c` (copie).
+    pub raw: String,
     pub scroll: u16,
 }
 
@@ -839,6 +844,10 @@ impl App {
                 self.status = tr("mission arrêtée sur le blocage", "mission stopped on the blockage").into();
             }
             KeyCode::Char('e') => self.request_escalation_chat(),
+            KeyCode::Char('c') => {
+                let summary = es.summary.clone();
+                self.copy_text(&summary);
+            }
             KeyCode::Down | KeyCode::Char('j') => es.scroll = es.scroll.saturating_add(1),
             KeyCode::Up | KeyCode::Char('k') => es.scroll = es.scroll.saturating_sub(1),
             KeyCode::PageDown => es.scroll = es.scroll.saturating_add(10),
@@ -1408,6 +1417,16 @@ impl App {
                     if down || up {
                         r.sel = step(r.sel, r.nodes.len(), down);
                     }
+                    // `c` : journal du poste sélectionné ; `C` : journal de tous les postes.
+                    if let KeyCode::Char(ch @ ('c' | 'C')) = k.code {
+                        let text = if ch == 'c' {
+                            r.nodes.get(r.sel).map(|n| n.log.join("\n")).unwrap_or_default()
+                        } else {
+                            r.nodes.iter().map(|n| format!("## {}\n{}", n.label, n.log.join("\n"))).collect::<Vec<_>>().join("\n\n")
+                        };
+                        self.copy_text(&text);
+                        return;
+                    }
                     if k.code == KeyCode::Char('s') && r.finished.is_none() {
                         self.mode = Mode::ConfirmAction(PendingAction::CancelRun(r.name.clone()));
                     }
@@ -1473,7 +1492,7 @@ impl App {
             md = tr("_Cette mission n'a encore aucun contenu._", "_This mission has no content yet._").into();
         }
         let width = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(100).min(96).saturating_sub(4);
-        self.mission_view = Some(MissionView { title: m.title.clone(), dir: m.dir.clone(), text: super::markdown::render(&md, width), scroll: 0 });
+        self.mission_view = Some(MissionView { title: m.title.clone(), dir: m.dir.clone(), text: super::markdown::render(&md, width), raw: md, scroll: 0 });
     }
 
     /// Déplie / replie le résumé de la mission sélectionnée (`want` : Some(true) déplie, Some(false) replie).
@@ -1504,10 +1523,26 @@ impl App {
         self.assistant_request = Some((AssistantKind::Debrief, args));
     }
 
+    /// Copie `text` dans le presse-papiers et le dit dans la barre de statut.
+    fn copy_text(&mut self, text: &str) {
+        self.status = if text.trim().is_empty() {
+            tr("rien à copier", "nothing to copy").into()
+        } else {
+            match super::clipboard::copy(text) {
+                Ok(how) => tf!("copié ({} caractères, via {how})", "copied ({} characters, via {how})", text.chars().count()),
+                Err(e) => tf!("copie impossible : {e}", "copy failed: {e}"),
+            }
+        };
+    }
+
     fn key_mission_view(&mut self, k: KeyEvent) {
         let Some(v) = self.mission_view.as_mut() else { return };
         match k.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter | KeyCode::Char('o') => self.mission_view = None,
+            KeyCode::Char('c') => {
+                let raw = v.raw.clone();
+                self.copy_text(&raw);
+            }
             KeyCode::Char('d') => {
                 let dir = v.dir.clone();
                 self.mission_view = None;
@@ -1536,6 +1571,10 @@ impl App {
                 self.status = tr("réalisation refusée : la mission s'arrête sur le plan", "realisation refused: the mission stops at the plan").into();
             }
             KeyCode::Char('e') => self.request_plan_revision(),
+            KeyCode::Char('c') => {
+                let plan = cp.plan.clone();
+                self.copy_text(&plan);
+            }
             KeyCode::Down | KeyCode::Char('j') => cp.scroll = cp.scroll.saturating_add(1),
             KeyCode::Up | KeyCode::Char('k') => cp.scroll = cp.scroll.saturating_sub(1),
             KeyCode::PageDown => cp.scroll = cp.scroll.saturating_add(10),

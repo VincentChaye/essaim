@@ -36,6 +36,7 @@ agent = "developer"
 reports_to = "cto"
 expertise = "corrections ciblées, refactorings, tests"
 builds = true
+helpers = "haiku"
 allow_bash = [
     "cargo test",
     "cargo clippy",
@@ -57,3 +58,4 @@ agent = "doc-writer"
 reports_to = "cpo"
 expertise = "README, documentation, docstrings"
 builds = true
+helpers = "haiku"

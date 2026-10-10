@@ -1,7 +1,7 @@
 //! Exécution d'un poste : délégation, lots de travail, correction des échecs, rapport de synthèse.
 
 use super::prompt::{escalation_summary, report_prompt, work_prompt};
-use super::schema::FixPlan;
+use super::schema::{FixPlan, ReviewPlan};
 use super::shared::Shared;
 use super::{Assignment, Blocker, Kind, Phase, SeatOut, Status};
 use crate::runtime::executor::EscalationReply;
@@ -14,7 +14,7 @@ use tokio::task::JoinSet;
 /// Exécute des affectations : en conception tout en parallèle ; en réalisation par lots sans chevauchement de
 /// fichiers, l'un après l'autre. Un lot qui échoue arrête les suivants (on ne construit pas sur une base cassée).
 /// Renvoie les affectations menées (avec leur résultat) et celles jamais démarrées.
-async fn run_batch(sh: &Arc<Shared>, phase: Phase, todo: Vec<Assignment>) -> (Vec<(Assignment, SeatOut)>, Vec<Assignment>) {
+async fn run_batch(sh: &Arc<Shared>, from: usize, phase: Phase, todo: Vec<Assignment>) -> (Vec<(Assignment, SeatOut)>, Vec<Assignment>) {
     let lots: Vec<Vec<usize>> = match phase {
         Phase::Conception => vec![(0..todo.len()).collect()],
         Phase::Realisation => scope::batches(&todo.iter().map(|a| a.scope.clone()).collect::<Vec<_>>()),
@@ -29,6 +29,7 @@ async fn run_batch(sh: &Arc<Shared>, phase: Phase, todo: Vec<Assignment>) -> (Ve
         for &n in &lot {
             started[n] = true;
             let a = &todo[n];
+            sh.set_hint(from, a);
             let (sh2, to, t, s2) = (sh.clone(), a.to, a.task.clone(), a.scope.clone());
             set.spawn(async move { (n, run_seat(sh2, to, phase, t, s2).await) });
         }
@@ -76,12 +77,14 @@ pub(super) fn run_seat(sh: Arc<Shared>, i: usize, phase: Phase, task: String, sc
         let mut history: Vec<(String, String, String, bool, String)> = vec![];
         let mut todo = assignments;
         let mut rounds_left = sh.company.max_fix_rounds;
+        // Seul le CEO relit le résultat contre l'objectif et peut relancer une redescente.
+        let mut reviews_left = if is_root { sh.company.max_review_rounds } else { 0 };
         let mut decision: Option<String> = None;
         let mut reason: Option<String> = None;
         // Problèmes non résolus à la fin : (titre, texte avec blocages, blocages).
         let mut unresolved: Vec<(String, String, Vec<Blocker>)> = vec![];
         loop {
-            let (ran, pending) = run_batch(&sh, phase, todo).await;
+            let (ran, pending) = run_batch(&sh, i, phase, todo).await;
             let mut failed_rows = vec![];
             unresolved.clear();
             for (a, out) in &ran {
@@ -100,8 +103,27 @@ pub(super) fn run_seat(sh: Arc<Shared>, i: usize, phase: Phase, task: String, sc
             }
             // Résolution : correctifs dans la branche, puis remontée ; le CEO en dernier recours s'adresse à l'utilisateur.
             let next = loop {
-                if unresolved.is_empty() || sh.cancelled() {
+                if sh.cancelled() {
                     break None;
+                }
+                if unresolved.is_empty() {
+                    if reviews_left == 0 {
+                        break None;
+                    }
+                    reviews_left -= 1;
+                    match sh.review(i, phase, &task, &history, &kids, &sc, reviews_left + 1).await {
+                        ReviewPlan::Accepted => break None,
+                        ReviewPlan::Redo { assignments, .. } => break Some(assignments),
+                        ReviewPlan::Unmet(findings) => {
+                            let title = sh.company.seats[i].title.clone();
+                            let msg = format!("review: goal not reached: {findings}");
+                            unresolved.push((title.clone(), msg.clone(), vec![Blocker { kind: "other".into(), detail: format!("{title}: {msg}"), needs: String::new() }]));
+                            failed_rows.push((title, sh.company.seats[i].id.clone(), task.clone(), false, msg));
+                            reason = Some(findings);
+                            rounds_left = 0;
+                            continue;
+                        }
+                    }
                 }
                 if rounds_left > 0 {
                     rounds_left -= 1;
@@ -121,6 +143,7 @@ pub(super) fn run_seat(sh: Arc<Shared>, i: usize, phase: Phase, task: String, sc
                     match sh.ask_user(escalation_summary(&shown, reason.as_deref())).await {
                         EscalationReply::Retry => {
                             rounds_left = sh.company.max_fix_rounds.max(1);
+                            reviews_left = reviews_left.max(1);
                             decision = sh.resolution();
                         }
                         EscalationReply::Stop => break None,

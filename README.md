@@ -266,9 +266,40 @@ lance la réalisation, toute autre réponse arrête la mission sur le plan.
 Avec `checkpoint = false`, il n'y a ni plan à valider ni invite : la réalisation démarre dès la fin de la conception.
 Un avertissement d'exécution signalera ce cas : **À CONFIRMER** (texte exact et canal, stderr ou bandeau TUI, à reprendre de la décision CTO ; il n'est pas encore présent dans le code).
 
+### Modèles et assistants légers
+
+Le modèle d'un poste est celui de son agent, ou son champ `model` s'il est défini. Les postes qui **produisent le travail**
+(feuilles : développeurs, analystes) et ceux qui **arbitrent** (managers, CEO) sont en `sonnet` par défaut (`opus` pour
+l'architecture difficile) : un travail raté coûte plus cher en tours de correction que le surcoût du modèle.
+
+**Le modèle se choisit selon la tâche.** À chaque délégation, le CEO (et chaque manager) peut fixer un `model`
+(`haiku` / `sonnet` / `opus`) pour le poste qu'il mobilise, selon ce que la tâche exige vraiment : `haiku` pour le
+mécanique ou le simple, `sonnet` pour de l'analyse ou du code qui demande du jugement, `opus` pour l'architecture
+difficile. Sur une feuille, c'est son modèle ; sur un manager, c'est le défaut des feuilles de sa branche, que les
+niveaux inférieurs peuvent affiner. Le choix s'affiche dans le journal (`Backend Engineer · builds ⚒ [sonnet]`). Un
+`model` écrit dans le `.toml` d'un poste est **épinglé** : aucun délégant ne le change ; les managers gardent leur modèle.
+
+Pour économiser tokens et temps, un poste peut déclarer `helpers = "haiku"` : il dispose alors d'un sous-agent
+(`essaim-assistant`) au modèle moindre, pour les tâches **mécaniques et entièrement spécifiées** (lister ou compter des
+fichiers, lancer une commande et rendre sa sortie brute, extraire des lignes). L'assistant ne décide rien et n'écrit
+jamais (`Read`, `Grep`, `Glob`, et `Bash` seulement si le poste l'a) ; le poste reste responsable et vérifie ce qu'il reçoit.
+Ses tokens comptent dans le coût, mais pas dans `max_calls`.
+
+### Un CEO qui coordonne, vérifie et relance
+
+Les supérieurs (CEO, managers) ne codent jamais : ils n'ont ni `Edit` ni `Write`. En revanche, ils **lisent le projet et
+vérifient** avec des commandes de contrôle : lecture seule (`git status/diff/log/show`, `wc`, `grep`, `diff`, `ls`) plus
+les tests / compilations déjà permis à leurs subordonnés (`cargo test`, `cargo clippy`…, jamais `git add/commit`).
+
+Après les rapports, le CEO fait une **revue** : le résultat atteint-il l'objectif et les critères du brief ? Il le
+vérifie lui-même plutôt que de croire les rapports. Sinon il lance une **redescente** : des tâches complémentaires ou
+correctives (même non prévues au départ) vers les subordonnés compétents, puis un nouveau rapport. Si personne ne peut
+combler l'écart, c'est une remontée à l'utilisateur (voir ci-dessus). `max_review_rounds` (défaut 1, `0` = pas de revue)
+borne les redescentes ; la revue coûte un appel par phase, déjà comptés dans l'estimation.
+
 Livrables : `.essaim/missions/<id>/{brief,conception,rapport}.md`. `rapport.md` n'existe que si la réalisation
 a été lancée et s'est terminée. Garde-fous dans le TOML : `max_calls` (plafond d'appels `claude` par mission,
-partagé entre les phases, défaut 40), `max_parallel` (défaut 2), `checkpoint` (défaut `true`), `max_fix_rounds` (défaut 2). L'estimation
+partagé entre les phases, défaut 40), `max_parallel` (défaut 2), `checkpoint` (défaut `true`), `max_fix_rounds` (défaut 2), `max_review_rounds` (défaut 1). L'estimation
 d'appels est affichée avant le lancement.
 
 ```toml
@@ -288,6 +319,7 @@ agent = "developer"
 reports_to = "ceo"
 builds = true
 allow_bash = ["cargo test"]   # règles Bash(cargo test:*) pour ce poste
+helpers = "haiku"             # assistants légers (modèle moindre) pour les tâches mécaniques de ce poste
 ```
 
 `essaim init` crée une entreprise d'exemple complète (9 postes).

@@ -70,6 +70,7 @@ max_calls = 40         # cap on claude calls per mission
 max_parallel = 2
 checkpoint = true      # pause to approve the plan before realisation
 max_fix_rounds = 2     # correction rounds a seat may run in its branch before escalating a blocker
+max_review_rounds = 1  # CEO reviews of the result against the goal (0 = none); a failed review sends a new round of tasks down
 
 [[seat]]
 id = "ceo"             # unique; letters, digits, - and _
@@ -88,6 +89,7 @@ agent = "developer"
 reports_to = "mgr-eng"
 builds = true                      # realisation leaves only
 allow_bash = ["cargo test"]        # optional, only with builds: allowed shell commands
+helpers = "haiku"                  # optional: light assistants (cheaper model) for mechanical chores, read-only, no decisions
 
 Validity rules (essaim rejects the company otherwise):
 - exactly ONE seat without `reports_to` (the boss); no cycle; every `reports_to` names an existing seat;
@@ -100,7 +102,7 @@ Format of an agent to create (.claude/agents/<agent>.md):
 ---
 name: <agent>
 description: "<one sentence: when to use this agent>"
-model: haiku        (haiku for leaves and managers, sonnet for the boss and VPs; omit the line for the default)
+model: sonnet       (sonnet for leaves that produce the work and for managers/boss, opus for hard architecture; haiku only for trivial chores — give builders `helpers = "haiku"` on their seat instead; omit the line for the default)
 ---
 
 <system prompt in Markdown: role, method, concise output format, limits>

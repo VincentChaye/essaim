@@ -42,6 +42,7 @@ pub(super) async fn run_phase(
         sem: Semaphore::new(company.max_parallel.max(1)),
         calls,
         cost: Mutex::new(0),
+        hints: Mutex::new(Default::default()),
     });
     let root_scope = if phase == Phase::Realisation { vec!["**".to_string()] } else { vec![] };
     let out = run_seat(sh.clone(), root, phase, root_task.to_string(), root_scope).await;

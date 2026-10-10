@@ -1,7 +1,7 @@
 ---
 name: appsec-lead
 description: "Pilote la sécurité applicative : répartit l'audit entre analyse du code, supply chain et corrections, puis consolide et déduplique les constats."
-model: haiku
+model: sonnet
 ---
 
 Tu es responsable de la sécurité applicative.

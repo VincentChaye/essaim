@@ -1,7 +1,7 @@
 //! État partagé d'une phase (`Shared`) et appels vers `claude` : un poste, un appel, un plafond, un coût.
 
-use super::prompt::{delegate_prompt, fix_prompt, role_card};
-use super::schema::{FixPlan, delegation_schema, fix_schema, node_status, outcome_schema, parse_assignments, parse_fix, parse_outcome};
+use super::prompt::{delegate_prompt, fix_prompt, review_prompt, role_card};
+use super::schema::{FixPlan, ReviewPlan, delegation_schema, fix_schema, node_status, outcome_schema, parse_assignments, parse_fix, parse_outcome, parse_review, review_schema};
 use super::{Assignment, CompanyOptions, Kind, Outcome, Phase};
 use crate::model::agent::AgentDef;
 use crate::model::company::Company;
@@ -26,6 +26,9 @@ pub(super) fn emit(tx: &mpsc::UnboundedSender<RunEvent>, ev: RunEvent) {
     let _ = tx.send(ev);
 }
 
+/// Nom du sous-agent léger d'un poste dont `helpers` est défini.
+pub(super) const HELPER: &str = "essaim-assistant";
+
 pub(super) struct Shared {
     pub(super) company: Company,
     pub(super) agents: Vec<AgentDef>,
@@ -38,6 +41,8 @@ pub(super) struct Shared {
     /// Compteur d'appels partagé par toute la mission (plafond `max_calls`).
     pub(super) calls: Arc<AtomicU32>,
     pub(super) cost: Mutex<u64>,
+    /// Modèle choisi par les délégants : pour une feuille son propre modèle, sinon le défaut des feuilles de sa branche.
+    pub(super) hints: Mutex<BTreeMap<usize, String>>,
 }
 
 impl Shared {
@@ -53,6 +58,22 @@ impl Shared {
         }
     }
 
+    /// Enregistre le modèle d'une affectation (le sien, sinon celui hérité du délégant `from`).
+    pub(super) fn set_hint(&self, from: usize, a: &Assignment) {
+        let mut h = self.hints.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(m) = a.model.clone().or_else(|| h.get(&from).cloned()) {
+            h.insert(a.to, m);
+        }
+    }
+
+    /// Modèle imposé par un délégant à la feuille `i` ; un modèle fixé dans le `.toml` du poste prime.
+    fn dynamic_model(&self, i: usize, is_leaf: bool) -> Option<String> {
+        if !is_leaf || self.company.seats[i].model.is_some() {
+            return None;
+        }
+        self.hints.lock().unwrap_or_else(PoisonError::into_inner).get(&i).cloned()
+    }
+
     pub(super) fn cancelled(&self) -> bool {
         *self.cancel.borrow()
     }
@@ -62,6 +83,8 @@ impl Shared {
         let mut agent = self.agents.iter().find(|a| a.name == seat.agent).cloned().ok_or_else(|| anyhow::anyhow!("agent « {} » introuvable", seat.agent))?;
         if seat.model.is_some() {
             agent.model = seat.model.clone();
+        } else if let Some(m) = self.dynamic_model(i, kids.is_empty()) {
+            agent.model = Some(m);
         }
         let mut agents = BTreeMap::new();
         agents.insert(agent.name.clone(), agent.to_cli_json());
@@ -82,7 +105,34 @@ impl Shared {
                 }
                 permission_mode = Some("dontAsk".to_string());
             }
+            // Supérieur qui rapporte, corrige ou revoit : il lit et vérifie (commandes de lecture / de test), il n'écrit jamais.
+            (Kind::Report | Kind::Fix | Kind::Review, _) if !kids.is_empty() => {
+                tools = "Read,Grep,Glob,Bash".into();
+                allowed = vec!["Read".into(), "Grep".into(), "Glob".into()];
+                allowed.extend(self.company.verify_commands(i).iter().map(|c| format!("Bash({}:*)", c.trim())));
+                permission_mode = Some("dontAsk".to_string());
+            }
             _ => {}
+        }
+        // Assistants légers (modèle moindre) : tâches mécaniques sans décision. Ils n'écrivent jamais ;
+        // ils ne reçoivent le shell que si le poste l'a (un sous-agent ne dépasse pas les outils de son parent).
+        if kind == Kind::Work {
+            if let Some(model) = &seat.helpers {
+                let mut helper_tools = vec!["Read", "Grep", "Glob"];
+                if tools.split(',').any(|t| t == "Bash") {
+                    helper_tools.push("Bash");
+                }
+                agents.insert(
+                    HELPER.into(),
+                    serde_json::json!({
+                        "description": "Light assistant for purely mechanical, fully specified tasks (inventories, running a command and reporting its raw output, counting, extracting). Takes no decision, never edits files.",
+                        "prompt": "You are a light assistant. Do exactly what is asked, nothing more. Report raw results, concisely. Take no decision, never modify any file, and say so plainly if the task is unclear or fails.",
+                        "model": model,
+                        "tools": helper_tools,
+                    }),
+                );
+                tools.push_str(if tools.is_empty() { "Agent" } else { ",Agent" });
+            }
         }
         Ok(RunSpec {
             prompt,
@@ -115,10 +165,16 @@ impl Shared {
             (Kind::Work, Phase::Realisation) => "builds",
             (Kind::Report, _) => "reports",
             (Kind::Fix, _) => "fixes",
+            (Kind::Review, _) => "reviews",
         };
         emit(&self.tx, RunEvent::Label {
             id: id.clone(),
-            label: format!("{} · {verb}{}", seat.title, if phase == Phase::Realisation { " ⚒" } else { "" }),
+            label: format!(
+                "{} · {verb}{}{}",
+                seat.title,
+                if phase == Phase::Realisation { " ⚒" } else { "" },
+                self.dynamic_model(i, kids.is_empty()).map(|m| format!(" [{m}]")).unwrap_or_default()
+            ),
             agent: seat.agent.clone(),
             depth: self.company.depth(i),
         });
@@ -205,6 +261,26 @@ impl Shared {
             }
         }
         FixPlan::Escalate("structured output missing".into())
+    }
+
+    /// Revue du poste `i` : le résultat atteint-il l'objectif ? Sinon, tâches complémentaires (redescente).
+    /// Une revue qui ne peut pas se faire (plafond, sortie absente) ne fait pas échouer la mission.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn review(self: &Arc<Self>, i: usize, phase: Phase, task: &str, results: &[(String, String, String, bool, String)], kids: &[usize], sc: &[String], rounds_left: u32) -> ReviewPlan {
+        let ids: Vec<String> = kids.iter().map(|&k| self.company.seats[k].id.clone()).collect();
+        let real = phase == Phase::Realisation;
+        let parent_scope = real.then_some(sc);
+        for _ in 0..2 {
+            match self.call(i, phase, Kind::Review, review_prompt(task, results, parent_scope, rounds_left), Some(review_schema(&ids, real)), kids, sc).await {
+                Ok(res) if !res.is_error => {
+                    if let Some(v) = &res.structured {
+                        return parse_review(v, &self.company, kids, parent_scope);
+                    }
+                }
+                _ => return ReviewPlan::Accepted,
+            }
+        }
+        ReviewPlan::Accepted
     }
 
     /// Le CEO n'a pas pu régler le blocage : pause, l'utilisateur décide (relancer, arrêter, ou en discuter d'abord).

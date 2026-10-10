@@ -7,6 +7,9 @@ use crate::runtime::scope;
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
+/// Modèles qu'un délégant peut choisir pour un poste (du moins cher au plus capable).
+pub(super) const MODELS: [&str; 3] = ["haiku", "sonnet", "opus"];
+
 /// Schéma de sortie des appels de travail et de rapport.
 pub(super) fn outcome_schema() -> String {
     json!({
@@ -99,7 +102,8 @@ pub(super) fn delegation_schema(kid_ids: &[String], with_scope: bool) -> String 
 fn delegation_value(kid_ids: &[String], with_scope: bool) -> Value {
     let mut props = json!({
         "to": {"type": "string", "enum": kid_ids},
-        "task": {"type": "string"}
+        "task": {"type": "string"},
+        "model": {"type": "string", "enum": MODELS}
     });
     let mut required = vec!["to", "task"];
     if with_scope {
@@ -127,6 +131,37 @@ pub(super) fn fix_schema(kid_ids: &[String], with_scope: bool) -> String {
     v["properties"]["escalate"] = json!({"type": "string"});
     v["required"] = json!(["plan"]);
     v.to_string()
+}
+
+/// Schéma de la revue : verdict, constats, puis (si le résultat n'est pas conforme) les tâches de la redescente.
+pub(super) fn review_schema(kid_ids: &[String], with_scope: bool) -> String {
+    let mut v = delegation_value(kid_ids, with_scope);
+    v["properties"]["assignments"].as_object_mut().map(|a| a.remove("minItems"));
+    v["properties"]["accepted"] = json!({"type": "boolean"});
+    v["properties"]["findings"] = json!({"type": "string"});
+    v["required"] = json!(["accepted", "findings"]);
+    v.to_string()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum ReviewPlan {
+    /// Objectif atteint (ou revue impossible : elle n'ajoute qu'un garde-fou, son absence ne fait pas échouer la mission).
+    Accepted,
+    /// Objectif non atteint : tâches complémentaires pour les subordonnés compétents.
+    Redo { findings: String, assignments: Vec<Assignment> },
+    /// Objectif non atteint et rien à relancer dans la branche : à décider avec l'utilisateur.
+    Unmet(String),
+}
+
+pub(super) fn parse_review(v: &Value, c: &Company, kids: &[usize], parent_scope: Option<&[String]>) -> ReviewPlan {
+    if v["accepted"].as_bool() == Some(true) {
+        return ReviewPlan::Accepted;
+    }
+    let findings = v["findings"].as_str().map(str::trim).filter(|f| !f.is_empty()).unwrap_or("goal not reached").to_string();
+    match parse_assignments(v, c, kids, parent_scope) {
+        Ok(assignments) => ReviewPlan::Redo { findings, assignments },
+        Err(_) => ReviewPlan::Unmet(findings),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -172,8 +207,10 @@ pub(super) fn parse_assignments(v: &Value, c: &Company, kids: &[usize], parent_s
                 continue; // aucun motif dans le périmètre du délégant
             }
         }
+        let model = a["model"].as_str().map(str::trim).filter(|m| MODELS.contains(m)).map(String::from);
         match out.iter_mut().find(|x| x.to == idx) {
             Some(x) => {
+                x.model = x.model.clone().or(model);
                 x.task.push_str("\n\n");
                 x.task.push_str(task.trim());
                 for m in sc {
@@ -182,7 +219,7 @@ pub(super) fn parse_assignments(v: &Value, c: &Company, kids: &[usize], parent_s
                     }
                 }
             }
-            None => out.push(Assignment { to: idx, task: task.trim().to_string(), scope: sc }),
+            None => out.push(Assignment { to: idx, task: task.trim().to_string(), scope: sc, model }),
         }
     }
     if out.is_empty() {

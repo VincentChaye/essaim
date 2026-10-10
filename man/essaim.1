@@ -58,6 +58,9 @@ Si le point de contrôle est désactivé (\fBcheckpoint = false\fR dans le TOML)
 Missions liées : une mission peut exiger la réussite d'autres missions (fichier \fBafter\fR du dossier de la mission, touche \fBa\fR dans la TUI), quelle que soit leur entreprise. Tant qu'un prérequis n'est pas réussi, elle est grisée et \fBcompany run --mission\fR la refuse.
 .PP
 Blocages : un poste bloqué (tests rouges, permission refusée, prérequis absent) n'est jamais compté comme réussi. Son supérieur lance jusqu'à \fBmax_fix_rounds\fR tours de correction (défaut 2), puis remonte le blocage de niveau en niveau jusqu'au CEO ; si le CEO échoue, le run attend une décision (relancer, discuter avec le CEO, arrêter). Avec \fB--yes\fR, la mission s'arrête.
+Revue : les supérieurs ne codent pas mais lisent et vérifient (commandes de lecture, tests déjà permis à leurs subordonnés). Après les rapports, le CEO relit le résultat contre l'objectif et peut relancer une redescente de tâches complémentaires, jusqu'à \fBmax_review_rounds\fR fois (défaut 1, 0 = aucune revue).
+Modèles : sonnet par défaut pour les postes qui produisent le travail et ceux qui arbitrent. \fBhelpers\fR = \(dqhaiku\(dq sur un poste lui donne des assistants légers (sous-agent en lecture seule) pour les tâches mécaniques, sans décision.
+Choix du modèle : à chaque délégation, le CEO ou un manager peut fixer \fBmodel\fR (haiku, sonnet, opus) pour le poste mobilisé selon la difficulté réelle de la tâche (pour une feuille : son modèle ; pour un manager : le défaut de sa branche). Un \fBmodel\fR écrit dans le .toml d'un poste est épinglé.
 Avertissement d'exécution dans ce cas : \fB[À CONFIRMER]\fR (texte et canal à fixer).
 .SH INTERFACE
 .SS Navigation

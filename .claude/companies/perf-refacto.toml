@@ -37,6 +37,7 @@ agent = "developer"
 reports_to = "head-perf"
 expertise = "mise en oeuvre des optimisations, benchmarks, non-régression"
 builds = true
+helpers = "haiku"
 allow_bash = [
     "cargo build",
     "cargo test",
@@ -74,6 +75,7 @@ agent = "developer"
 reports_to = "mgr-refacto"
 expertise = "déplacements purs de code, factorisation et simplification sans régression"
 builds = true
+helpers = "haiku"
 allow_bash = [
     "cargo build",
     "cargo test",

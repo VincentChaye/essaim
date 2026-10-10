@@ -22,6 +22,7 @@ agent = "developer"
 reports_to = "cto"
 expertise = "modèle, runtime, persistance (src/model, src/runtime)"
 builds = true
+helpers = "haiku"
 allow_bash = [
     "cargo build",
     "cargo test",
@@ -44,6 +45,7 @@ agent = "developer"
 reports_to = "cto"
 expertise = "interface, confirmations, saisie (src/tui)"
 builds = true
+helpers = "haiku"
 allow_bash = [
     "cargo build",
     "cargo test",

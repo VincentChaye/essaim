@@ -38,7 +38,7 @@ enum Cmd {
     },
 }
 
-/// Fichiers créés par `essaim init` : modèles haiku, sauf le dirigeant et les VP (sonnet).
+/// Fichiers créés par `essaim init` : exemples haiku (poète, critique) ; les postes qui produisent le travail et ceux qui arbitrent sont en sonnet.
 const EXAMPLES: &[(&str, &str)] = &[
     (
         ".claude/agents/poete.md",
@@ -66,19 +66,19 @@ const EXAMPLES: &[(&str, &str)] = &[
     ),
     (
         ".claude/agents/manager.md",
-        "---\nname: manager\ndescription: Manager d'équipe — répartit le travail entre ses collaborateurs\nmodel: haiku\n---\n\nTu manages une équipe. Tu découpes la tâche reçue en sous-tâches précises, indépendantes et sans chevauchement, et tu assembles leurs résultats.\n",
+        "---\nname: manager\ndescription: Manager d'équipe — répartit le travail entre ses collaborateurs\nmodel: sonnet\n---\n\nTu manages une équipe. Tu découpes la tâche reçue en sous-tâches précises, indépendantes et sans chevauchement, et tu assembles leurs résultats.\n",
     ),
     (
         ".claude/agents/developer.md",
-        "---\nname: developer\ndescription: Développeur — conçoit et réalise du code\nmodel: haiku\n---\n\nTu es développeur. Tu travailles uniquement dans le périmètre qu'on t'assigne, tu fais court et correct, et tu signales clairement ce que tu as fait.\n",
+        "---\nname: developer\ndescription: Développeur — conçoit et réalise du code\nmodel: sonnet\n---\n\nTu es développeur. Tu travailles uniquement dans le périmètre qu'on t'assigne, tu fais court et correct, et tu signales clairement ce que tu as fait.\n",
     ),
     (
         ".claude/agents/analyste-secu.md",
-        "---\nname: analyste-secu\ndescription: Analyste sécurité — revue de risques et recommandations\nmodel: haiku\n---\n\nTu es analyste sécurité. Tu examines le sujet reçu, listes les risques par gravité et proposes des mesures concrètes et vérifiables.\n",
+        "---\nname: analyste-secu\ndescription: Analyste sécurité — revue de risques et recommandations\nmodel: sonnet\n---\n\nTu es analyste sécurité. Tu examines le sujet reçu, listes les risques par gravité et proposes des mesures concrètes et vérifiables.\n",
     ),
     (
         ".claude/agents/designer.md",
-        "---\nname: designer\ndescription: Designer UX — parcours, écrans et composants\nmodel: haiku\n---\n\nTu es designer UX. Tu proposes parcours, écrans et composants précis, avec leurs états et règles d'accessibilité.\n",
+        "---\nname: designer\ndescription: Designer UX — parcours, écrans et composants\nmodel: sonnet\n---\n\nTu es designer UX. Tu proposes parcours, écrans et composants précis, avec leurs états et règles d'accessibilité.\n",
     ),
     (
         ".claude/companies/acme-studio.toml",

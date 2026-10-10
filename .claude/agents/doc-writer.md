@@ -1,7 +1,7 @@
 ---
 name: doc-writer
 description: Rédige ou met à jour la documentation (README, docs, commentaires de code, docstrings) à partir du code réel. À utiliser quand on demande de documenter, d'expliquer l'usage d'un module ou de mettre la doc en phase avec le code.
-model: haiku
+model: sonnet
 tools: Read, Grep, Glob, Edit, Write, Bash
 ---
 

@@ -5,6 +5,9 @@ use crate::model::company::Company;
 use crate::tf;
 use crate::tui::settings::Lang;
 
+/// Consigne de choix du modèle, ajoutée à tout prompt qui produit des affectations.
+pub(super) const MODEL_ADVICE: &str = " For each assignment you may set `model`, the cost/quality level of whoever does it: \"haiku\" for purely mechanical or simple work (inventories, running checks, small well-specified edits), \"sonnet\" for real analysis or code that needs judgment, \"opus\" only for hard architecture or subtle reasoning. Choose the cheapest level that will do the task well, based on what the task really demands; when in doubt for code that must be correct, use \"sonnet\". On a leaf it is its own model; on a manager it is the default for the leaves below (who can be refined further down). Seats marked `model pinned` keep their fixed model; leave `model` out to keep the default.";
+
 /// Un résultat d'enfant tronqué au-delà de cette taille dans le prompt de rapport du parent.
 pub(super) const MAX_CHILD_CHARS: usize = 6000;
 
@@ -33,8 +36,21 @@ pub(super) fn role_card(lang: Lang, c: &Company, i: usize, brief: &str, phase: P
                 (true, true) => " · builds".to_string(),
                 (true, false) => format!(" · builds, shell: {}", ks.allow_bash.join(", ")),
             };
-            out.push_str(&format!("- {} · {}{}{tools}\n", ks.id, ks.title, if expertise.is_empty() { String::new() } else { format!(" · {expertise}") }));
+            let pinned = ks.model.as_ref().map(|m| format!(" · model pinned: {m}")).unwrap_or_default();
+            out.push_str(&format!("- {} · {}{}{tools}{pinned}\n", ks.id, ks.title, if expertise.is_empty() { String::new() } else { format!(" · {expertise}") }));
         }
+    }
+    if !kids.is_empty() {
+        out.push_str(&format!(
+            "You coordinate: you never write or modify files yourself, but you can read the project and verify results with these shell commands: {}.\n",
+            c.verify_commands(i).join(", ")
+        ));
+    }
+    if let Some(m) = &s.helpers {
+        out.push_str(&format!(
+            "You have light assistants (subagent \"{}\", model {m}): hand them only mechanical, fully specified chores that take no decision (listing or counting files, running a command and returning its raw output, extracting lines, moving a block you point out); they never edit files. You stay responsible: decide yourself, give precise instructions, and verify what they return.\n",
+            super::shared::HELPER
+        ));
     }
     if phase == Phase::Realisation && !scope.is_empty() {
         out.push_str(&format!("File scope assigned to you: {}.\n", scope.join(", ")));
@@ -72,6 +88,7 @@ pub(super) fn delegate_prompt(task: &str, phase: Phase, scope: Option<&[String]>
             sc.join("`, `")
         ));
     }
+    out.push_str(MODEL_ADVICE);
     out.push_str(" Answer only through the structured output.");
     out
 }
@@ -119,6 +136,29 @@ pub(super) fn fix_prompt(task: &str, failed: &[(String, String, String, bool, St
     if let Some(d) = decision.filter(|d| !d.trim().is_empty()) {
         out.push_str(&format!("\n\nDecision from the user who requested the mission (follow it):\n{}", d.trim()));
     }
+    out.push_str(MODEL_ADVICE);
+    out.push_str("\n\nAnswer only through the structured output.");
+    out
+}
+
+/// Revue du CEO : le résultat atteint-il l'objectif ? `results` : mêmes rangées que pour le rapport.
+pub(super) fn review_prompt(task: &str, results: &[(String, String, String, bool, String)], scope: Option<&[String]>, rounds_left: u32) -> String {
+    let mut out = format!("Original task:\n{task}\n\nWhat your subordinates delivered:\n");
+    for (title, id, sub_task, _, text) in results {
+        let mut t = text.clone();
+        if t.chars().count() > MAX_CHILD_CHARS {
+            t = t.chars().take(MAX_CHILD_CHARS).collect::<String>() + "\n[… truncated]";
+        }
+        out.push_str(&format!("\n### {title} ({id})\nAssigned task: {sub_task}\n{t}\n"));
+    }
+    out.push_str("\nYou are accountable for the result reaching the goal, as cleanly as possible. Review it against the success criteria of the brief: check it yourself with the commands you have (tests, build, git diff, grep, wc…) instead of trusting reports. Treat any subordinate statement of failure, partial result, missing deliverable or unmeasured criterion as unmet unless a later result clearly resolved it. You coordinate and verify, you never do the work yourself.\n- Goal fully reached and verified: `accepted` true, with a one-line `findings`.\n- Otherwise: `accepted` false, `findings` = exactly what is missing or wrong, and `assignments` = complementary or corrective tasks (even ones the user did not foresee) for the subordinates best placed to do them. If nobody in your branch can do it, assign nothing: `findings` explains what is needed and the user will be asked.");
+    if rounds_left <= 1 {
+        out.push_str(" This is your last review round: do not ask for more than what is needed to reach the goal.");
+    }
+    if let Some(sc) = scope {
+        out.push_str(&format!("\n\nYour file scope: `{}`. Each assignment needs a `scope` (project-relative patterns, ALL included in yours).", sc.join("`, `")));
+    }
+    out.push_str(MODEL_ADVICE);
     out.push_str("\n\nAnswer only through the structured output.");
     out
 }

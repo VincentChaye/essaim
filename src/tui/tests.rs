@@ -736,7 +736,7 @@ fn onglet_claude_vide_explique_comment_l_ouvrir() {
 // ---------- onglet Entreprise ----------
 
 const ACME: &str = r#"name = "acme"
-max_calls = 10
+max_calls = 14
 
 [[seat]]
 id = "ceo"
@@ -779,7 +779,7 @@ fn onglet_entreprise_arbre_niveaux_et_validation() {
     assert!(s.contains("└─ N-2") || s.contains("N-2"), "{s}");
     assert!(s.contains("CEO") && s.contains("CTO") && s.contains("Backend Engineer"));
     assert!(s.contains("⚒"), "marqueur des postes de réalisation");
-    assert!(s.contains("conception 5") && s.contains("réalisation 5") && s.contains("= 10"), "estimation affichée : {s}");
+    assert!(s.contains("conception 6") && s.contains("réalisation 6") && s.contains("= 12") && s.contains("14 appels"), "estimation affichée : {s}");
 }
 
 #[test]
@@ -1620,6 +1620,9 @@ fn ouvrir_une_ancienne_mission() {
     press(&mut app, KeyCode::Enter);
     let s = screen(&app);
     assert!(s.contains("Vieux chantier") && s.contains("faire X") && s.contains("tout est fait"));
+    // `c` copierait le markdown brut (pas la mise en forme) : on vérifie ce qui serait copié, sans toucher au presse-papiers.
+    let raw = &app.mission_view.as_ref().unwrap().raw;
+    assert!(raw.contains("faire X") && raw.contains("tout est fait") && !raw.contains('│'));
     press(&mut app, KeyCode::Char('d')); // discuter du compte rendu
     assert!(app.mission_view.is_none());
     let (kind, args) = app.assistant_request.take().expect("session de debrief demandée");

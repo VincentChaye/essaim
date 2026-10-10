@@ -36,6 +36,7 @@ agent = "developer"
 reports_to = "appsec"
 expertise = "correctifs de sécurité ciblés, tests de non-régression"
 builds = true
+helpers = "haiku"
 allow_bash = [
     "cargo test",
     "cargo clippy",
