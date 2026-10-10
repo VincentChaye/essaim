@@ -1,7 +1,7 @@
 //! Pilotage d'une mission : phase de conception, point de contrôle, phase de réalisation, clôture du run.
 
 use super::seat::run_seat;
-use super::shared::Shared;
+use super::shared::{Shared, cost_guard};
 use super::{CompanyOptions, MissionOutcome, Phase, PhaseOutcome};
 use crate::model::agent::AgentDef;
 use crate::model::company::Company;
@@ -45,7 +45,7 @@ pub(super) async fn run_phase(
     });
     let root_scope = if phase == Phase::Realisation { vec!["**".to_string()] } else { vec![] };
     let out = run_seat(sh.clone(), root, phase, root_task.to_string(), root_scope).await;
-    let cost = *sh.cost.lock().unwrap();
+    let cost = *cost_guard(&sh.cost);
     let used = sh.calls.load(Ordering::SeqCst).min(company.max_calls).saturating_sub(before);
     let ok = out.ok();
     Ok(PhaseOutcome { ok, report: out.text, blockers: if ok { vec![] } else { out.blockers }, tokens: cost, calls: used })

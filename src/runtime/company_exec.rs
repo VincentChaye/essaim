@@ -448,6 +448,21 @@ reports_to = "ciso"
         std::env::temp_dir().join(format!("essaim-mission-{}", uuid::Uuid::new_v4()))
     }
 
+    /// Un verrou du coût empoisonné par une panique ailleurs reste utilisable (pas de panic en chaîne).
+    #[test]
+    fn compteur_de_cout_reste_utilisable_apres_empoisonnement() {
+        let cost = Arc::new(Mutex::new(5u64));
+        let poisoner = cost.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("empoisonnement volontaire du test");
+        })
+        .join();
+        assert!(cost.is_poisoned());
+        *super::shared::cost_guard(&cost) += 1;
+        assert_eq!(*super::shared::cost_guard(&cost), 6);
+    }
+
     /// R1 : un livrable qui ne peut pas être écrit n'est plus avalé : le run se ferme en échec et l'erreur remonte.
     #[tokio::test]
     async fn echec_d_ecriture_du_livrable_ferme_le_run_en_echec() {

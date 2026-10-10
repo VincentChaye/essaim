@@ -11,8 +11,14 @@ use crate::runtime::{missions, scope};
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::{Semaphore, mpsc, watch};
+
+/// Verrou du compteur de coût. Un verrou empoisonné (panique d'un autre fil) garde une valeur entière valide :
+/// on la reprend au lieu de paniquer.
+pub(super) fn cost_guard(cost: &Mutex<u64>) -> MutexGuard<'_, u64> {
+    cost.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 pub(super) struct Shared {
     pub(super) company: Company,
@@ -136,7 +142,7 @@ impl Shared {
             }
             Err(e) => (NodeStatus::Failed(e.to_string()), 0),
         };
-        *self.cost.lock().unwrap() += used;
+        *cost_guard(&self.cost) += used;
         let _ = self.tx.send(RunEvent::NodeFinished { id, status, tokens: used });
         res
     }
