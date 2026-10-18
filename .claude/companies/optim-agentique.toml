@@ -1,0 +1,47 @@
+name = "optim-agentique"
+max_calls = 30
+max_parallel = 2
+checkpoint = true
+max_fix_rounds = 2
+max_review_rounds = 1
+
+[[seat]]
+id = "ceo"
+title = "CEO"
+agent = "ceo"
+
+[[seat]]
+id = "vp-qualite"
+title = "VP Qualité et Performance"
+agent = "quality-vp"
+reports_to = "ceo"
+expertise = "optimisation du système agentique, coût en jetons, performance, fiabilité, non-régression"
+
+[[seat]]
+id = "agent-opt"
+title = "Ingénieur Optimisation Agentique"
+agent = "agent-optimizer"
+reports_to = "vp-qualite"
+expertise = "prompts, contexte, jetons, cache, routage des modèles, nombre d'appels"
+builds = true
+allow_bash = ["cargo build", "cargo test", "cargo clippy"]
+helpers = "haiku"
+
+[[seat]]
+id = "perf-eng"
+title = "Performance Engineer"
+agent = "perf-engineer"
+reports_to = "vp-qualite"
+expertise = "parallélisme, E/S, processus, latence, allocations"
+builds = true
+allow_bash = ["cargo build", "cargo test"]
+helpers = "haiku"
+
+[[seat]]
+id = "qa"
+title = "QA Engineer"
+agent = "e2e-tester"
+reports_to = "vp-qualite"
+expertise = "tests de non-régression, mesure avant/après"
+builds = true
+allow_bash = ["cargo build", "cargo test"]

@@ -5,3 +5,6 @@
 .essaim/
 .DS_Store
 *.swp
+
+# Référence locale des fonctionnalités (non publiée)
+docs/FONCTIONNALITES.md
