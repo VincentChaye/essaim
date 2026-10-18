@@ -126,6 +126,20 @@ pub fn set_after(root: &Path, id: &str, after: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Supprime une mission (son dossier entier) et la retire des prérequis des autres missions, qui ne l'attendent plus.
+pub fn delete(root: &Path, id: &str) -> Result<()> {
+    anyhow::ensure!(is_valid_id(id), "identifiant de mission invalide");
+    let dir = dir_of(root, id);
+    anyhow::ensure!(dir.is_dir(), "mission introuvable");
+    let others: Vec<(String, Vec<String>)> = list(root).into_iter().filter(|m| m.id != id && m.after.iter().any(|a| a == id)).map(|m| (m.id, m.after)).collect();
+    std::fs::remove_dir_all(&dir)?;
+    for (other, after) in others {
+        let rest: Vec<String> = after.into_iter().filter(|a| a != id).collect();
+        set_after(root, &other, &rest)?;
+    }
+    Ok(())
+}
+
 /// `id` dépend-elle (directement ou non) de `target` ?
 pub fn depends_on(all: &[Mission], id: &str, target: &str) -> bool {
     let mut stack = vec![id.to_string()];
@@ -295,11 +309,22 @@ pub struct ReportData<'a> {
     pub blocked: bool,
     pub realised: bool,
     pub tokens: u64,
+    /// Part de `tokens` lue dans le cache de prompt (0 = non mesuré).
+    pub cached: u64,
     pub steps: Vec<StepLine>,
     /// Points d'attention : (libellé, message) des appels échoués ou ignorés.
     pub issues: Vec<(String, String)>,
     /// Rapport final du boss (rapport.md, sinon plan de conception).
     pub final_report: &'a str,
+}
+
+/// « N » ou « N (dont M lus en cache) » : le cache coûte bien moins cher qu'une entrée normale.
+pub fn with_cache(tokens: u64, cached: u64, fr: bool) -> String {
+    match (cached, fr) {
+        (0, _) => tokens.to_string(),
+        (c, true) => format!("{tokens} (dont {c} lus en cache)"),
+        (c, false) => format!("{tokens} ({c} read from cache)"),
+    }
 }
 
 /// Compte rendu Markdown de fin de mission (`compte-rendu.md`), lisible dans l'onglet Entreprise.
@@ -312,7 +337,7 @@ pub fn compte_rendu(d: &ReportData, fr: bool) -> String {
         (false, _) => t("✖ terminée avec des échecs ou interrompue", "✖ finished with failures or interrupted"),
     };
     let mut s = format!("# {} — {}\n\n", t("Compte rendu", "Report"), d.title);
-    s.push_str(&format!("- **{}** : {}\n- **{}** : {}\n- **{}** : {}\n- **Tokens** : {}\n- **{}** : {}\n\n", t("Entreprise", "Company"), d.company, t("Date", "Date"), d.date, t("Résultat", "Result"), verdict, d.tokens, t("Appels", "Calls"), d.steps.len()));
+    s.push_str(&format!("- **{}** : {}\n- **{}** : {}\n- **{}** : {}\n- **Tokens** : {}\n- **{}** : {}\n\n", t("Entreprise", "Company"), d.company, t("Date", "Date"), d.date, t("Résultat", "Result"), verdict, with_cache(d.tokens, d.cached, fr), t("Appels", "Calls"), d.steps.len()));
     s.push_str(&format!("## {}\n\n", t("Ce qui a été fait", "What was done")));
     if d.final_report.trim().is_empty() {
         s.push_str(t("_Aucun rapport final n'a été produit._\n\n", "_No final report was produced._\n\n"));
@@ -347,9 +372,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn jetons_avec_part_du_cache() {
+        assert_eq!(with_cache(10, 0, true), "10");
+        assert_eq!(with_cache(10, 4, true), "10 (dont 4 lus en cache)");
+        assert_eq!(with_cache(10, 4, false), "10 (4 read from cache)");
+    }
+
+    #[test]
     fn compte_rendu_resume_la_mission() {
         let d = ReportData {
-            title: "Site", company: "Acme", date: "01/01 10:00", ok: false, blocked: false, realised: true, tokens: 1234,
+            title: "Site", company: "Acme", date: "01/01 10:00", ok: false, blocked: false, realised: true, tokens: 1234, cached: 800,
             steps: vec![StepLine { label: "CEO · reports".into(), agent: "boss".into(), status: "✔".into(), tokens: 10 }],
             issues: vec![("Dev · builds".into(), "boum\nsuite".into())],
             final_report: "Tout est fait.",
@@ -494,5 +526,24 @@ mod tests_company {
         assert_eq!(list(&root)[0].company, None);
         set_company(&dir, "a.toml").unwrap();
         assert_eq!(list(&root)[0].company.as_deref(), Some("a.toml"));
+    }
+
+    #[test]
+    fn suppression_retire_la_mission_et_les_liens_qui_pointaient_vers_elle() {
+        let root = std::env::temp_dir().join(format!("essaim-mis-{}", uuid::Uuid::new_v4()));
+        let mk = |ms: u64, t: &str| {
+            let id = new_id(ms);
+            write_output(&create(&root, &id).unwrap(), "brief.md", t).unwrap();
+            id
+        };
+        let (a, b) = (mk(1, "# A"), mk(2, "# B"));
+        set_after(&root, &b, &[a.clone()]).unwrap();
+        assert!(list(&root).iter().find(|m| m.id == b).unwrap().waiting_for.len() == 1);
+        delete(&root, &a).unwrap();
+        let left = list(&root);
+        assert_eq!(left.len(), 1);
+        assert!(left[0].after.is_empty() && left[0].waiting_for.is_empty(), "B n'attend plus une mission supprimée");
+        assert!(delete(&root, &a).is_err() && delete(&root, "../x").is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

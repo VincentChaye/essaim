@@ -1221,7 +1221,7 @@ reports_to = "ciso"
     fn rapport_tronque_les_gros_resultats() {
         let big = "x".repeat(MAX_CHILD_CHARS + 500);
         let p = report_prompt("t", &[("CTO".into(), "cto".into(), "sous-tâche".into(), true, big)]);
-        assert!(p.contains("[… truncated]"));
+        assert!(p.contains("chars omitted"));
         assert!(p.len() < MAX_CHILD_CHARS + 1500);
     }
 }

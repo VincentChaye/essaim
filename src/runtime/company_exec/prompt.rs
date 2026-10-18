@@ -2,6 +2,7 @@
 
 use super::Phase;
 use crate::model::company::Company;
+use crate::runtime::textutil::truncate_middle;
 use crate::tf;
 use crate::tui::settings::Lang;
 
@@ -13,19 +14,32 @@ pub(super) const MAX_CHILD_CHARS: usize = 6000;
 
 /// Seat card appended to the system prompt of every call. Written in English (cheaper in tokens);
 /// the user's language tells the model what to write in.
+/// Order matters for the prompt cache, which matches on the longest identical prefix: what is shared
+/// by the whole company (brief, phase, rules) comes first, what is specific to the seat comes last.
 pub(super) fn role_card(lang: Lang, c: &Company, i: usize, brief: &str, phase: Phase, kids: &[usize], scope: &[String]) -> String {
     let s = &c.seats[i];
+    let mut out = format!("Company mission (brief framed with the leader):\n{brief}\n");
+    match phase {
+        Phase::Conception => out.push_str(
+            "\nDESIGN PHASE: we think and prepare, we build NOTHING. Produce only analysis, specifications, decisions and recommendations for the mission (nothing is created or modified in the project yet; this is normal). Never report as a failure or a gap that the mission's result does not exist yet: it is set up later by the realisation team, after the plan is approved.\n",
+        ),
+        Phase::Realisation => out.push_str("\nREALISATION PHASE: the plan is approved, we now build in the project.\n"),
+    }
+    out.push_str(&format!(
+        "\nRules: be concise and actionable; stay within your seat's remit; do not repeat the brief; clearly flag what is missing or what really failed. Never claim a success you could not verify: when you cannot complete your task, say so (status blocked) with the exact cause and what is needed, instead of working around it. The user's language is {}: write everything you produce in it.\n",
+        lang.name()
+    ));
     let mut chain: Vec<String> = c.chain_of_command(i).iter().rev().map(|&p| c.seats[p].title.clone()).collect();
     chain.push(format!("{} (you)", s.title));
-    let mut out = format!(
-        "You hold the seat \"{}\" ({}) in the company \"{}\", under the identity of the agent \"{}\".\nChain of command: {}.\nCurrent phase: {}.\n",
+    out.push_str(&format!(
+        "\nYou hold the seat \"{}\" ({}) in the company \"{}\", under the identity of the agent \"{}\".\nChain of command: {}.\nCurrent phase: {}.\n",
         s.title,
         c.level(i),
         c.name,
         s.agent,
         chain.join(" → "),
         phase.name()
-    );
+    ));
     if !kids.is_empty() {
         out.push_str("Your direct subordinates (you delegate only to them):\n");
         for &k in kids {
@@ -61,17 +75,6 @@ pub(super) fn role_card(lang: Lang, c: &Company, i: usize, brief: &str, phase: P
             }
         }
     }
-    out.push_str(&format!("\nCompany mission (brief framed with the leader):\n{brief}\n"));
-    match phase {
-        Phase::Conception => out.push_str(
-            "\nDESIGN PHASE: we think and prepare, we build NOTHING. Produce only analysis, specifications, decisions and recommendations for the mission (nothing is created or modified in the project yet; this is normal). Never report as a failure or a gap that the mission's result does not exist yet: it is set up later by the realisation team, after the plan is approved.\n",
-        ),
-        Phase::Realisation => out.push_str("\nREALISATION PHASE: the plan is approved, we now build in the project.\n"),
-    }
-    out.push_str(&format!(
-        "\nRules: be concise and actionable; stay within your seat's remit; do not repeat the brief; clearly flag what is missing or what really failed. Never claim a success you could not verify: when you cannot complete your task, say so (status blocked) with the exact cause and what is needed, instead of working around it. The user's language is {}: write everything you produce in it.",
-        lang.name()
-    ));
     out
 }
 
@@ -105,10 +108,7 @@ pub(super) fn work_prompt(task: &str, phase: Phase) -> String {
 pub(super) fn report_prompt(task: &str, results: &[(String, String, String, bool, String)]) -> String {
     let mut out = format!("Original task your supervisor gave you:\n{task}\n\nResults from your subordinates:\n");
     for (title, id, sub_task, ok, text) in results {
-        let mut t = text.clone();
-        if t.chars().count() > MAX_CHILD_CHARS {
-            t = t.chars().take(MAX_CHILD_CHARS).collect::<String>() + "\n[… truncated]";
-        }
+        let t = truncate_middle(text, MAX_CHILD_CHARS);
         out.push_str(&format!(
             "\n### {title} ({id}){}\nAssigned task: {sub_task}\n{}\n",
             if *ok { "" } else { " — FAILED" },
@@ -123,10 +123,7 @@ pub(super) fn report_prompt(task: &str, results: &[(String, String, String, bool
 pub(super) fn fix_prompt(task: &str, failed: &[(String, String, String, bool, String)], scope: Option<&[String]>, decision: Option<&str>) -> String {
     let mut out = format!("Original task your supervisor gave you:\n{task}\n\nThese subordinates could NOT complete their work:\n");
     for (title, id, sub_task, _, text) in failed {
-        let mut t = text.clone();
-        if t.chars().count() > MAX_CHILD_CHARS {
-            t = t.chars().take(MAX_CHILD_CHARS).collect::<String>() + "\n[… truncated]";
-        }
+        let t = truncate_middle(text, MAX_CHILD_CHARS);
         out.push_str(&format!("\n### {title} ({id})\nAssigned task: {sub_task}\n[{t}]\n"));
     }
     out.push_str("\nYou are responsible for getting this fixed, properly. Write a short correction plan in `plan` (root cause, then the steps). Then give corrective, self-contained tasks in `assignments` to the subordinate(s) best placed to fix it: possibly a different one than who failed (e.g. the one that has the missing tool or permission, or the specialist team). If nobody in your branch can fix it (a permission or tool nobody has, a prerequisite that does not exist, a decision that is not yours), assign nothing and explain precisely in `escalate` what is needed: your supervisor will take over. Do not play the problem down.");
@@ -145,10 +142,7 @@ pub(super) fn fix_prompt(task: &str, failed: &[(String, String, String, bool, St
 pub(super) fn review_prompt(task: &str, results: &[(String, String, String, bool, String)], scope: Option<&[String]>, rounds_left: u32) -> String {
     let mut out = format!("Original task:\n{task}\n\nWhat your subordinates delivered:\n");
     for (title, id, sub_task, _, text) in results {
-        let mut t = text.clone();
-        if t.chars().count() > MAX_CHILD_CHARS {
-            t = t.chars().take(MAX_CHILD_CHARS).collect::<String>() + "\n[… truncated]";
-        }
+        let t = truncate_middle(text, MAX_CHILD_CHARS);
         out.push_str(&format!("\n### {title} ({id})\nAssigned task: {sub_task}\n{t}\n"));
     }
     out.push_str("\nYou are accountable for the result reaching the goal, as cleanly as possible. Review it against the success criteria of the brief: check it yourself with the commands you have (tests, build, git diff, grep, wc…) instead of trusting reports. Treat any subordinate statement of failure, partial result, missing deliverable or unmeasured criterion as unmet unless a later result clearly resolved it. You coordinate and verify, you never do the work yourself.\n- Goal fully reached and verified: `accepted` true, with a one-line `findings`.\n- Otherwise: `accepted` false, `findings` = exactly what is missing or wrong, and `assignments` = complementary or corrective tasks (even ones the user did not foresee) for the subordinates best placed to do them. If nobody in your branch can do it, assign nothing: `findings` explains what is needed and the user will be asked.");

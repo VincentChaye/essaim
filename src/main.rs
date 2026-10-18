@@ -233,6 +233,7 @@ fn spawn_printer(mut rx: mpsc::UnboundedReceiver<RunEvent>, auto_yes: bool, edit
             Some((l, d)) => format!("{}{l}", "  ".repeat(*d)),
             None => id.to_string(),
         };
+        let mut cached_total = 0u64;
         while let Some(ev) = rx.recv().await {
             match ev {
                 RunEvent::Label { id, label, depth, .. } => {
@@ -294,6 +295,7 @@ fn spawn_printer(mut rx: mpsc::UnboundedReceiver<RunEvent>, auto_yes: bool, edit
                 RunEvent::Node { id, event: ClaudeEvent::ToolUse { name: tool, .. } } => {
                     eprintln!("  [{}] outil {tool}", name(&labels, &id).trim())
                 }
+                RunEvent::Node { event: ClaudeEvent::Result { cached, .. }, .. } => cached_total += cached,
                 RunEvent::Node { .. } => {}
                 RunEvent::NodeFinished { id, status, tokens } => {
                     let n = name(&labels, &id);
@@ -306,7 +308,7 @@ fn spawn_printer(mut rx: mpsc::UnboundedReceiver<RunEvent>, auto_yes: bool, edit
                     }
                 }
                 RunEvent::RunFinished { ok, tokens } => {
-                    eprintln!("{} {tokens} tokens au total", if ok { "terminé —" } else { "échec —" })
+                    eprintln!("{} {} tokens au total", if ok { "terminé —" } else { "échec —" }, runtime::missions::with_cache(tokens, cached_total, true))
                 }
             }
         }

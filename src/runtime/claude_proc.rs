@@ -25,6 +25,8 @@ pub enum ClaudeEvent {
         text: String,
         is_error: bool,
         tokens: u64,
+        /// Part de `tokens` servie par le cache de prompt (`cache_read_input_tokens`).
+        cached: u64,
         duration_ms: u64,
         /// Sortie structurée (avec `--json-schema`), déjà validée par `claude`.
         structured: Option<Value>,
@@ -93,6 +95,7 @@ pub fn parse_line(line: &str) -> Result<Vec<ClaudeEvent>> {
                 .iter()
                 .map(|k| v["usage"][*k].as_u64().unwrap_or(0))
                 .sum(),
+            cached: v["usage"]["cache_read_input_tokens"].as_u64().unwrap_or(0),
             duration_ms: v["duration_ms"].as_u64().unwrap_or(0),
             structured: Some(v["structured_output"].clone()).filter(|x| !x.is_null()),
             denials: v["permission_denials"].as_array().map(|a| a.iter().map(denial_label).collect()).unwrap_or_default(),
@@ -345,6 +348,7 @@ impl ClaudeProc {
                                     ),
                                     is_error: true,
                                     tokens: 0,
+                                    cached: 0,
                                     duration_ms: 0,
                                     structured: None,
                                     denials: vec![],
@@ -461,6 +465,17 @@ mod tests {
         assert!(a.windows(2).any(|w| w == ["--json-schema", "{}"]));
         assert!(a.windows(2).any(|w| w == ["--permission-mode", "dontAsk"]));
         assert_eq!(&a[a.len() - 2..], ["--", "p"], "le prompt reste après --");
+    }
+
+    #[test]
+    fn lectures_de_cache_comptees_a_part() {
+        let l = r#"{"type":"result","is_error":false,"result":"ok","usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":20,"cache_read_input_tokens":100}}"#;
+        match &parse_line(l).unwrap()[0] {
+            ClaudeEvent::Result { tokens, cached, .. } => assert_eq!((*tokens, *cached), (135, 100)),
+            e => panic!("{e:?}"),
+        }
+        let sans = r#"{"type":"result","is_error":false,"result":"ok"}"#;
+        assert!(matches!(&parse_line(sans).unwrap()[0], ClaudeEvent::Result { cached: 0, .. }));
     }
 
     #[test]

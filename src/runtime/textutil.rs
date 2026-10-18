@@ -23,6 +23,20 @@ pub fn truncate_marked(s: &str, max: usize, marker: &str) -> String {
     if s.chars().count() <= max { s.to_string() } else { format!("{}{marker}", take_chars(s, max)) }
 }
 
+/// Garde environ deux tiers de `max` en tête et un tiers en fin, avec un marqueur au milieu qui
+/// dit combien de caractères sont omis. Le texte court est rendu tel quel. La fin compte : c'est
+/// souvent là que se trouvent les conclusions et les blocages.
+pub fn truncate_middle(s: &str, max: usize) -> String {
+    let total = s.chars().count();
+    if total <= max {
+        return s.to_string();
+    }
+    let head = max * 2 / 3;
+    let tail = max - head;
+    let tail_text: String = s.chars().skip(total - tail).collect();
+    format!("{}\n[… {} chars omitted …]\n{tail_text}", take_chars(s, head), total - head - tail)
+}
+
 /// F6 : tronque à `width` caractères, `…` final compris, si la coupe a eu lieu.
 /// Même règle que `company_view` : `width - 1` caractères puis `…`.
 #[allow(dead_code)] // retiré à l'adoption (étape 4)
@@ -53,6 +67,17 @@ mod tests {
         assert_eq!(truncate_marked("abcdef", 3, "…"), "abc…");
         assert_eq!(truncate_marked("abc", 3, "…"), "abc");
         assert_eq!(truncate_marked("éèà", 2, "!"), "éè!");
+    }
+
+    #[test]
+    fn truncate_middle_garde_debut_et_fin() {
+        assert_eq!(truncate_middle("abc", 3), "abc");
+        let s = format!("{}{}{}", "d".repeat(100), "m".repeat(100), "f".repeat(100));
+        let t = truncate_middle(&s, 30);
+        assert!(t.starts_with(&"d".repeat(20)) && t.ends_with(&"f".repeat(10)));
+        assert!(t.contains("[… 270 chars omitted …]"));
+        assert!(!t.contains("mm"));
+        assert!(truncate_middle("éèàéèàéèà", 6).starts_with("éèàé"), "coupe par caractères, pas par octets");
     }
 
     #[test]

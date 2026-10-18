@@ -1608,6 +1608,24 @@ fn session_claude_deja_ouverte_renvoie_vers_l_onglet_5() {
 }
 
 #[test]
+fn d_supprime_une_mission_apres_confirmation() {
+    let root = tmp_root();
+    let dir = crate::runtime::missions::create(&root, &crate::runtime::missions::new_id(1)).unwrap();
+    crate::runtime::missions::write_output(&dir, "brief.md", "# A jeter\nrien").unwrap();
+    let mut app = new_app(&root);
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Enter); // entre dans la zone missions
+    press(&mut app, KeyCode::Char('D'));
+    assert!(matches!(app.mode, Mode::ConfirmAction(PendingAction::DeleteMission(..))));
+    press(&mut app, KeyCode::Char('n')); // refus : rien n'est supprimé
+    assert!(dir.exists());
+    press(&mut app, KeyCode::Char('D'));
+    press(&mut app, KeyCode::Char('o'));
+    assert!(!dir.exists() && app.missions.is_empty(), "{}", app.status);
+}
+
+#[test]
 fn ouvrir_une_ancienne_mission() {
     let root = tmp_root();
     let dir = crate::runtime::missions::create(&root, &crate::runtime::missions::new_id(1)).unwrap();

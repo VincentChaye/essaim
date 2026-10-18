@@ -77,9 +77,9 @@ fn draw_missions(f: &mut Frame, area: Rect, app: &App) {
     let hint = if vis.is_empty() {
         tr(" m : cadrer ", " m: frame one ")
     } else if open {
-        tr(" ↑↓ · ← replier · r lancer · a prérequis · v réussie ", " ↑↓ · ← fold · r run · a prerequisites · v succeeded ")
+        tr(" ↑↓ · ← replier · r lancer · a prérequis · v réussie · D suppr. ", " ↑↓ · ← fold · r run · a prerequisites · v succeeded · D delete ")
     } else {
-        tr(" ↑↓ · → déplier · r lancer · a prérequis · v réussie ", " ↑↓ · → unfold · r run · a prerequisites · v succeeded ")
+        tr(" ↑↓ · → déplier · r lancer · a prérequis · v réussie · D suppr. ", " ↑↓ · → unfold · r run · a prerequisites · v succeeded · D delete ")
     };
     f.render_stateful_widget(
         List::new(items)

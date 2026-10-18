@@ -452,7 +452,7 @@ fn draw_run(f: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(Line::from(vec![
             Span::styled(format!("{} — ", run.name), Style::new().add_modifier(Modifier::BOLD)),
             Span::styled(label, Style::new().fg(color)),
-            Span::raw(tf!("   {tokens} tokens", "   {tokens} tokens")),
+            Span::raw(format!("   {} tokens", crate::runtime::missions::with_cache(tokens, run.nodes.iter().map(|n| n.cached).sum(), super::settings::current() == Lang::Fr))),
         ]))
         .block(Block::bordered().title(" Run ")),
         head,

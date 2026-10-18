@@ -374,6 +374,8 @@ pub enum PendingAction {
     DeleteAgent(String),
     /// Suppression d'un poste : (fichier de l'entreprise, id, intitulé).
     DeleteSeat(PathBuf, String, String),
+    /// Suppression d'une mission : (id, titre).
+    DeleteMission(String, String),
     /// Suppression d'une entrée d'historique : (id, nom du run).
     DeleteHistory(String, String),
     /// Annulation du run en cours : nom.
@@ -403,6 +405,7 @@ impl PendingAction {
             Self::DeleteAgent(name) => ask_delete("l'agent", "the agent", name),
             Self::DeleteSeat(_, _, title) => ask_delete("le poste", "the seat", title),
             Self::DeleteHistory(_, name) => ask_delete("le run", "the run", name),
+            Self::DeleteMission(_, title) => ask_delete("la mission", "the mission", title),
             Self::RemoveSession(_, name) => ask_delete("la session", "the session", name),
             Self::CancelRun(name) => tf!("Annuler le run « {name} » ? (o/n)", "Cancel the run \"{name}\"? (o/n)"),
             Self::QuitRun(name) => tf!("Quitter et annuler le run « {name} » ? (o/n)", "Quit and cancel the run \"{name}\"? (o/n)"),
@@ -418,6 +421,7 @@ impl PendingAction {
         match self {
             Self::DeleteAgent(_) if !users.is_empty() => Some(tf!("⚠ Postes utilisant cet agent : {}", "⚠ Seats using this agent: {}", users.join(", "))),
             Self::DeleteSeat(..) => Some(tr("Ses subordonnés remontent d'un cran.", "Its subordinates move up one level.").into()),
+            Self::DeleteMission(..) => Some(tr("Brief, plan, rapport et compte rendu sont effacés. Les missions qui l'attendaient ne l'attendent plus.", "Brief, plan, report and summary are erased. Missions that waited for it no longer do.").into()),
             Self::DeleteHistory(..) => Some(tr("L'historique du run est effacé ; les missions restent.", "The run history is erased; missions are kept.").into()),
             _ => None,
         }
@@ -440,11 +444,13 @@ pub struct NodeView {
     pub state: NodeState,
     pub log: Vec<String>,
     pub tokens: u64,
+    /// Part de `tokens` lue dans le cache de prompt.
+    pub cached: u64,
 }
 
 impl NodeView {
     pub fn new(id: &str, agent: &str) -> Self {
-        Self { id: id.into(), agent: agent.into(), label: id.into(), depth: 0, state: NodeState::Waiting, log: vec![], tokens: 0 }
+        Self { id: id.into(), agent: agent.into(), label: id.into(), depth: 0, state: NodeState::Waiting, log: vec![], tokens: 0, cached: 0 }
     }
 }
 
@@ -1382,6 +1388,7 @@ impl App {
                     KeyCode::Char('m') => self.request_mission_brief(),
                     KeyCode::Char('a') if self.zone == CompZone::Missions => self.open_link_form(),
                     KeyCode::Char('v') if self.zone == CompZone::Missions => self.toggle_done(),
+                    KeyCode::Char('D') if self.zone == CompZone::Missions => self.ask_delete_mission(),
                     KeyCode::Char('o') => self.open_mission(),
                     KeyCode::Char('r') => self.start_mission(true),
                     KeyCode::Char('R') => self.start_mission(false),
@@ -1463,6 +1470,19 @@ impl App {
     }
 
     /// Validation du plan avant la réalisation : Entrée lance, Échap arrête, flèches défilent.
+    /// `D` sur une mission : demande confirmation avant de la supprimer (jamais pendant un run).
+    fn ask_delete_mission(&mut self) {
+        if self.run.as_ref().is_some_and(|r| r.finished.is_none()) {
+            self.status = tr("un run est en cours : suppression impossible", "a run is in progress: cannot delete").into();
+            return;
+        }
+        let Some(m) = self.visible_missions().contains(&self.mission_sel).then(|| self.missions.get(self.mission_sel)).flatten() else {
+            self.status = tr("aucune mission sélectionnée", "no mission selected").into();
+            return;
+        };
+        self.mode = Mode::ConfirmAction(PendingAction::DeleteMission(m.id.clone(), m.title.clone()));
+    }
+
     /// `Entrée` / `o` : ouvre la mission sélectionnée (brief, plan, rapport) en lecture.
     fn open_mission(&mut self) {
         let Some(m) = self.visible_missions().contains(&self.mission_sel).then(|| self.missions.get(self.mission_sel)).flatten() else {
@@ -1856,6 +1876,17 @@ impl App {
                     Err(e) => self.status = erreur(&e),
                 }
             }
+            PendingAction::DeleteMission(id, title) => {
+                match missions::delete(&self.root, &id) {
+                    Ok(()) => {
+                        self.mission_open.remove(&id);
+                        self.status = tf!("mission « {title} » supprimée", "mission \"{title}\" deleted");
+                    }
+                    Err(e) => self.status = erreur(&e),
+                }
+                self.reload();
+                self.snap_mission_sel();
+            }
             PendingAction::DeleteHistory(id, _) => {
                 match store::delete(&self.root, &id) {
                     Ok(()) => self.status = tr("run supprimé de l'historique", "run removed from history").into(),
@@ -2154,6 +2185,9 @@ impl App {
             }
             RunEvent::Node { id, event } => {
                 let Some(i) = node(run, &id) else { return };
+                if let ClaudeEvent::Result { cached, .. } = &event {
+                    run.nodes[i].cached = *cached;
+                }
                 let log = &mut run.nodes[i].log;
                 match event {
                     ClaudeEvent::Text(t) => log.extend(t.lines().map(String::from)),
@@ -2222,7 +2256,7 @@ impl App {
         let title = run.name.split(" · ").nth(1).unwrap_or(&run.name).to_string();
         let date = RunRecord { id: String::new(), pipeline: String::new(), started_ms: self.run_started_ms, finished: None, tokens: 0, nodes: vec![] }.started_label();
         let md = missions::compte_rendu(
-            &missions::ReportData { title: &title, company: &company.name, date: &date, ok: *ok, blocked, realised, tokens: *tokens, steps, issues, final_report: &final_report },
+            &missions::ReportData { title: &title, company: &company.name, date: &date, ok: *ok, blocked, realised, tokens: *tokens, cached: run.nodes.iter().map(|n| n.cached).sum(), steps, issues, final_report: &final_report },
             self.lang == Lang::Fr,
         );
         let _ = missions::write_output(dir, "compte-rendu.md", &md);
@@ -2283,6 +2317,7 @@ impl App {
                     state: NodeState::Done(n.status.clone().unwrap_or(NodeStatus::Cancelled)),
                     log: n.log.clone(),
                     tokens: n.tokens,
+                    cached: 0, // non conservé dans l'historique
                 })
                 .collect(),
             sel: 0,
