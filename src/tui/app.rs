@@ -646,10 +646,10 @@ impl App {
             .collect()
     }
 
-    /// Missions de l'entreprise sélectionnée (index dans `missions`) : les siennes et celles que personne n'a encore lancées.
+    /// Missions de l'entreprise sélectionnée (index dans `missions`) : seulement celles qui lui sont rattachées.
     pub fn visible_missions(&self) -> Vec<usize> {
         let file = self.companies.get(self.comp_sel).map(|c| c.file.as_str());
-        (0..self.missions.len()).filter(|&i| self.missions[i].company.as_deref().is_none_or(|c| Some(c) == file)).collect()
+        (0..self.missions.len()).filter(|&i| file.is_some() && self.missions[i].company.as_deref() == file).collect()
     }
 
     /// Missions lancées avant le rattachement : retrouve leur entreprise via le nom du run (« entreprise · titre »).
@@ -773,6 +773,11 @@ impl App {
                 }
                 self.status = match self.missions.iter().position(|m| !before.contains(&m.id)) {
                     Some(i) => {
+                        // Rattachée dès le cadrage à l'entreprise courante, pas seulement au lancement.
+                        if let Some(file) = self.companies.get(self.comp_sel).map(|c| c.file.clone()) {
+                            let _ = missions::set_company(&self.missions[i].dir, &file);
+                            self.missions = missions::list(&self.root);
+                        }
                         self.mission_sel = i;
                         tf!("mission « {} » cadrée — r pour la lancer", "mission \"{}\" framed — r to run it", self.missions[i].title)
                     }

@@ -1062,6 +1062,7 @@ fn le_manuel_suit_la_largeur_du_terminal() {
 
 fn write_brief(root: &PathBuf, id: &str, text: &str) {
     let dir = crate::runtime::missions::create(root, id).unwrap();
+    crate::runtime::missions::set_company(&dir, "acme.toml").unwrap();
     crate::runtime::missions::write_output(&dir, "brief.md", text).unwrap();
 }
 
@@ -1153,6 +1154,24 @@ fn liste_des_missions_et_navigation() {
     assert_eq!(app.mission_sel, 0, "boucle");
     press(&mut app, KeyCode::Char('T'));
     assert_eq!(app.mission_sel, 1);
+}
+
+#[test]
+fn seules_les_missions_de_l_entreprise_selectionnee_sont_listees() {
+    use crate::runtime::missions as m;
+    let mut app = company_app();
+    write_brief(&app.root, "0000000000001-aaaa", "# Rattachée\n");
+    for (id, company) in [("0000000000002-bbbb", Some("autre.toml")), ("0000000000003-cccc", None)] {
+        let dir = m::create(&app.root, id).unwrap();
+        if let Some(c) = company {
+            m::set_company(&dir, c).unwrap();
+        }
+        m::write_output(&dir, "brief.md", "# Ailleurs\n").unwrap();
+    }
+    app.reload();
+    press(&mut app, KeyCode::Char('2'));
+    let s = screen(&app);
+    assert!(s.contains("Missions (1)") && s.contains("Rattachée") && !s.contains("Ailleurs"), "{s}");
 }
 
 #[test]
@@ -1566,6 +1585,7 @@ fn renommage_d_agent_met_a_jour_les_postes() {
 fn relance_qui_ecraserait_le_plan_demande_confirmation() {
     let root = tmp_root();
     let dir = crate::runtime::missions::create(&root, &crate::runtime::missions::new_id(1)).unwrap();
+    crate::runtime::missions::set_company(&dir, "acme.toml").unwrap();
     crate::runtime::missions::write_output(&dir, "brief.md", "# Chantier\nfaire X").unwrap();
     crate::runtime::missions::write_output(&dir, "conception.md", "plan").unwrap();
     crate::runtime::missions::write_output(&dir, "rapport.md", "fin").unwrap();
@@ -1611,7 +1631,12 @@ fn session_claude_deja_ouverte_renvoie_vers_l_onglet_5() {
 fn d_supprime_une_mission_apres_confirmation() {
     let root = tmp_root();
     let dir = crate::runtime::missions::create(&root, &crate::runtime::missions::new_id(1)).unwrap();
+    crate::runtime::missions::set_company(&dir, "acme.toml").unwrap();
     crate::runtime::missions::write_output(&dir, "brief.md", "# A jeter\nrien").unwrap();
+    write_agent(&root, "boss");
+    write_agent(&root, "poete");
+    std::fs::create_dir_all(root.join(".claude/companies")).unwrap();
+    std::fs::write(root.join(".claude/companies/acme.toml"), ACME).unwrap();
     let mut app = new_app(&root);
     press(&mut app, KeyCode::Char('2'));
     press(&mut app, KeyCode::Up);
@@ -1629,8 +1654,13 @@ fn d_supprime_une_mission_apres_confirmation() {
 fn ouvrir_une_ancienne_mission() {
     let root = tmp_root();
     let dir = crate::runtime::missions::create(&root, &crate::runtime::missions::new_id(1)).unwrap();
+    crate::runtime::missions::set_company(&dir, "acme.toml").unwrap();
     crate::runtime::missions::write_output(&dir, "brief.md", "# Vieux chantier\nfaire X").unwrap();
     crate::runtime::missions::write_output(&dir, "rapport.md", "tout est fait").unwrap();
+    write_agent(&root, "boss");
+    write_agent(&root, "poete");
+    std::fs::create_dir_all(root.join(".claude/companies")).unwrap();
+    std::fs::write(root.join(".claude/companies/acme.toml"), ACME).unwrap();
     let mut app = new_app(&root);
     press(&mut app, KeyCode::Char('2'));
     press(&mut app, KeyCode::Up);
@@ -2080,6 +2110,7 @@ fn linked_app() -> (App, String, String) {
     let (a, b) = (m::new_id(1), m::new_id(2));
     for (id, t) in [(&a, "# Stabilisation"), (&b, "# Performance")] {
         let dir = m::create(&root, id).unwrap();
+        m::set_company(&dir, "acme.toml").unwrap();
         m::write_output(&dir, "brief.md", t).unwrap();
     }
     write_agent(&root, "boss");
