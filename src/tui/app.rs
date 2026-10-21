@@ -446,11 +446,14 @@ pub struct NodeView {
     pub tokens: u64,
     /// Part de `tokens` lue dans le cache de prompt.
     pub cached: u64,
+    /// Suivi en temps réel : messages déjà soldés + message en cours (id, tokens, cache).
+    pub live: (u64, u64),
+    pub live_msg: (String, u64, u64),
 }
 
 impl NodeView {
     pub fn new(id: &str, agent: &str) -> Self {
-        Self { id: id.into(), agent: agent.into(), label: id.into(), depth: 0, state: NodeState::Waiting, log: vec![], tokens: 0, cached: 0 }
+        Self { id: id.into(), agent: agent.into(), label: id.into(), depth: 0, state: NodeState::Waiting, log: vec![], tokens: 0, cached: 0, live: (0, 0), live_msg: (String::new(), 0, 0) }
     }
 }
 
@@ -502,7 +505,16 @@ pub struct CompanyEntry {
     pub problem: Option<String>,
 }
 
+/// Dernier quota d'abonnement reçu du flux `claude` (fractions 0..1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Quota {
+    pub five_hour: Option<f64>,
+    pub seven_day: Option<f64>,
+    pub resets_at: Option<u64>,
+}
+
 pub struct App {
+    pub quota: Option<Quota>,
     pub root: PathBuf,
     pub tab: Tab,
     pub mode: Mode,
@@ -587,6 +599,7 @@ impl App {
             seat_sel: 0,
             zone: CompZone::Companies,
             zone_in: true,
+            quota: None,
             run: None,
             checkpoint: None,
             escalation: None,
@@ -2164,6 +2177,9 @@ impl App {
                 }
             }
         }
+        if let RunEvent::Node { event: ClaudeEvent::RateLimit { five_hour, seven_day, resets_at }, .. } = &ev {
+            self.quota = Some(Quota { five_hour: *five_hour, seven_day: *seven_day, resets_at: *resets_at });
+        }
         let Some(run) = &mut self.run else { return };
         let node = |run: &mut RunView, id: &str| run.nodes.iter().position(|n| n.id == id);
         match ev {
@@ -2192,6 +2208,13 @@ impl App {
                 let Some(i) = node(run, &id) else { return };
                 if let ClaudeEvent::Result { cached, .. } = &event {
                     run.nodes[i].cached = *cached;
+                }
+                if let ClaudeEvent::Usage { id, tokens, cached } = &event {
+                    let n = &mut run.nodes[i];
+                    if n.live_msg.0 != *id {
+                        n.live = (n.live.0 + n.live_msg.1, n.live.1 + n.live_msg.2);
+                    }
+                    n.live_msg = (id.clone(), *tokens, *cached);
                 }
                 let log = &mut run.nodes[i].log;
                 match event {
@@ -2323,6 +2346,8 @@ impl App {
                     log: n.log.clone(),
                     tokens: n.tokens,
                     cached: 0, // non conservé dans l'historique
+                    live: (0, 0),
+                    live_msg: (String::new(), 0, 0),
                 })
                 .collect(),
             sel: 0,

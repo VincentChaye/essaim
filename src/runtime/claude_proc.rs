@@ -33,8 +33,17 @@ pub enum ClaudeEvent {
         /// Appels d'outils refusés par les permissions (« Bash(git status) »…) : jamais passés sous silence.
         denials: Vec<String>,
     },
-    /// Ligne ignorée (rate_limit_event, etc.) ou non reconnue.
+    /// Usage d'un message `assistant` (même `id` = même message, valeurs à remplacer et non à cumuler) : suivi en temps réel.
+    Usage { id: String, tokens: u64, cached: u64 },
+    /// Quota de l'abonnement (`rate_limit_event`) : utilisation en fraction 0..1 des fenêtres 5 h et 7 j, reset en secondes epoch.
+    RateLimit { five_hour: Option<f64>, seven_day: Option<f64>, resets_at: Option<u64> },
+    /// Ligne ignorée ou non reconnue.
     Other,
+}
+
+/// Somme des quatre compteurs d'un objet `usage`.
+fn usage_tokens(u: &Value) -> u64 {
+    ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"].iter().map(|k| u[*k].as_u64().unwrap_or(0)).sum()
 }
 
 /// « Outil(entrée) » d'un refus de permission, court et lisible.
@@ -60,7 +69,14 @@ pub fn parse_line(line: &str) -> Result<Vec<ClaudeEvent>> {
         Some("assistant") => v["message"]["content"]
             .as_array()
             .map(|blocks| {
-                blocks
+                let usage = Some(&v["message"]["usage"]).filter(|u| u.is_object()).map(|u| ClaudeEvent::Usage {
+                    id: s(&v["message"]["id"]),
+                    tokens: usage_tokens(u),
+                    cached: u["cache_read_input_tokens"].as_u64().unwrap_or(0),
+                });
+                usage
+                    .into_iter()
+                    .chain(blocks
                     .iter()
                     .filter_map(|b| match b["type"].as_str() {
                         Some("text") => Some(ClaudeEvent::Text(s(&b["text"]))),
@@ -69,10 +85,18 @@ pub fn parse_line(line: &str) -> Result<Vec<ClaudeEvent>> {
                             input: b["input"].clone(),
                         }),
                         _ => None,
-                    })
+                    }))
                     .collect()
             })
             .unwrap_or_default(),
+        Some("rate_limit_event") => {
+            let w = &v["rate_limit_info"]["unifiedWindows"];
+            vec![ClaudeEvent::RateLimit {
+                five_hour: w["five_hour"]["utilization"].as_f64(),
+                seven_day: w["seven_day"]["utilization"].as_f64(),
+                resets_at: w["five_hour"]["resetsAt"].as_u64().or_else(|| v["rate_limit_info"]["resetsAt"].as_u64()),
+            }]
+        }
         Some("user") => v["message"]["content"]
             .as_array()
             .map(|blocks| {
@@ -91,10 +115,7 @@ pub fn parse_line(line: &str) -> Result<Vec<ClaudeEvent>> {
             text: s(&v["result"]),
             // Absent = échec (R2) : un résultat sans statut explicite n'est jamais compté comme un succès.
             is_error: v["is_error"].as_bool().unwrap_or(true),
-            tokens:["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"]
-                .iter()
-                .map(|k| v["usage"][*k].as_u64().unwrap_or(0))
-                .sum(),
+            tokens: usage_tokens(&v["usage"]),
             cached: v["usage"]["cache_read_input_tokens"].as_u64().unwrap_or(0),
             duration_ms: v["duration_ms"].as_u64().unwrap_or(0),
             structured: Some(v["structured_output"].clone()).filter(|x| !x.is_null()),
@@ -195,6 +216,8 @@ pub struct RunSpec {
     /// Agent principal de la session (`--agent`).
     pub agent: Option<String>,
     pub session_id: Option<String>,
+    /// `--resume` : reprend la session d'un appel précédent (contexte conservé, relu depuis le cache de prompt).
+    pub resume: Option<String>,
     /// `--tools` : liste d'outils disponibles ; `Some("")` = aucun outil.
     pub tools: Option<String>,
     /// `--allowedTools` : règles autorisées d'office (ex. `Edit(src/**)`), séparées par des virgules à l'envoi.
@@ -245,6 +268,9 @@ impl RunSpec {
         }
         if let Some(id) = &self.session_id {
             a.extend(["--session-id".into(), id.clone()]);
+        }
+        if let Some(id) = &self.resume {
+            a.extend(["--resume".into(), id.clone()]);
         }
         // `--` : le prompt ne doit jamais être pris pour une option.
         a.push("--".into());
@@ -476,6 +502,23 @@ mod tests {
         }
         let sans = r#"{"type":"result","is_error":false,"result":"ok"}"#;
         assert!(matches!(&parse_line(sans).unwrap()[0], ClaudeEvent::Result { cached: 0, .. }));
+    }
+
+    #[test]
+    fn reprise_de_session_dans_les_arguments() {
+        let a = RunSpec { prompt: "p".into(), resume: Some("sid".into()), ..Default::default() }.args();
+        assert!(a.windows(2).any(|w| w == ["--resume", "sid"]));
+        assert!(!RunSpec::default().args().iter().any(|x| x == "--resume"));
+    }
+
+    #[test]
+    fn quota_et_usage_temps_reel() {
+        let q = r#"{"type":"rate_limit_event","rate_limit_info":{"unifiedWindows":{"five_hour":{"utilization":0.04,"resetsAt":10},"seven_day":{"utilization":0.01,"resetsAt":20}}}}"#;
+        assert_eq!(parse_line(q).unwrap(), vec![ClaudeEvent::RateLimit { five_hour: Some(0.04), seven_day: Some(0.01), resets_at: Some(10) }]);
+        let a = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":3,"output_tokens":2,"cache_read_input_tokens":10}}}"#;
+        let evs = parse_line(a).unwrap();
+        assert_eq!(evs[0], ClaudeEvent::Usage { id: "m1".into(), tokens: 15, cached: 10 });
+        assert_eq!(evs[1], ClaudeEvent::Text("hi".into()));
     }
 
     #[test]

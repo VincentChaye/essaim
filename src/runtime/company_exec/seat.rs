@@ -3,7 +3,7 @@
 use super::prompt::{escalation_summary, report_prompt, work_prompt};
 use super::schema::{FixPlan, ReviewPlan};
 use super::shared::Shared;
-use super::{Assignment, Blocker, Kind, Phase, SeatOut, Status};
+use super::{Assignment, Blocker, Kind, Phase, SeatOut, Section, Status};
 use crate::runtime::executor::EscalationReply;
 use crate::runtime::scope;
 use std::future::Future;
@@ -30,8 +30,8 @@ async fn run_batch(sh: &Arc<Shared>, from: usize, phase: Phase, todo: Vec<Assign
             started[n] = true;
             let a = &todo[n];
             sh.set_hint(from, a);
-            let (sh2, to, t, s2) = (sh.clone(), a.to, a.task.clone(), a.scope.clone());
-            set.spawn(async move { (n, run_seat(sh2, to, phase, t, s2).await) });
+            let (sh2, to, t, s2, sec) = (sh.clone(), a.to, a.task.clone(), a.scope.clone(), a.sections.clone());
+            set.spawn(async move { (n, run_seat(sh2, to, phase, t, s2, sec).await) });
         }
         while let Some(joined) = set.join_next().await {
             if let Ok((n, out)) = joined {
@@ -59,13 +59,13 @@ fn result_row(sh: &Shared, a: &Assignment, out: &SeatOut) -> (String, String, St
     (s.title.clone(), s.id.clone(), a.task.clone(), out.ok(), out.for_supervisor())
 }
 
-pub(super) fn run_seat(sh: Arc<Shared>, i: usize, phase: Phase, task: String, sc: Vec<String>) -> Pin<Box<dyn Future<Output = SeatOut> + Send>> {
+pub(super) fn run_seat(sh: Arc<Shared>, i: usize, phase: Phase, task: String, sc: Vec<String>, sections: Vec<Section>) -> Pin<Box<dyn Future<Output = SeatOut> + Send>> {
     Box::pin(async move {
         let kids = sh.kids(i, phase);
 
         // Feuille : travail direct.
         if kids.is_empty() {
-            return sh.act(i, phase, Kind::Work, work_prompt(&task, phase), &kids, &sc).await.into();
+            return sh.act(i, phase, Kind::Work, work_prompt(&task, phase, &sections), &kids, &sc, &sections).await.into();
         }
 
         // Poste interne : délégation → travail des subordonnés → (correction des échecs) → rapport de synthèse.
@@ -158,7 +158,7 @@ pub(super) fn run_seat(sh: Arc<Shared>, i: usize, phase: Phase, task: String, sc
             }
         }
 
-        let rep = sh.act(i, phase, Kind::Report, report_prompt(&task, &history), &kids, &sc).await;
+        let rep = sh.act(i, phase, Kind::Report, report_prompt(&task, &history, &sections), &kids, &sc, &sections).await;
         let mut blockers: Vec<Blocker> = unresolved.iter().flat_map(|(_, _, b)| b.clone()).collect();
         if unresolved.is_empty() && rep.status == Status::Done {
             return SeatOut { status: Status::Done, text: rep.report, blockers: vec![] };

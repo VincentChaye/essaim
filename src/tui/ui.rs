@@ -19,6 +19,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         return;
     }
     let [tabs, body, help] = Layout::vertical([Constraint::Length(3), Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
+    let quota_title = app.quota.map(quota_label);
 
     let titles: Vec<Line> = Tab::ALL
         .iter()
@@ -40,6 +41,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             .block(
                 Block::bordered()
                     .title(" essaim ")
+                    .title_top(Line::from(Span::styled(quota_title.unwrap_or_default(), Style::new().fg(Color::Cyan))).centered())
                     .title_top(Line::from(Span::styled(app.lang.t(" Ctrl+K aide · F10 réglages ", " Ctrl+K help · F10 settings "), Style::new().fg(Color::Yellow))).right_aligned()),
             )
             .highlight_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -447,12 +449,15 @@ fn draw_run(f: &mut Frame, area: Rect, app: &App) {
         Some(true) => (tr("terminé ✔", "done ✔").to_string(), Color::Green),
         Some(false) => (tr("terminé avec erreurs ✖", "done with errors ✖").to_string(), Color::Red),
     };
-    let tokens: u64 = if run.finished.is_some() { run.tokens } else { run.nodes.iter().map(|n| n.tokens).sum() };
+    // En cours : le total final du nœud s'il est connu, sinon le cumul temps réel des messages reçus.
+    let live = |n: &super::app::NodeView| if n.tokens > 0 { (n.tokens, n.cached) } else { (n.live.0 + n.live_msg.1, n.live.1 + n.live_msg.2) };
+    let tokens: u64 = if run.finished.is_some() { run.tokens } else { run.nodes.iter().map(|n| live(n).0).sum() };
+    let cached: u64 = run.nodes.iter().map(|n| live(n).1).sum();
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(format!("{} — ", run.name), Style::new().add_modifier(Modifier::BOLD)),
             Span::styled(label, Style::new().fg(color)),
-            Span::raw(format!("   {} tokens", crate::runtime::missions::with_cache(tokens, run.nodes.iter().map(|n| n.cached).sum(), super::settings::current() == Lang::Fr))),
+            Span::raw(format!("   {} tokens", crate::runtime::missions::with_cache(tokens, cached, super::settings::current() == Lang::Fr))),
         ]))
         .block(Block::bordered().title(" Run ")),
         head,
@@ -590,4 +595,14 @@ fn draw_terminal(f: &mut Frame, area: Rect, app: &App) {
             banner,
         );
     }
+}
+
+/// « 5h 4 % · 7j 1 % · reset 14:20 » : jauge de l'abonnement, d'après le dernier `rate_limit_event`.
+fn quota_label(q: super::app::Quota) -> String {
+    let pct = |v: Option<f64>| v.map_or("?".to_string(), |v| format!("{:.0} %", v * 100.0));
+    let reset = q.resets_at.map(|t| {
+        let left = t.saturating_sub(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()));
+        format!(" · reset {}h{:02}", left / 3600, left % 3600 / 60)
+    });
+    format!(" {} 5h {} · 7j {}{} ", tr("abo", "plan"), pct(q.five_hour), pct(q.seven_day), reset.unwrap_or_default())
 }

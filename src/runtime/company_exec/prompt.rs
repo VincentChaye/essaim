@@ -2,6 +2,7 @@
 
 use super::Phase;
 use crate::model::company::Company;
+use super::{Question, Section};
 use crate::runtime::textutil::truncate_middle;
 use crate::tf;
 use crate::tui::settings::Lang;
@@ -91,21 +92,35 @@ pub(super) fn delegate_prompt(task: &str, phase: Phase, scope: Option<&[String]>
             sc.join("`, `")
         ));
     }
+    out.push_str(" For each subordinate also give `sections`: the answer template you want back, 2 to 6 sections (`name`, `expect` = what it must contain, `max_chars` 100 to 1000). You decide what you need, so make it match your own plan for using the answer; keep it tight.");
     out.push_str(MODEL_ADVICE);
     out.push_str(" Answer only through the structured output.");
     out
 }
 
-pub(super) fn work_prompt(task: &str, phase: Phase) -> String {
-    let end = " Answer only through the structured output: status \"done\" ONLY if the task is really complete (and verified as far as your tools allow); otherwise \"blocked\" with `blockers` (kind, exact cause, what is needed). Never report \"done\" with a known problem.";
+/// Gabarit de réponse imposé par le délégant (vide si réponse libre).
+fn sections_hint(sections: &[Section]) -> String {
+    if sections.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n\nYour supervisor wants the answer in these sections (one structured field each, hard size limit: condense, keep the substance, never pad):\n");
+    for s in sections {
+        out.push_str(&format!("- `{}` ({}, max {} chars): {}\n", s.key, s.title, s.max_chars, s.expect));
+    }
+    out
+}
+
+pub(super) fn work_prompt(task: &str, phase: Phase, sections: &[Section]) -> String {
+    let end = " Answer only through the structured output: status \"done\" ONLY if the task is really complete (and verified as far as your tools allow), with every section filled; otherwise \"blocked\" with `blockers` (kind, exact cause, what is needed). Never report \"done\" with a known problem. If you lack information or a decision that only your supervisor can give, do not guess: answer with status \"question\" and one short `question` (kind, text, optional options); you will be resumed with the answer.";
+    let (sec, rep) = (sections_hint(sections), if sections.is_empty() { "`report`" } else { "the sections" });
     match phase {
-        Phase::Conception => format!("Task:\n{task}\n\nProduce your deliverable as text (analysis, specification, recommendations) in `report`. You do not have to modify the project; use \"blocked\" only if you cannot produce your analysis (missing access or information).{end}"),
-        Phase::Realisation => format!("Task:\n{task}\n\nCarry it out in the project, only within your scope, verify it with the commands you are allowed (tests, build), then summarize precisely what you did in `report`.\n\nIf a tool or command is refused, a test fails or a prerequisite is missing: first fix what is within your scope; if you cannot, STOP and report it as blocked. Do not silently work around it and do not continue as if it worked.{end}"),
+        Phase::Conception => format!("Task:\n{task}{sec}\n\nProduce your deliverable as text (analysis, specification, recommendations) in {rep}. You do not have to modify the project; use \"blocked\" only if you cannot produce your analysis (missing access or information).{end}"),
+        Phase::Realisation => format!("Task:\n{task}{sec}\n\nCarry it out in the project, only within your scope, verify it with the commands you are allowed (tests, build), then summarize precisely what you did in {rep}.\n\nIf a tool or command is refused, a test fails or a prerequisite is missing: first fix what is within your scope; if you cannot, STOP and report it as blocked. Do not silently work around it and do not continue as if it worked.{end}"),
     }
 }
 
 /// `results`: (title, id, assigned task, success, text).
-pub(super) fn report_prompt(task: &str, results: &[(String, String, String, bool, String)]) -> String {
+pub(super) fn report_prompt(task: &str, results: &[(String, String, String, bool, String)], sections: &[Section]) -> String {
     let mut out = format!("Original task your supervisor gave you:\n{task}\n\nResults from your subordinates:\n");
     for (title, id, sub_task, ok, text) in results {
         let t = truncate_middle(text, MAX_CHILD_CHARS);
@@ -115,6 +130,7 @@ pub(super) fn report_prompt(task: &str, results: &[(String, String, String, bool
             if *ok { t } else { format!("[FAILED: {t}]") }
         ));
     }
+    out.push_str(&sections_hint(sections));
     out.push_str("\nWrite your summary report for your supervisor: conclusions, decisions, points of attention, missing elements. Explicitly mention any FAILURE and its impact. Answer through the structured output: status \"done\" only if every part of the task is really complete and verified (a subordinate's problem that was fixed in a later result counts as resolved); otherwise \"blocked\" with the remaining `blockers`.");
     out
 }
@@ -166,5 +182,15 @@ pub(super) fn escalation_summary(problems: &[(String, String)], reason: Option<&
     if let Some(r) = reason.filter(|r| !r.trim().is_empty()) {
         out.push_str(&format!("\n\n{}\n{}", tf!("Raison de la remontée :", "Why it was escalated:"), r.trim()));
     }
+    out
+}
+
+/// Prompt d'un supérieur à qui un subordonné pose une question : réponse courte ou aveu d'ignorance.
+pub(super) fn answer_prompt(who: &str, task_prompt: &str, q: &Question) -> String {
+    let mut out = format!("Your subordinate \"{who}\" is working on this task and asks you a question.\n\nTheir task:\n{}\n\nQuestion ({}): {}\n", truncate_middle(task_prompt, 1500), q.kind, q.text);
+    if !q.options.is_empty() {
+        out.push_str(&format!("Options they suggest: {}\n", q.options.join(" | ")));
+    }
+    out.push_str("\nAnswer in a few lines, decisively: you may read the project to check. If the answer is not yours to give (it needs your own supervisor or the user), set `can_answer` false. Answer only through the structured output.");
     out
 }

@@ -44,6 +44,8 @@ enum Kind {
     Fix,
     /// Revue du résultat par le CEO : vérification contre l'objectif, éventuelle redescente.
     Review,
+    /// Réponse d'un supérieur à la question d'un subordonné en cours de tâche.
+    Answer,
 }
 
 impl Kind {
@@ -54,6 +56,7 @@ impl Kind {
             Kind::Report => "report",
             Kind::Fix => "fix",
             Kind::Review => "review",
+            Kind::Answer => "answer",
         }
     }
 }
@@ -96,9 +99,49 @@ pub struct MissionOutcome {
     pub calls: u32,
 }
 
+/// Section du gabarit de réponse imposé par le délégant : un champ du schéma de l'employé, de taille bornée.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Section {
+    /// Clé du champ dans la sortie structurée (alphanumérique, unique dans le gabarit).
+    pub key: String,
+    pub title: String,
+    /// Ce que la section doit contenir.
+    pub expect: String,
+    pub max_chars: usize,
+}
+
+pub const MAX_SECTIONS: usize = 6;
+pub const MIN_SECTION_CHARS: usize = 60;
+pub const MAX_SECTION_CHARS: usize = 1000;
+
+impl Section {
+    /// Gabarit nettoyé : au plus `MAX_SECTIONS` sections, tailles bornées, clés uniques. Entrées vides ignorées.
+    pub fn template(raw: impl IntoIterator<Item = (String, String, Option<u64>)>) -> Vec<Section> {
+        let mut out: Vec<Section> = vec![];
+        for (title, expect, max) in raw {
+            let title: String = title.trim().chars().take(60).collect();
+            if title.is_empty() || out.len() >= MAX_SECTIONS {
+                continue;
+            }
+            let mut key: String = title.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).take(40).collect();
+            if key.trim_matches('_').is_empty() {
+                key = format!("section_{}", out.len() + 1);
+            }
+            while out.iter().any(|s| s.key == key) {
+                key.push('_');
+            }
+            let max_chars = (max.unwrap_or(MAX_SECTION_CHARS as u64) as usize).clamp(MIN_SECTION_CHARS, MAX_SECTION_CHARS);
+            out.push(Section { key, title, expect: expect.trim().chars().take(200).collect(), max_chars });
+        }
+        out
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Assignment {
     pub to: usize,
+    /// Gabarit de réponse voulu par le délégant (vide = rapport libre).
+    pub sections: Vec<Section>,
     pub task: String,
     /// Périmètre de fichiers (phase de réalisation uniquement).
     pub scope: Vec<String>,
@@ -131,18 +174,31 @@ pub enum Status {
     Failed,
 }
 
+/// Questions qu'un employé peut poser à son supérieur pendant une même tâche (au-delà : il finit ou se déclare bloqué).
+const MAX_QUESTIONS: u32 = 2;
+
+/// Question cadrée d'un employé à son supérieur (sortie structurée, courte).
+#[derive(Debug, Clone, PartialEq)]
+struct Question {
+    kind: String,
+    text: String,
+    options: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 struct Outcome {
     status: Status,
     report: String,
     blockers: Vec<Blocker>,
+    /// L'employé attend une réponse avant de continuer (statut `Blocked` si personne ne peut le reprendre).
+    question: Option<Question>,
 }
 
 impl Outcome {
     fn failed(msg: impl Into<String>) -> Self {
         let msg = msg.into();
         let detail = msg.lines().next().unwrap_or("").trim().to_string();
-        Outcome { status: Status::Failed, blockers: vec![Blocker { kind: "other".into(), detail, needs: String::new() }], report: msg }
+        Outcome { status: Status::Failed, blockers: vec![Blocker { kind: "other".into(), detail, needs: String::new() }], report: msg, question: None }
     }
 }
 
@@ -278,6 +334,10 @@ reports_to = "ciso"
         review_unmet: bool,
         /// (poste délégant, destinataire, modèle) : le délégant choisit le modèle de ce destinataire.
         models: Vec<(&'static str, &'static str, &'static str)>,
+        /// Ces appels posent une question à leur premier passage (session annoncée), puis finissent à la reprise.
+        ask: Vec<&'static str>,
+        /// Le supérieur répond « je ne sais pas » aux questions.
+        boss_cannot_answer: bool,
     }
 
     fn enum_ids(schema: &str) -> Vec<String> {
@@ -311,6 +371,18 @@ reports_to = "ciso"
                     let parts: Vec<&str> = job.id.split('/').collect();
                     (parts[0].to_string(), parts[2].to_string())
                 };
+                if kind.starts_with("answer") {
+                    let a = if b.boss_cannot_answer { json!({"can_answer": false, "answer": ""}) } else { json!({"can_answer": true, "answer": "snake_case"}) };
+                    return Ok(NodeResult { structured: Some(a), output: "{}".into(), ..Default::default() });
+                }
+                if kind.starts_with("work#") {
+                    let o = json!({"status": "done", "report": format!("reprise({seat})")});
+                    return Ok(NodeResult { structured: Some(o), output: "ok".into(), session_id: Some("sid-1".into()), ..Default::default() });
+                }
+                if kind == "work" && b.ask.contains(&job.id.as_str()) {
+                    let q = json!({"status": "question", "question": {"kind": "decision", "text": "snake_case ou camelCase ?", "options": ["snake_case", "camelCase"]}});
+                    return Ok(NodeResult { structured: Some(q), output: "q".into(), session_id: Some("sid-1".into()), ..Default::default() });
+                }
                 if b.fail.contains(&job.id.as_str()) {
                     return Ok(NodeResult { output: "boum".into(), is_error: true, ..Default::default() });
                 }
@@ -490,6 +562,25 @@ reports_to = "ciso"
     }
 
     /// Un verrou du coût empoisonné par une panique ailleurs reste utilisable (pas de panic en chaîne).
+    #[test]
+    fn gabarit_de_reponse_schema_et_lecture() {
+        let secs = Section::template([
+            ("Risques".to_string(), "les 3 principaux".to_string(), Some(5000)),
+            ("Risques".to_string(), "doublon".to_string(), Some(1)),
+            ("".to_string(), "ignorée".to_string(), None),
+        ]);
+        assert_eq!(secs.len(), 2);
+        assert_ne!(secs[0].key, secs[1].key, "clés uniques");
+        assert_eq!((secs[0].max_chars, secs[1].max_chars), (MAX_SECTION_CHARS, MIN_SECTION_CHARS), "tailles bornées");
+        let v: serde_json::Value = serde_json::from_str(&schema::outcome_schema(&secs, false)).unwrap();
+        assert!(v["properties"]["report"].is_null() && v["properties"]["sections"]["properties"][&secs[0].key]["maxLength"] == 1000);
+        assert_eq!(v["required"], json!(["status", "sections"]));
+        let r = NodeResult { structured: Some(json!({"status": "done", "sections": {secs[0].key.clone(): "r1"}})), ..Default::default() };
+        let o = parse_outcome(&r, &secs).unwrap();
+        assert_eq!(o.report, "### Risques\nr1\n\n### Risques\n—", "ordre du gabarit, section vide visible");
+        assert!(Section::template((0..10).map(|i| (format!("s{i}"), String::new(), None))).len() <= MAX_SECTIONS);
+    }
+
     #[test]
     fn compteur_de_cout_reste_utilisable_apres_empoisonnement() {
         let cost = Arc::new(Mutex::new(5u64));
@@ -1020,6 +1111,37 @@ reports_to = "ciso"
     // ----------------------------------------------------------- blocages : correction et escalade
 
     #[tokio::test]
+    async fn question_de_l_employe_reponse_du_chef_puis_reprise() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { ask: vec!["dev1/conception/work"], ..Default::default() };
+        let (out, _) = run(&company(), p.clone(), b, false).await;
+        assert!(out.ok, "{:?}", out.conception.blockers);
+        let started = p.started.lock().unwrap().clone();
+        assert_eq!(started.iter().filter(|id| id.starts_with("mgr/conception/answer")).count(), 1, "le manager répond");
+        assert!(started.iter().any(|id| id.starts_with("dev1/conception/work#")), "l'employé est repris");
+        let specs = p.specs.lock().unwrap();
+        let resumed = specs.iter().find(|(id, _)| id.starts_with("dev1/conception/work#")).unwrap();
+        assert_eq!(resumed.1.resume.as_deref(), Some("sid-1"));
+        assert!(resumed.1.prompt.contains("snake_case"), "la réponse est transmise");
+        let ans = specs.iter().find(|(id, _)| id.starts_with("mgr/conception/answer")).unwrap();
+        assert!(ans.1.prompt.contains("snake_case ou camelCase") && ans.1.json_schema.as_deref().unwrap().contains("can_answer"));
+        let first = &specs.iter().find(|(id, _)| id == "dev1/conception/work").unwrap().1;
+        assert!(first.json_schema.as_deref().unwrap().contains("\"question\""), "la question est permise à la première passe");
+        let rep = &p.prompts.lock().unwrap().iter().find(|(id, _, _)| id == "mgr/conception/report").unwrap().1.clone();
+        assert!(rep.contains("reprise(dev1)"), "le rapport vient de la reprise : {rep}");
+    }
+
+    #[tokio::test]
+    async fn question_sans_reponse_possible_devient_un_blocage() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { ask: vec!["dev1/conception/work"], boss_cannot_answer: true, ..Default::default() };
+        let (out, evs) = run(&company(), p.clone(), b, false).await;
+        assert!(!out.ok);
+        assert!(!p.started.lock().unwrap().iter().any(|id| id.starts_with("dev1/conception/work#")), "pas de reprise sans réponse");
+        assert!(evs.iter().any(|e| matches!(e, RunEvent::NodeFinished { id, status: NodeStatus::Blocked(m), .. } if id == "dev1/conception/work" && m.contains("snake_case ou camelCase"))));
+    }
+
+    #[tokio::test]
     async fn blocage_corrige_par_le_manager_la_phase_reussit() {
         let p = Arc::new(Probe::default());
         let b = Behavior { blocked_once: vec!["dev1/conception/work"], fix_assign: vec!["mgr"], ..Default::default() };
@@ -1136,14 +1258,14 @@ reports_to = "ciso"
     #[test]
     fn sortie_sans_statut_ou_refus_jamais_un_succes() {
         let r = |structured: Option<Value>, denials: Vec<String>| NodeResult { structured, denials, output: "txt".into(), ..Default::default() };
-        assert!(parse_outcome(&r(None, vec![])).is_none(), "sortie structurée absente");
-        assert!(parse_outcome(&r(Some(json!({"status": "oups", "report": "x"})), vec![])).is_none());
-        let o = parse_outcome(&r(Some(json!({"status": "done", "report": "ok"})), vec!["Bash(git push)".into()])).unwrap();
+        assert!(parse_outcome(&r(None, vec![]), &[]).is_none(), "sortie structurée absente");
+        assert!(parse_outcome(&r(Some(json!({"status": "oups", "report": "x"})), vec![]), &[]).is_none());
+        let o = parse_outcome(&r(Some(json!({"status": "done", "report": "ok"})), vec!["Bash(git push)".into()]), &[]).unwrap();
         assert_eq!(o.status, Status::Blocked);
         assert_eq!(o.blockers[0].kind, "permission");
-        let o = parse_outcome(&r(Some(json!({"status": "blocked", "report": "KO"})), vec![])).unwrap();
+        let o = parse_outcome(&r(Some(json!({"status": "blocked", "report": "KO"})), vec![]), &[]).unwrap();
         assert_eq!(o.blockers.len(), 1, "un blocage est toujours expliqué");
-        assert_eq!(parse_outcome(&NodeResult { is_error: true, output: "boum".into(), ..Default::default() }).unwrap().status, Status::Failed);
+        assert_eq!(parse_outcome(&NodeResult { is_error: true, output: "boum".into(), ..Default::default() }, &[]).unwrap().status, Status::Failed);
     }
 
     // ----------------------------------------------------------- briques pures
@@ -1220,7 +1342,7 @@ reports_to = "ciso"
     #[test]
     fn rapport_tronque_les_gros_resultats() {
         let big = "x".repeat(MAX_CHILD_CHARS + 500);
-        let p = report_prompt("t", &[("CTO".into(), "cto".into(), "sous-tâche".into(), true, big)]);
+        let p = report_prompt("t", &[("CTO".into(), "cto".into(), "sous-tâche".into(), true, big)], &[]);
         assert!(p.contains("chars omitted"));
         assert!(p.len() < MAX_CHILD_CHARS + 1500);
     }

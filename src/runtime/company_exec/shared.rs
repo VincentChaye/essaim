@@ -1,8 +1,8 @@
 //! État partagé d'une phase (`Shared`) et appels vers `claude` : un poste, un appel, un plafond, un coût.
 
-use super::prompt::{delegate_prompt, fix_prompt, review_prompt, role_card};
-use super::schema::{FixPlan, ReviewPlan, delegation_schema, fix_schema, node_status, outcome_schema, parse_assignments, parse_fix, parse_outcome, parse_review, review_schema};
-use super::{Assignment, CompanyOptions, Kind, Outcome, Phase};
+use super::prompt::{answer_prompt, delegate_prompt, fix_prompt, review_prompt, role_card};
+use super::schema::{FixPlan, ReviewPlan, answer_schema, delegation_schema, fix_schema, node_status, outcome_schema, parse_answer, parse_assignments, parse_fix, parse_outcome, parse_review, review_schema};
+use super::{Assignment, CompanyOptions, Kind, MAX_QUESTIONS, Outcome, Phase, Section};
 use crate::model::agent::AgentDef;
 use crate::model::company::Company;
 use crate::runtime::claude_proc::{ClaudeEvent, RunSpec};
@@ -106,7 +106,7 @@ impl Shared {
                 permission_mode = Some("dontAsk".to_string());
             }
             // Supérieur qui rapporte, corrige ou revoit : il lit et vérifie (commandes de lecture / de test), il n'écrit jamais.
-            (Kind::Report | Kind::Fix | Kind::Review, _) if !kids.is_empty() => {
+            (Kind::Report | Kind::Fix | Kind::Review | Kind::Answer, _) if !kids.is_empty() => {
                 tools = "Read,Grep,Glob,Bash".into();
                 allowed = vec!["Read".into(), "Grep".into(), "Glob".into()];
                 allowed.extend(self.company.verify_commands(i).iter().map(|c| format!("Bash({}:*)", c.trim())));
@@ -149,7 +149,7 @@ impl Shared {
     }
 
     /// Un appel `claude` : plafond d'appels, parallélisme borné, événements, coût.
-    async fn call(self: &Arc<Self>, i: usize, phase: Phase, kind: Kind, prompt: String, schema: Option<String>, kids: &[usize], sc: &[String]) -> Result<NodeResult> {
+    async fn call(self: &Arc<Self>, i: usize, phase: Phase, kind: Kind, prompt: String, schema: Option<String>, kids: &[usize], sc: &[String], sections: &[Section], resume: Option<String>) -> Result<NodeResult> {
         if self.cancelled() {
             bail!("cancelled");
         }
@@ -158,14 +158,17 @@ impl Shared {
             bail!("call cap reached (max_calls = {})", self.company.max_calls);
         }
         let seat = &self.company.seats[i];
-        let id = format!("{}/{}/{}", seat.id, phase.key(), kind.key());
+        // Un appel de reprise ou de réponse est un nœud à part (sinon il écraserait le coût affiché du premier).
+        let id = if resume.is_some() || kind == Kind::Answer { format!("{}/{}/{}#{n}", seat.id, phase.key(), kind.key()) } else { format!("{}/{}/{}", seat.id, phase.key(), kind.key()) };
         let verb = match (kind, phase) {
+            (Kind::Work, _) if resume.is_some() => "resumes",
             (Kind::Delegate, _) => "delegates",
             (Kind::Work, Phase::Conception) => "analyses",
             (Kind::Work, Phase::Realisation) => "builds",
             (Kind::Report, _) => "reports",
             (Kind::Fix, _) => "fixes",
             (Kind::Review, _) => "reviews",
+            (Kind::Answer, _) => "answers",
         };
         emit(&self.tx, RunEvent::Label {
             id: id.clone(),
@@ -178,7 +181,8 @@ impl Shared {
             agent: seat.agent.clone(),
             depth: self.company.depth(i),
         });
-        let spec = self.spec(i, phase, kind, prompt, schema, kids, sc)?;
+        let mut spec = self.spec(i, phase, kind, prompt, schema, kids, sc)?;
+        spec.resume = resume;
         let _permit = self.sem.acquire().await?;
         if self.cancelled() {
             bail!("cancelled");
@@ -198,7 +202,7 @@ impl Shared {
         let _ = fwd.await;
 
         let (status, used) = match &res {
-            Ok(r) => (node_status(kind, r), r.tokens),
+            Ok(r) => (node_status(kind, r, sections), r.tokens),
             Err(_) if self.cancelled() => (NodeStatus::Cancelled, 0),
             Err(e) => (NodeStatus::Failed(e.to_string()), 0),
         };
@@ -214,7 +218,7 @@ impl Shared {
         let parent_scope = real.then_some(sc);
         let mut last = anyhow::anyhow!("delegation impossible");
         for _ in 0..2 {
-            let r = self.call(i, phase, Kind::Delegate, delegate_prompt(task, phase, parent_scope), Some(delegation_schema(&ids, real)), kids, sc).await;
+            let r = self.call(i, phase, Kind::Delegate, delegate_prompt(task, phase, parent_scope), Some(delegation_schema(&ids, real)), kids, sc, &[], None).await;
             match r {
                 Ok(res) if !res.is_error => match res.structured.as_ref().map(|v| parse_assignments(v, &self.company, kids, parent_scope)) {
                     Some(Ok(a)) => return Ok(a),
@@ -229,18 +233,44 @@ impl Shared {
     }
 
     /// Appel de travail ou de rapport : sortie structurée obligatoire, un nouvel essai si elle manque.
-    pub(super) async fn act(self: &Arc<Self>, i: usize, phase: Phase, kind: Kind, prompt: String, kids: &[usize], sc: &[String]) -> Outcome {
-        for _ in 0..2 {
-            match self.call(i, phase, kind, prompt.clone(), Some(outcome_schema()), kids, sc).await {
+    /// Un employé (Kind::Work) peut poser jusqu'à `MAX_QUESTIONS` questions cadrées : son supérieur répond (appel court,
+    /// schéma borné) puis l'employé reprend sa session (`--resume`) là où il s'était arrêté.
+    pub(super) async fn act(self: &Arc<Self>, i: usize, phase: Phase, kind: Kind, prompt: String, kids: &[usize], sc: &[String], sections: &[Section]) -> Outcome {
+        let (mut asks, mut tries) = (if kind == Kind::Work { MAX_QUESTIONS } else { 0 }, 0);
+        let (first, mut prompt, mut resume) = (prompt.clone(), prompt, None::<String>);
+        while tries < 2 {
+            match self.call(i, phase, kind, prompt.clone(), Some(outcome_schema(sections, asks > 0)), kids, sc, sections, resume.clone()).await {
                 Ok(r) => {
-                    if let Some(o) = parse_outcome(&r) {
+                    let Some(o) = parse_outcome(&r, sections) else {
+                        tries += 1;
+                        continue;
+                    };
+                    let (Some(q), Some(sid)) = (&o.question, &r.session_id) else { return o };
+                    if asks == 0 {
                         return o;
+                    }
+                    asks -= 1;
+                    match self.answer_question(i, phase, &first, q).await {
+                        Some(a) => {
+                            prompt = format!("Answer from your supervisor: {a}\n\nContinue and finish your task.");
+                            resume = Some(sid.clone());
+                        }
+                        None => return o, // personne ne peut répondre : la question remonte comme un blocage
                     }
                 }
                 Err(e) => return Outcome::failed(e.to_string()),
             }
         }
         Outcome::failed("structured result missing")
+    }
+
+    /// Le supérieur direct de `i` répond à la question de `i`. `None` : pas de supérieur, appel en échec ou « je ne sais pas ».
+    async fn answer_question(self: &Arc<Self>, i: usize, phase: Phase, task_prompt: &str, q: &super::Question) -> Option<String> {
+        let boss = self.company.parent(i)?;
+        let kids = self.kids(boss, phase);
+        let who = self.company.seats[i].title.clone();
+        let r = self.call(boss, phase, Kind::Answer, answer_prompt(&who, task_prompt, q), Some(answer_schema()), &kids, &[], &[], None).await.ok()?;
+        parse_answer(&r)
     }
 
     /// Plan de correction du poste `i` pour les subordonnés en échec ; remonte si personne ne peut corriger.
@@ -250,7 +280,7 @@ impl Shared {
         let real = phase == Phase::Realisation;
         let parent_scope = real.then_some(sc);
         for _ in 0..2 {
-            match self.call(i, phase, Kind::Fix, fix_prompt(task, failed, parent_scope, decision), Some(fix_schema(&ids, real)), kids, sc).await {
+            match self.call(i, phase, Kind::Fix, fix_prompt(task, failed, parent_scope, decision), Some(fix_schema(&ids, real)), kids, sc, &[], None).await {
                 Ok(res) if !res.is_error => {
                     if let Some(v) = &res.structured {
                         return parse_fix(v, &self.company, kids, parent_scope);
@@ -271,7 +301,7 @@ impl Shared {
         let real = phase == Phase::Realisation;
         let parent_scope = real.then_some(sc);
         for _ in 0..2 {
-            match self.call(i, phase, Kind::Review, review_prompt(task, results, parent_scope, rounds_left), Some(review_schema(&ids, real)), kids, sc).await {
+            match self.call(i, phase, Kind::Review, review_prompt(task, results, parent_scope, rounds_left), Some(review_schema(&ids, real)), kids, sc, &[], None).await {
                 Ok(res) if !res.is_error => {
                     if let Some(v) = &res.structured {
                         return parse_review(v, &self.company, kids, parent_scope);

@@ -61,6 +61,8 @@ pub struct NodeResult {
     pub structured: Option<serde_json::Value>,
     /// Appels refusés par les permissions pendant ce nœud.
     pub denials: Vec<String>,
+    /// Session `claude` de l'appel (pour la reprise `--resume`) ; absente si le flux ne l'a pas annoncée.
+    pub session_id: Option<String>,
 }
 
 /// Exécute un nœud. Injectable pour tester l'ordonnancement sans lancer `claude`.
@@ -109,8 +111,11 @@ pub async fn run_local(
         tokio::select! {
             ev = crx.recv() => match ev {
                 Some(ev) => {
+                    if let ClaudeEvent::Init { session_id, .. } = &ev {
+                        res.session_id = Some(session_id.clone()).filter(|s| !s.is_empty());
+                    }
                     if let ClaudeEvent::Result { text, is_error, tokens, structured, denials, .. } = &ev {
-                        res = NodeResult { output: text.clone(), tokens: *tokens, is_error: *is_error, structured: structured.clone(), denials: denials.clone() };
+                        res = NodeResult { output: text.clone(), tokens: *tokens, is_error: *is_error, structured: structured.clone(), denials: denials.clone(), session_id: res.session_id.take() };
                     }
                     let _ = tx.send(ev);
                 }

@@ -45,7 +45,7 @@ pub(super) async fn run_phase(
         hints: Mutex::new(Default::default()),
     });
     let root_scope = if phase == Phase::Realisation { vec!["**".to_string()] } else { vec![] };
-    let out = run_seat(sh.clone(), root, phase, root_task.to_string(), root_scope).await;
+    let out = run_seat(sh.clone(), root, phase, root_task.to_string(), root_scope, vec![]).await;
     let cost = *cost_guard(&sh.cost);
     let used = sh.calls.load(Ordering::SeqCst).min(company.max_calls).saturating_sub(before);
     let ok = out.ok();
