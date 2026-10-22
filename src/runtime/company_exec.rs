@@ -174,14 +174,16 @@ pub enum Status {
     Failed,
 }
 
-/// Questions qu'un employé peut poser à son supérieur pendant une même tâche (au-delà : il finit ou se déclare bloqué).
-const MAX_QUESTIONS: u32 = 2;
+/// Interruptions (questions ou demandes de commande shell) qu'un employé peut faire pendant une même tâche (au-delà : il finit ou se déclare bloqué).
+const MAX_QUESTIONS: u32 = 3;
 
 /// Question cadrée d'un employé à son supérieur (sortie structurée, courte).
 #[derive(Debug, Clone, PartialEq)]
 struct Question {
     kind: String,
     text: String,
+    /// Commande shell exacte demandée (kind = permission).
+    command: String,
     options: Vec<String>,
 }
 
@@ -338,6 +340,12 @@ reports_to = "ciso"
         ask: Vec<&'static str>,
         /// Le supérieur répond « je ne sais pas » aux questions.
         boss_cannot_answer: bool,
+        /// (appel, commande) : l'employé demande cette commande shell (kind permission) à son premier passage.
+        ask_perm: Vec<(&'static str, &'static str)>,
+        /// Ces appels subissent un refus « Bash(git status) » mais annoncent leur session (la reprise est possible).
+        deny_session: Vec<&'static str>,
+        /// (supérieur, décision) sur les demandes de commande : approve par défaut.
+        perm: Vec<(&'static str, &'static str)>,
     }
 
     fn enum_ids(schema: &str) -> Vec<String> {
@@ -371,6 +379,10 @@ reports_to = "ciso"
                     let parts: Vec<&str> = job.id.split('/').collect();
                     (parts[0].to_string(), parts[2].to_string())
                 };
+                if kind.starts_with("answer") && job.spec.json_schema.as_deref().is_some_and(|x| x.contains("\"decision\"")) {
+                    let d = b.perm.iter().find(|(s, _)| *s == seat).map(|(_, d)| *d).unwrap_or("approve");
+                    return Ok(NodeResult { structured: Some(json!({"decision": d, "reason": "r"})), output: "{}".into(), ..Default::default() });
+                }
                 if kind.starts_with("answer") {
                     let a = if b.boss_cannot_answer { json!({"can_answer": false, "answer": ""}) } else { json!({"can_answer": true, "answer": "snake_case"}) };
                     return Ok(NodeResult { structured: Some(a), output: "{}".into(), ..Default::default() });
@@ -378,6 +390,14 @@ reports_to = "ciso"
                 if kind.starts_with("work#") {
                     let o = json!({"status": "done", "report": format!("reprise({seat})")});
                     return Ok(NodeResult { structured: Some(o), output: "ok".into(), session_id: Some("sid-1".into()), ..Default::default() });
+                }
+                if let (true, Some((_, cmd))) = (kind == "work", b.ask_perm.iter().find(|(id, _)| *id == job.id)) {
+                    let q = json!({"status": "question", "question": {"kind": "permission", "text": "besoin d'une commande", "command": cmd}});
+                    return Ok(NodeResult { structured: Some(q), output: "q".into(), session_id: Some("sid-1".into()), ..Default::default() });
+                }
+                if kind == "work" && b.deny_session.contains(&job.id.as_str()) {
+                    let o = json!({"status": "done", "report": "fait"});
+                    return Ok(NodeResult { structured: Some(o), output: "ok".into(), denials: vec!["Bash(rm -rf cache)".into()], session_id: Some("sid-1".into()), ..Default::default() });
                 }
                 if kind == "work" && b.ask.contains(&job.id.as_str()) {
                     let q = json!({"status": "question", "question": {"kind": "decision", "text": "snake_case ou camelCase ?", "options": ["snake_case", "camelCase"]}});
@@ -1109,6 +1129,58 @@ reports_to = "ciso"
     }
 
     // ----------------------------------------------------------- blocages : correction et escalade
+
+    fn resumed_spec(p: &Probe, seat_id: &str) -> Option<RunSpec> {
+        p.specs.lock().unwrap().iter().find(|(id, _)| id.starts_with(&format!("{seat_id}/conception/work#"))).map(|(_, s)| s.clone())
+    }
+
+    #[tokio::test]
+    async fn commande_sure_demandee_est_accordee_durablement() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { ask_perm: vec![("dev1/conception/work", "cargo clippy --all-targets")], ..Default::default() };
+        let (out, _) = run(&company(), p.clone(), b, false).await;
+        assert!(out.ok, "{:?}", out.conception.blockers);
+        let s = resumed_spec(&p, "dev1").expect("reprise");
+        assert!(s.allowed_tools.iter().any(|r| r == "Bash(cargo clippy --all-targets:*)"), "{:?}", s.allowed_tools);
+        assert!(s.tools.as_deref().unwrap().contains("Bash") && s.permission_mode.as_deref() == Some("dontAsk"));
+        assert!(p.started.lock().unwrap().iter().any(|id| id.starts_with("mgr/conception/answer")), "le n+1 décide");
+    }
+
+    #[tokio::test]
+    async fn commande_a_risque_usage_unique_et_refus_par_defaut() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { deny_session: vec!["dev1/conception/work"], ..Default::default() };
+        let (out, _) = run(&company(), p.clone(), b, false).await;
+        assert!(out.ok, "{:?}", out.conception.blockers);
+        let s = resumed_spec(&p, "dev1").expect("reprise");
+        assert!(s.allowed_tools.iter().any(|r| r == "Bash(rm -rf cache)"), "règle exacte, sans :* : {:?}", s.allowed_tools);
+        assert!(!s.allowed_tools.iter().any(|r| r.contains(":*") && r.contains("rm")), "jamais de préfixe permanent");
+        assert!(p.prompts.lock().unwrap().iter().any(|(id, pr, _)| id.starts_with("mgr/conception/answer") && pr.contains("ONE single run")), "le supérieur sait que c'est à usage unique");
+
+        // Refusé par le n+1 : pas de reprise, le blocage de permission remonte.
+        let p2 = Arc::new(Probe::default());
+        let b2 = Behavior { deny_session: vec!["dev1/conception/work"], perm: vec![("mgr", "deny")], ..Default::default() };
+        let (out2, evs) = run(&company(), p2.clone(), b2, false).await;
+        assert!(!out2.ok && resumed_spec(&p2, "dev1").is_none());
+        assert!(evs.iter().any(|e| matches!(e, RunEvent::NodeFinished { id, status: NodeStatus::Blocked(m), .. } if id == "dev1/conception/work" && m.contains("rm -rf cache"))));
+    }
+
+    #[tokio::test]
+    async fn demande_remontee_jusqu_au_ceo() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { ask_perm: vec![("dev1/conception/work", "cargo test")], perm: vec![("mgr", "escalate"), ("cto", "escalate"), ("ceo", "approve")], ..Default::default() };
+        let (out, _) = run(&company(), p.clone(), b, false).await;
+        assert!(out.ok);
+        let started = p.started.lock().unwrap().clone();
+        for boss in ["mgr", "cto", "ceo"] {
+            assert!(started.iter().any(|id| id.starts_with(&format!("{boss}/conception/answer"))), "{boss} consulté : {started:?}");
+        }
+        // Le CEO est l'autorité finale : un « escalate » de sa part vaut refus.
+        let p2 = Arc::new(Probe::default());
+        let b2 = Behavior { ask_perm: vec![("dev1/conception/work", "cargo test")], perm: vec![("mgr", "escalate"), ("cto", "escalate"), ("ceo", "escalate")], ..Default::default() };
+        let (out2, _) = run(&company(), p2.clone(), b2, false).await;
+        assert!(!out2.ok && resumed_spec(&p2, "dev1").is_none());
+    }
 
     #[tokio::test]
     async fn question_de_l_employe_reponse_du_chef_puis_reprise() {

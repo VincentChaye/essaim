@@ -22,6 +22,7 @@ pub(super) fn outcome_schema(sections: &[Section], ask: bool) -> String {
             "properties": {
                 "kind": {"type": "string", "enum": ["missing_info", "decision", "permission", "ambiguity"]},
                 "text": {"type": "string", "maxLength": QUESTION_CHARS},
+                "command": {"type": "string", "maxLength": COMMAND_CHARS},
                 "options": {"type": "array", "items": {"type": "string", "maxLength": 60}}
             },
             "required": ["kind", "text"]
@@ -43,6 +44,7 @@ pub(super) fn outcome_schema(sections: &[Section], ask: bool) -> String {
 
 /// Taille maximale d'une question d'employé et d'une réponse de supérieur.
 pub(super) const QUESTION_CHARS: usize = 150;
+pub(super) const COMMAND_CHARS: usize = 120;
 pub(super) const ANSWER_CHARS: usize = 300;
 
 /// Schéma de la réponse d'un supérieur : une réponse courte, ou l'aveu qu'il ne peut pas répondre.
@@ -56,6 +58,35 @@ pub(super) fn answer_schema() -> String {
         "required": ["can_answer", "answer"]
     })
     .to_string()
+}
+
+/// Décision d'un supérieur sur une demande de commande shell : accepter, refuser, ou renvoyer plus haut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Decision {
+    Approve,
+    Deny,
+    Escalate,
+}
+
+pub(super) fn permission_schema() -> String {
+    json!({
+        "type": "object",
+        "properties": {
+            "decision": {"type": "string", "enum": ["approve", "deny", "escalate"]},
+            "reason": {"type": "string", "maxLength": 150}
+        },
+        "required": ["decision", "reason"]
+    })
+    .to_string()
+}
+
+/// Sortie absente ou illisible = refus : on n'autorise jamais par défaut.
+pub(super) fn parse_decision(r: &NodeResult) -> Decision {
+    match r.structured.as_ref().filter(|_| !r.is_error).and_then(|v| v["decision"].as_str()) {
+        Some("approve") => Decision::Approve,
+        Some("escalate") => Decision::Escalate,
+        _ => Decision::Deny,
+    }
 }
 
 /// Réponse retenue : `None` si le supérieur ne peut pas répondre (la question devient un blocage remonté).
@@ -105,6 +136,7 @@ pub(super) fn parse_outcome(r: &NodeResult, sections: &[Section]) -> Option<Outc
     let question = (v["status"] == "question").then(|| Question {
         kind: v["question"]["kind"].as_str().unwrap_or("ambiguity").to_string(),
         text: v["question"]["text"].as_str().unwrap_or_default().trim().to_string(),
+        command: v["question"]["command"].as_str().unwrap_or_default().trim().to_string(),
         options: v["question"]["options"].as_array().into_iter().flatten().filter_map(|o| o.as_str()).map(|o| o.trim().to_string()).filter(|o| !o.is_empty()).take(4).collect(),
     });
     let text = |x: &Value| x.as_str().unwrap_or_default().trim().to_string();

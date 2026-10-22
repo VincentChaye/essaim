@@ -43,6 +43,7 @@ pub(super) async fn run_phase(
         calls,
         cost: Mutex::new(0),
         hints: Mutex::new(Default::default()),
+        grants: Mutex::new(Default::default()),
     });
     let root_scope = if phase == Phase::Realisation { vec!["**".to_string()] } else { vec![] };
     let out = run_seat(sh.clone(), root, phase, root_task.to_string(), root_scope, vec![]).await;

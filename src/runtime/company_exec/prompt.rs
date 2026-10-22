@@ -111,7 +111,7 @@ fn sections_hint(sections: &[Section]) -> String {
 }
 
 pub(super) fn work_prompt(task: &str, phase: Phase, sections: &[Section]) -> String {
-    let end = " Answer only through the structured output: status \"done\" ONLY if the task is really complete (and verified as far as your tools allow), with every section filled; otherwise \"blocked\" with `blockers` (kind, exact cause, what is needed). Never report \"done\" with a known problem. If you lack information or a decision that only your supervisor can give, do not guess: answer with status \"question\" and one short `question` (kind, text, optional options); you will be resumed with the answer.";
+    let end = " Answer only through the structured output: status \"done\" ONLY if the task is really complete (and verified as far as your tools allow), with every section filled; otherwise \"blocked\" with `blockers` (kind, exact cause, what is needed). Never report \"done\" with a known problem. If you lack information or a decision that only your supervisor can give, do not guess: answer with status \"question\" and one short `question` (kind, text, optional options); you will be resumed with the answer. If you need a shell command you are not allowed to run, use kind \"permission\" with the exact `command`: your supervisor decides, and a command that modifies the system is allowed for one single use only, never to be repeated or varied without asking again.";
     let (sec, rep) = (sections_hint(sections), if sections.is_empty() { "`report`" } else { "the sections" });
     match phase {
         Phase::Conception => format!("Task:\n{task}{sec}\n\nProduce your deliverable as text (analysis, specification, recommendations) in {rep}. You do not have to modify the project; use \"blocked\" only if you cannot produce your analysis (missing access or information).{end}"),
@@ -192,5 +192,18 @@ pub(super) fn answer_prompt(who: &str, task_prompt: &str, q: &Question) -> Strin
         out.push_str(&format!("Options they suggest: {}\n", q.options.join(" | ")));
     }
     out.push_str("\nAnswer in a few lines, decisively: you may read the project to check. If the answer is not yours to give (it needs your own supervisor or the user), set `can_answer` false. Answer only through the structured output.");
+    out
+}
+
+/// Demande de commande shell d'un subordonné : le supérieur accepte, refuse, ou renvoie à son propre supérieur.
+pub(super) fn permission_prompt(who: &str, task_prompt: &str, cmd: &str, risky: bool, can_escalate: bool) -> String {
+    let mut out = format!("Your subordinate \"{who}\" asks permission to run this shell command:\n\n    {cmd}\n\nTheir task:\n{}\n\n", truncate_middle(task_prompt, 1500));
+    if risky {
+        out.push_str("This command can MODIFY the system (files, history, processes, network or installs). If you approve, it is allowed for ONE single run of exactly this command; any other or repeated use will ask you again. Approve only if the task really needs it, there is no read-only way to get the same result, and you have checked what it touches.");
+    } else {
+        out.push_str("This command only reads, tests or builds. If you approve, they may run it (and variants of it) for the rest of the mission.");
+    }
+    out.push_str(if can_escalate { " Deny if it is unnecessary or unsafe. Use `escalate` only if the decision is not yours to take." } else { " You are the final authority: decide approve or deny." });
+    out.push_str(" Answer only through the structured output.");
     out
 }

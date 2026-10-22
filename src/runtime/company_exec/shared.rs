@@ -1,12 +1,13 @@
 //! État partagé d'une phase (`Shared`) et appels vers `claude` : un poste, un appel, un plafond, un coût.
 
-use super::prompt::{answer_prompt, delegate_prompt, fix_prompt, review_prompt, role_card};
-use super::schema::{FixPlan, ReviewPlan, answer_schema, delegation_schema, fix_schema, node_status, outcome_schema, parse_answer, parse_assignments, parse_fix, parse_outcome, parse_review, review_schema};
+use super::prompt::{answer_prompt, delegate_prompt, fix_prompt, permission_prompt, review_prompt, role_card};
+use super::schema::{Decision, FixPlan, ReviewPlan, answer_schema, parse_decision, permission_schema, delegation_schema, fix_schema, node_status, outcome_schema, parse_answer, parse_assignments, parse_fix, parse_outcome, parse_review, review_schema};
 use super::{Assignment, CompanyOptions, Kind, MAX_QUESTIONS, Outcome, Phase, Section};
 use crate::model::agent::AgentDef;
 use crate::model::company::Company;
 use crate::runtime::claude_proc::{ClaudeEvent, RunSpec};
 use crate::runtime::executor::{EscalationReply, NodeJob, NodeResult, NodeStatus, RunEvent, Runner, cancelled};
+use crate::runtime::bashrisk::is_risky;
 use crate::runtime::{missions, scope};
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
@@ -29,6 +30,19 @@ pub(super) fn emit(tx: &mpsc::UnboundedSender<RunEvent>, ev: RunEvent) {
 /// Nom du sous-agent léger d'un poste dont `helpers` est défini.
 pub(super) const HELPER: &str = "essaim-assistant";
 
+/// Reprise d'une session `claude` ; `allow` : règles accordées pour CE seul appel (commandes à risque approuvées une fois).
+#[derive(Debug, Clone)]
+pub(super) struct Resume {
+    pub(super) session: String,
+    pub(super) allow: Vec<String>,
+}
+
+/// Commandes shell refusées par les permissions, lues dans les libellés « Bash(cmd) ». Un libellé tronqué est écarté
+/// (on n'autorise jamais une commande qu'on ne connaît pas en entier).
+fn denied_bash(denials: &[String]) -> Vec<String> {
+    denials.iter().filter_map(|d| d.strip_prefix("Bash(")?.strip_suffix(')')).filter(|c| c.chars().count() < 80).map(String::from).collect()
+}
+
 pub(super) struct Shared {
     pub(super) company: Company,
     pub(super) agents: Vec<AgentDef>,
@@ -43,6 +57,8 @@ pub(super) struct Shared {
     pub(super) cost: Mutex<u64>,
     /// Modèle choisi par les délégants : pour une feuille son propre modèle, sinon le défaut des feuilles de sa branche.
     pub(super) hints: Mutex<BTreeMap<usize, String>>,
+    /// Règles Bash accordées durablement (commandes sûres) à un poste par son supérieur, pour la durée de la mission.
+    pub(super) grants: Mutex<BTreeMap<usize, Vec<String>>>,
 }
 
 impl Shared {
@@ -78,7 +94,7 @@ impl Shared {
         *self.cancel.borrow()
     }
 
-    fn spec(&self, i: usize, phase: Phase, kind: Kind, prompt: String, schema: Option<String>, kids: &[usize], sc: &[String]) -> Result<RunSpec> {
+    fn spec(&self, i: usize, phase: Phase, kind: Kind, prompt: String, schema: Option<String>, kids: &[usize], sc: &[String], extra_allow: &[String]) -> Result<RunSpec> {
         let seat = &self.company.seats[i];
         let mut agent = self.agents.iter().find(|a| a.name == seat.agent).cloned().ok_or_else(|| anyhow::anyhow!("agent « {} » introuvable", seat.agent))?;
         if seat.model.is_some() {
@@ -101,7 +117,8 @@ impl Shared {
                 allowed.extend(scope::write_rules(sc));
                 if !seat.allow_bash.is_empty() {
                     tools.push_str(",Bash");
-                    allowed.extend(seat.allow_bash.iter().map(|c| format!("Bash({}:*)", c.trim())));
+                    // Une commande qui modifie le système n'est jamais permanente : elle repasse par le supérieur à chaque usage.
+                    allowed.extend(seat.allow_bash.iter().filter(|c| !is_risky(c)).map(|c| format!("Bash({}:*)", c.trim())));
                 }
                 permission_mode = Some("dontAsk".to_string());
             }
@@ -113,6 +130,21 @@ impl Shared {
                 permission_mode = Some("dontAsk".to_string());
             }
             _ => {}
+        }
+        // Autorisations accordées par le supérieur : durables (commandes sûres) puis celles de cet appel seul.
+        let mut extra: Vec<String> = self.grants.lock().unwrap_or_else(PoisonError::into_inner).get(&i).cloned().unwrap_or_default();
+        extra.extend(extra_allow.iter().cloned());
+        if kind == Kind::Work && !extra.is_empty() {
+            if !tools.split(',').any(|t| t == "Bash") {
+                tools.push_str(if tools.is_empty() { "Bash" } else { ",Bash" });
+            }
+            for r in ["Read", "Grep", "Glob"] {
+                if !allowed.iter().any(|a| a == r) {
+                    allowed.push(r.into());
+                }
+            }
+            allowed.extend(extra);
+            permission_mode = Some("dontAsk".to_string());
         }
         // Assistants légers (modèle moindre) : tâches mécaniques sans décision. Ils n'écrivent jamais ;
         // ils ne reçoivent le shell que si le poste l'a (un sous-agent ne dépasse pas les outils de son parent).
@@ -149,7 +181,7 @@ impl Shared {
     }
 
     /// Un appel `claude` : plafond d'appels, parallélisme borné, événements, coût.
-    async fn call(self: &Arc<Self>, i: usize, phase: Phase, kind: Kind, prompt: String, schema: Option<String>, kids: &[usize], sc: &[String], sections: &[Section], resume: Option<String>) -> Result<NodeResult> {
+    async fn call(self: &Arc<Self>, i: usize, phase: Phase, kind: Kind, prompt: String, schema: Option<String>, kids: &[usize], sc: &[String], sections: &[Section], resume: Option<Resume>) -> Result<NodeResult> {
         if self.cancelled() {
             bail!("cancelled");
         }
@@ -181,8 +213,9 @@ impl Shared {
             agent: seat.agent.clone(),
             depth: self.company.depth(i),
         });
-        let mut spec = self.spec(i, phase, kind, prompt, schema, kids, sc)?;
-        spec.resume = resume;
+        let extra = resume.as_ref().map(|r| r.allow.clone()).unwrap_or_default();
+        let mut spec = self.spec(i, phase, kind, prompt, schema, kids, sc, &extra)?;
+        spec.resume = resume.map(|r| r.session);
         let _permit = self.sem.acquire().await?;
         if self.cancelled() {
             bail!("cancelled");
@@ -233,11 +266,12 @@ impl Shared {
     }
 
     /// Appel de travail ou de rapport : sortie structurée obligatoire, un nouvel essai si elle manque.
-    /// Un employé (Kind::Work) peut poser jusqu'à `MAX_QUESTIONS` questions cadrées : son supérieur répond (appel court,
-    /// schéma borné) puis l'employé reprend sa session (`--resume`) là où il s'était arrêté.
+    /// Un employé (Kind::Work) peut interrompre sa tâche `MAX_QUESTIONS` fois, soit pour une question cadrée, soit pour
+    /// une commande shell qu'il n'a pas le droit de lancer (refus de permission ou demande explicite). Son supérieur
+    /// répond (appel court, schéma borné) puis l'employé reprend sa session (`--resume`) là où il s'était arrêté.
     pub(super) async fn act(self: &Arc<Self>, i: usize, phase: Phase, kind: Kind, prompt: String, kids: &[usize], sc: &[String], sections: &[Section]) -> Outcome {
         let (mut asks, mut tries) = (if kind == Kind::Work { MAX_QUESTIONS } else { 0 }, 0);
-        let (first, mut prompt, mut resume) = (prompt.clone(), prompt, None::<String>);
+        let (first, mut prompt, mut resume) = (prompt.clone(), prompt, None::<Resume>);
         while tries < 2 {
             match self.call(i, phase, kind, prompt.clone(), Some(outcome_schema(sections, asks > 0)), kids, sc, sections, resume.clone()).await {
                 Ok(r) => {
@@ -245,15 +279,29 @@ impl Shared {
                         tries += 1;
                         continue;
                     };
-                    let (Some(q), Some(sid)) = (&o.question, &r.session_id) else { return o };
-                    if asks == 0 {
-                        return o;
+                    let Some(sid) = r.session_id.clone().filter(|_| asks > 0) else { return o };
+                    // Commandes shell voulues : demande explicite, puis refus subis pendant l'appel.
+                    let mut wanted: Vec<String> = o.question.iter().filter(|q| q.kind == "permission" && !q.command.is_empty()).map(|q| q.command.clone()).collect();
+                    wanted.extend(denied_bash(&r.denials));
+                    wanted.dedup();
+                    wanted.truncate(3);
+                    if !wanted.is_empty() {
+                        asks -= 1;
+                        let (approved, once) = self.authorize_all(i, phase, &first, &wanted).await;
+                        if approved.is_empty() {
+                            return o; // refusé : le blocage remonte par le circuit ordinaire
+                        }
+                        let (what, risky) = (approved.join("; "), if once.is_empty() { "" } else { " Commands that modify the system were approved for this single run only: if you need them again, ask again." });
+                        prompt = format!("Your supervisor approved: {what}.{risky} Run only what you need and finish your task.");
+                        resume = Some(Resume { session: sid, allow: once });
+                        continue;
                     }
+                    let Some(q) = &o.question else { return o };
                     asks -= 1;
                     match self.answer_question(i, phase, &first, q).await {
                         Some(a) => {
                             prompt = format!("Answer from your supervisor: {a}\n\nContinue and finish your task.");
-                            resume = Some(sid.clone());
+                            resume = Some(Resume { session: sid, allow: vec![] });
                         }
                         None => return o, // personne ne peut répondre : la question remonte comme un blocage
                     }
@@ -262,6 +310,44 @@ impl Shared {
             }
         }
         Outcome::failed("structured result missing")
+    }
+
+    /// Soumet chaque commande à la chaîne hiérarchique. Renvoie les commandes approuvées et les règles à usage unique
+    /// (commandes à risque) ; les commandes sûres sont accordées au poste pour le reste de la mission.
+    async fn authorize_all(self: &Arc<Self>, i: usize, phase: Phase, task_prompt: &str, cmds: &[String]) -> (Vec<String>, Vec<String>) {
+        let (mut approved, mut once) = (vec![], vec![]);
+        for cmd in cmds {
+            // Une règle `Bash(...)` ne peut pas porter de parenthèses : on ne devine pas, la demande reste refusée.
+            if cmd.contains(['(', ')']) || !self.authorize(i, phase, task_prompt, cmd).await {
+                continue;
+            }
+            if is_risky(cmd) {
+                once.push(format!("Bash({cmd})"));
+            } else {
+                self.grants.lock().unwrap_or_else(PoisonError::into_inner).entry(i).or_default().push(format!("Bash({cmd}:*)"));
+            }
+            approved.push(cmd.clone());
+        }
+        (approved, once)
+    }
+
+    /// Le supérieur direct décide ; s'il renvoie plus haut, son propre supérieur, jusqu'au CEO qui tranche. Absent ou
+    /// illisible = refus.
+    async fn authorize(self: &Arc<Self>, i: usize, phase: Phase, task_prompt: &str, cmd: &str) -> bool {
+        let who = self.company.seats[i].title.clone();
+        let risky = is_risky(cmd);
+        let mut cur = self.company.parent(i);
+        while let Some(boss) = cur {
+            let up = self.company.parent(boss);
+            let kids = self.kids(boss, phase);
+            let r = self.call(boss, phase, Kind::Answer, permission_prompt(&who, task_prompt, cmd, risky, up.is_some()), Some(permission_schema()), &kids, &[], &[], None).await;
+            match r.map(|r| parse_decision(&r)) {
+                Ok(Decision::Approve) => return true,
+                Ok(Decision::Escalate) => cur = up,
+                _ => return false,
+            }
+        }
+        false
     }
 
     /// Le supérieur direct de `i` répond à la question de `i`. `None` : pas de supérieur, appel en échec ou « je ne sais pas ».

@@ -1,3 +1,4 @@
+pub mod bashrisk;
 pub mod claude_proc;
 pub mod company_exec;
 pub mod executor;
