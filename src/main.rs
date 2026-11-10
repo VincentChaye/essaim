@@ -4,10 +4,11 @@ mod tui;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use model::{agent, company::Company};
+use model::{ConfigDirs, agent, company, company::Company};
 use runtime::claude_proc::ClaudeEvent;
 use runtime::company_exec::{CompanyOptions, note_refus, run_mission};
 use runtime::missions;
+use runtime::pause;
 use runtime::executor::{EscalationReply, NodeStatus, RunEvent, claude_runner};
 use std::path::PathBuf;
 use tokio::sync::{mpsc, watch};
@@ -21,7 +22,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Crée des agents et une entreprise d'exemple dans le dossier courant (sans écraser).
+    /// Crée des agents et une entreprise d'exemple (sans écraser). Par défaut dans `~/.claude`,
+    /// donc visibles depuis tous vos dossiers ; `--root <projet>` les crée dans ce projet seul.
     Init {
         #[arg(long)]
         root: Option<PathBuf>,
@@ -33,6 +35,20 @@ enum Cmd {
     },
     /// Liste les agents disponibles.
     Agents {
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// Ouvre le tableau de bord de consommation dans le navigateur : jetons dans le temps, par session,
+    /// par dossier, par modèle et par poste, plus les terminaux `claude` ouverts. Page servie sur la
+    /// boucle locale uniquement, avec une clé dans l'URL.
+    #[command(visible_alias = "usage")]
+    Conso {
+        /// Port d'écoute sur 127.0.0.1 ; par défaut 8787, puis le port suivant s'il est pris.
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Affiche seulement l'URL, sans ouvrir le navigateur.
+        #[arg(long)]
+        no_open: bool,
         #[arg(long)]
         root: Option<PathBuf>,
     },
@@ -183,6 +199,7 @@ struct PlanEdit {
     company: Company,
     agents: Vec<agent::AgentDef>,
     root: PathBuf,
+    dirs: ConfigDirs,
     mission_dir: PathBuf,
     lang: tui::settings::Lang,
 }
@@ -215,7 +232,17 @@ impl PlanEdit {
         let seat = &self.company.seats[boss];
         let prompt = self.agents.iter().find(|a| a.name == seat.agent).map(|a| a.prompt.clone()).unwrap_or_default();
         let rel = |name: &str| self.mission_dir.strip_prefix(&self.root).unwrap_or(&self.mission_dir).join(name).display().to_string();
-        let args = tui::assistant::escalation_args(self.lang, &self.company.name, &seat.title, &prompt, &self.company.outline(), &rel("brief.md"), &rel(missions::RESOLUTION_FILE), blockage);
+        let args = tui::assistant::escalation_args(
+            self.lang,
+            &self.company.name,
+            &seat.title,
+            &prompt,
+            &self.company.outline(),
+            &rel("brief.md"),
+            &rel(missions::RESOLUTION_FILE),
+            blockage,
+            &tui::assistant::Dirs::of(&self.dirs),
+        );
         eprintln!("\n── discussion avec le boss : /exit pour revenir au blocage ──");
         match runtime::claude_proc::claude_command().args(&args).current_dir(&self.root).status().await {
             Ok(st) if st.success() => {}
@@ -225,16 +252,20 @@ impl PlanEdit {
     }
 }
 
-/// Affiche l'avancement d'un run sur stderr (libellés hiérarchiques inclus).
-fn spawn_printer(mut rx: mpsc::UnboundedReceiver<RunEvent>, auto_yes: bool, edit: Option<PlanEdit>) -> tokio::task::JoinHandle<()> {
+/// Affiche l'avancement d'un run sur stderr (libellés hiérarchiques inclus). `live` suit le run pour le
+/// tableau de bord : `essaim conso` montre l'organigramme et les jetons pendant la mission, même lancée ici.
+fn spawn_printer(mut rx: mpsc::UnboundedReceiver<RunEvent>, auto_yes: bool, edit: Option<PlanEdit>, mut live: Option<runtime::live::Tracker>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut labels: std::collections::HashMap<String, (String, usize)> = Default::default();
         let name = |labels: &std::collections::HashMap<String, (String, usize)>, id: &str| match labels.get(id) {
             Some((l, d)) => format!("{}{l}", "  ".repeat(*d)),
             None => id.to_string(),
         };
-        let mut cached_total = 0u64;
+        let (mut cached_total, mut volume_total) = (0u64, 0u64);
         while let Some(ev) = rx.recv().await {
+            if let Some(t) = &mut live {
+                t.on_event(&ev);
+            }
             match ev {
                 RunEvent::Label { id, label, depth, .. } => {
                     labels.insert(id, (label, depth));
@@ -295,7 +326,10 @@ fn spawn_printer(mut rx: mpsc::UnboundedReceiver<RunEvent>, auto_yes: bool, edit
                 RunEvent::Node { id, event: ClaudeEvent::ToolUse { name: tool, .. } } => {
                     eprintln!("  [{}] outil {tool}", name(&labels, &id).trim())
                 }
-                RunEvent::Node { event: ClaudeEvent::Result { cached, .. }, .. } => cached_total += cached,
+                RunEvent::Node { event: ClaudeEvent::Result { volume, cached, .. }, .. } => {
+                    volume_total += volume;
+                    cached_total += cached;
+                }
                 RunEvent::Node { .. } => {}
                 RunEvent::NodeFinished { id, status, tokens } => {
                     let n = name(&labels, &id);
@@ -307,8 +341,16 @@ fn spawn_printer(mut rx: mpsc::UnboundedReceiver<RunEvent>, auto_yes: bool, edit
                         NodeStatus::Cancelled => eprintln!("✖ {n} : annulé"),
                     }
                 }
+                RunEvent::Paused { why, resets_at } => match why {
+                    pause::Why::Limit => eprintln!(
+                        "⏸ limite de l'abonnement atteinte — run en pause, reprise automatique {} (Ctrl+C pour arrêter : la mission se reprendra plus tard)",
+                        pause::reset_label(resets_at, true)
+                    ),
+                    pause::Why::User => eprintln!("⏸ run en pause"),
+                },
+                RunEvent::Resumed => eprintln!("▶ reprise du run"),
                 RunEvent::RunFinished { ok, tokens } => {
-                    eprintln!("{} {} tokens au total", if ok { "terminé —" } else { "échec —" }, runtime::missions::with_cache(tokens, cached_total, true))
+                    eprintln!("{} {} tokens au total", if ok { "terminé —" } else { "échec —" }, runtime::missions::with_cache(tokens, volume_total, cached_total, true))
                 }
             }
         }
@@ -320,9 +362,13 @@ async fn main() -> Result<()> {
     match Cli::parse().cmd {
         None => tui::run(std::env::current_dir()?).await,
         Some(Cmd::Init { root }) => {
-            let root = root.unwrap_or(std::env::current_dir()?);
+            // Sans `--root` : dossier de l'utilisateur, pour que les exemples suivent partout.
+            let base = match &root {
+                Some(r) => r.join(".claude"),
+                None => model::user_claude_dir().context("dossier personnel introuvable : précisez --root <projet>")?,
+            };
             for (path, content) in EXAMPLES {
-                let path = root.join(path);
+                let path = base.join(path.strip_prefix(".claude/").unwrap_or(path));
                 if path.exists() {
                     println!("existe déjà : {}", path.display());
                     continue;
@@ -331,13 +377,16 @@ async fn main() -> Result<()> {
                 std::fs::write(&path, content)?;
                 println!("créé : {}", path.display());
             }
+            if root.is_none() {
+                println!("\nCes agents et cette entreprise sont à vous : essaim les retrouve depuis n'importe quel dossier.");
+            }
             println!("\nLancez `essaim` : onglet Entreprise (organigramme d'exemple).");
             Ok(())
         }
         Some(Cmd::Company { cmd }) => {
             match cmd {
                 CompanyCmd::Show { file } => {
-                    let c = Company::load(&file)?;
+                    let c = Company::load(&company::resolve(&ConfigDirs::new(std::env::current_dir()?), &file)?)?;
                     let e = c.estimate_calls();
                     println!(
                         "{} — {} poste(s) · max {} appels · parallélisme {} · point de contrôle : {}",
@@ -354,8 +403,9 @@ async fn main() -> Result<()> {
                 }
                 CompanyCmd::Run { file, brief, mission, yes, resume, root } => {
                     let root = root.unwrap_or(std::env::current_dir()?).canonicalize().context("racine introuvable")?;
-                    let company = Company::load(&file)?;
-                    let agents = agent::load_all(&root);
+                    let dirs = ConfigDirs::new(&root);
+                    let company = Company::load(&company::resolve(&dirs, &file)?)?;
+                    let agents = agent::load_all(&dirs);
                     let names: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
                     company.validate(&names)?;
                     // Brief : mission existante, ou nouveau dossier de mission créé à partir du texte.
@@ -402,10 +452,21 @@ async fn main() -> Result<()> {
                     });
                     let mission_dir = missions::dir_of(&root, &mission_id);
                     let lang = crate::tui::settings::path().map(|p| crate::tui::settings::load(&p)).and_then(|s| s.lang).unwrap_or_default();
-                    let edit = PlanEdit { company: company.clone(), agents: agents.clone(), root: root.clone(), mission_dir: mission_dir.clone(), lang };
-                    let printer = spawn_printer(rx, yes, Some(edit));
-                    let opts = CompanyOptions { base_dir: root, mission_dir: Some(mission_dir.clone()), lang, resume };
-                    let out = run_mission(&company, &agents, &brief_text, &opts, claude_runner(), tx, cancel_rx).await?;
+                    let edit = PlanEdit { company: company.clone(), agents: agents.clone(), root: root.clone(), dirs: dirs.clone(), mission_dir: mission_dir.clone(), lang };
+                    let run_id = runtime::store::new_id(runtime::store::now_ms());
+                    let titre = missions::list(&root).into_iter().find(|m| m.id == mission_id).map(|m| m.title).unwrap_or_default();
+                    let live = runtime::live::Tracker::new(&root, &run_id, &company, &titre, runtime::store::now_ms());
+                    let printer = spawn_printer(rx, yes, Some(edit), Some(live));
+                    // Mission laissée en pause par la limite : la porte repart fermée, le run attend l'heure de reprise.
+                    let gate = match missions::read_pause(&mission_dir) {
+                        Some(p) if p.resets_at.is_none_or(|t| t > pause::now_s()) => {
+                            eprintln!("⏸ mission en pause (limite de l'abonnement) — reprise {}", pause::reset_label(p.resets_at, true));
+                            pause::Gate::closed(pause::Why::Limit, p.resets_at)
+                        }
+                        _ => pause::Gate::new(),
+                    };
+                    let opts = CompanyOptions { base_dir: root, mission_dir: Some(mission_dir.clone()), lang, resume, pause: gate };
+                    let out = run_mission(&company, &agents, &brief_text, &opts, claude_runner(std::time::Duration::from_secs(company.node_timeout_s)), tx, cancel_rx).await?;
                     printer.await?;
                     if let Some(note) = note_refus(out.approved) {
                         eprintln!("{note}");
@@ -430,9 +491,9 @@ async fn main() -> Result<()> {
                     }
                 }
                 CompanyCmd::Check { file, root } => {
-                    let root = root.unwrap_or(std::env::current_dir()?);
-                    let c = Company::load(&file)?;
-                    let names: Vec<String> = agent::load_all(&root).into_iter().map(|a| a.name).collect();
+                    let dirs = ConfigDirs::new(root.unwrap_or(std::env::current_dir()?));
+                    let c = Company::load(&company::resolve(&dirs, &file)?)?;
+                    let names: Vec<String> = agent::load_all(&dirs).into_iter().map(|a| a.name).collect();
                     c.validate(&names)?;
                     let e = c.estimate_calls();
                     println!("✔ {} : {} poste(s), valide — jusqu'à {} appel(s) par mission", c.name, c.seats.len(), e.total());
@@ -443,10 +504,27 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Some(Cmd::Agents { root }) => {
+        Some(Cmd::Conso { port, no_open, root }) => {
             let root = root.unwrap_or(std::env::current_dir()?);
-            for a in agent::load_all(&root) {
-                println!("{:<24} {}", a.name, a.description);
+            let lang = tui::settings::path().map(|p| tui::settings::load(&p)).and_then(|s| s.lang).unwrap_or_default();
+            let dash = runtime::web::start(root, lang, port).await?;
+            println!("Tableau de bord : {}", dash.url);
+            println!("La clé de l'URL n'est valable que pour ce lancement. Ctrl+C pour arrêter.");
+            if !no_open {
+                if let Err(e) = runtime::web::open_in_browser(&dash.url) {
+                    eprintln!("⚠ navigateur non lancé ({e:#}) : ouvrez l'URL ci-dessus à la main");
+                }
+            }
+            tokio::signal::ctrl_c().await.ok();
+            eprintln!("\ntableau de bord arrêté.");
+            Ok(())
+        }
+        Some(Cmd::Agents { root }) => {
+            let dirs = ConfigDirs::new(root.unwrap_or(std::env::current_dir()?));
+            for a in agent::load_all(&dirs) {
+                // Un agent global (dossier utilisateur) est disponible dans tous les projets : signalé par `~`.
+                let ou = a.path.as_deref().filter(|p| dirs.is_global(p)).map_or("", |_| " ~");
+                println!("{:<24} {}{ou}", a.name, a.description);
             }
             Ok(())
         }
@@ -469,7 +547,7 @@ mod tests {
         std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         unsafe { std::env::set_var("ESSAIM_CLAUDE_BIN", &fake) };
         let company = Company::parse("name = \"acme\"\n[[seat]]\nid = \"ceo\"\ntitle = \"CEO\"\nagent = \"a\"\n").unwrap();
-        let edit = PlanEdit { company, agents: vec![], root: root.clone(), mission_dir: dir, lang: tui::settings::Lang::Fr };
+        let edit = PlanEdit { company, agents: vec![], root: root.clone(), dirs: ConfigDirs::project_only(&root), mission_dir: dir, lang: tui::settings::Lang::Fr };
         assert_eq!(edit.revise().await.as_deref(), Some("PLAN V2"));
         let args = std::fs::read_to_string(root.join("args.txt")).unwrap();
         assert!(args.contains("--permission-mode plan") && args.contains(".essaim/missions/42/conception.md"), "{args}");

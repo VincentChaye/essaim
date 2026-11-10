@@ -1,17 +1,21 @@
 //! Organigramme d'une entreprise d'agents : des postes (agent + intitulé) reliés par une hiérarchie libre.
 
+use super::ConfigDirs;
 use super::roles::level_label;
 use crate::tf;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn default_max_calls() -> u32 {
     40
 }
 fn default_max_parallel() -> usize {
     2
+}
+fn default_node_timeout_s() -> u64 {
+    15 * 60
 }
 fn default_max_fix_rounds() -> u32 {
     2
@@ -48,6 +52,9 @@ pub struct Seat {
     /// spécifiées (inventaires, lancement de commandes, résumés de sortie), sans décision ; absent = pas d'assistants.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub helpers: Option<String>,
+    /// Plafond de dépense estimée pour un appel de ce poste, en dollars ; absent = celui de l'entreprise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_budget_usd: Option<f64>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -87,6 +94,14 @@ pub struct Company {
     /// Pause pour valider le plan avant la réalisation.
     #[serde(default = "default_checkpoint")]
     pub checkpoint: bool,
+    /// Délai maximal d'un appel `claude`, en secondes : garde-fou contre un poste qui s'emballe
+    /// (boucle d'outils sans fin). Au-delà, l'appel est arrêté et le poste échoue.
+    #[serde(default = "default_node_timeout_s")]
+    pub node_timeout_s: u64,
+    /// Plafond de dépense estimée par appel, en dollars (`--max-budget-usd`), surchargé par poste.
+    /// Absent = pas de plafond : la bonne valeur dépend du modèle du poste.
+    #[serde(default)]
+    pub max_budget_usd: Option<f64>,
     /// Tours de correction qu'un poste peut lancer dans sa branche avant de remonter le blocage à son supérieur.
     #[serde(default = "default_max_fix_rounds")]
     pub max_fix_rounds: u32,
@@ -166,6 +181,41 @@ pub struct CallEstimate {
 impl CallEstimate {
     pub fn total(&self) -> u32 {
         self.conception + self.realisation
+    }
+}
+
+/// Fichiers d'entreprise visibles : ceux du projet, puis ceux de l'utilisateur (disponibles depuis
+/// tous les dossiers). Un même nom de fichier des deux côtés : celui du projet l'emporte.
+pub fn files(dirs: &ConfigDirs) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = vec![];
+    for dir in dirs.companies() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let mut files: Vec<_> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "toml")).collect();
+        files.sort();
+        let neufs: Vec<PathBuf> = files.into_iter().filter(|p| !out.iter().any(|q| q.file_name() == p.file_name())).collect();
+        out.extend(neufs);
+    }
+    out
+}
+
+/// Entreprise désignée en ligne de commande : un chemin de fichier, ou le nom d'une entreprise
+/// connue (projet ou utilisateur), avec ou sans `.toml`.
+pub fn resolve(dirs: &ConfigDirs, arg: &Path) -> Result<PathBuf> {
+    if arg.exists() {
+        return Ok(arg.to_path_buf());
+    }
+    let wanted = arg.file_name().map(|n| n.to_string_lossy().trim_end_matches(".toml").to_string()).unwrap_or_default();
+    if arg.parent().is_some_and(|p| !p.as_os_str().is_empty()) || wanted.is_empty() {
+        bail!("{}", tf!("entreprise introuvable : {}", "company not found: {}", arg.display()));
+    }
+    let known = files(dirs);
+    match known.iter().find(|p| p.file_stem().is_some_and(|n| n == wanted.as_str())) {
+        Some(p) => Ok(p.clone()),
+        None => {
+            let names: Vec<String> = known.iter().filter_map(|p| p.file_stem().map(|n| n.to_string_lossy().into_owned())).collect();
+            let list = if names.is_empty() { tf!("aucune", "none") } else { names.join(", ") };
+            bail!("{}", tf!("entreprise introuvable : {} (connues : {list})", "company not found: {} (known: {list})", arg.display()))
+        }
     }
 }
 
@@ -326,6 +376,18 @@ impl Company {
 
     /// Commandes de vérification d'un supérieur : lecture seule, plus les tests / compilations / lectures déjà permis à ses
     /// subordonnés (jamais d'écriture : un supérieur coordonne et contrôle, il ne code pas).
+    /// Ce poste peut-il déplacer des fichiers et committer lui-même (`git` dans ses commandes
+    /// autorisées) ? Sert à n'exiger un commit par étape que des postes qui en ont le droit : dans une
+    /// entreprise avec une équipe release, seul ce poste a `git`.
+    pub fn allows_git(&self, i: usize) -> bool {
+        self.seats.get(i).is_some_and(|s| {
+            s.allow_bash.iter().any(|c| {
+                let c = c.trim();
+                c == "git" || c.strip_prefix("git ").is_some_and(|r| r.starts_with("mv") || r.starts_with("commit") || r.starts_with("add"))
+            })
+        })
+    }
+
     pub fn verify_commands(&self, i: usize) -> Vec<String> {
         let mut out: Vec<String> = READ_ONLY_COMMANDS.iter().map(|c| c.to_string()).collect();
         let mut stack = self.children(i);
@@ -438,6 +500,15 @@ impl Company {
         }
         if self.max_parallel == 0 || self.max_calls == 0 {
             bail!("{}", tf!("max_calls et max_parallel doivent être ≥ 1", "max_calls and max_parallel must be ≥ 1"));
+        }
+        if self.node_timeout_s < 60 {
+            bail!("{}", tf!("node_timeout_s doit être ≥ 60 (secondes)", "node_timeout_s must be ≥ 60 (seconds)"));
+        }
+        // Un plafond nul ou négatif arrêterait tout appel avant son premier jeton : refusé plutôt que subi.
+        for b in std::iter::once(&self.max_budget_usd).chain(self.seats.iter().map(|s| &s.max_budget_usd)) {
+            if b.is_some_and(|v| !(v.is_finite() && v > 0.0)) {
+                bail!("{}", tf!("max_budget_usd doit être un nombre > 0", "max_budget_usd must be a number > 0"));
+            }
         }
         Ok(())
     }
@@ -685,5 +756,34 @@ reports_to = "ciso"
     fn entreprise_vide_refusee() {
         let c = Company::parse("name = \"x\"").unwrap();
         assert!(c.validate(&agents()).unwrap_err().to_string().contains("aucun poste"));
+    }
+
+    /// Les entreprises de l'utilisateur sont visibles depuis n'importe quel projet, et désignables
+    /// par leur seul nom en ligne de commande.
+    #[test]
+    fn entreprises_du_projet_et_de_l_utilisateur() {
+        let base = std::env::temp_dir().join(format!("essaim-ent-{}", uuid::Uuid::new_v4()));
+        let dirs = ConfigDirs { project: base.join("projet"), user: Some(base.join("maison/.claude")) };
+        std::fs::create_dir_all(dirs.project.join(".claude/companies")).unwrap();
+        std::fs::create_dir_all(dirs.user.clone().unwrap().join("companies")).unwrap();
+        let mini = "name = \"m\"\n[[seat]]\nid = \"ceo\"\ntitle = \"CEO\"\nagent = \"a\"\n";
+        std::fs::write(dirs.project.join(".claude/companies/locale.toml"), mini).unwrap();
+        std::fs::write(dirs.user.clone().unwrap().join("companies/globale.toml"), mini).unwrap();
+        // Doublon de nom : le fichier du projet masque celui de l'utilisateur.
+        std::fs::write(dirs.project.join(".claude/companies/deux.toml"), mini).unwrap();
+        std::fs::write(dirs.user.clone().unwrap().join("companies/deux.toml"), mini).unwrap();
+
+        let noms: Vec<String> = files(&dirs).iter().map(|p| p.file_stem().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(noms, vec!["deux", "locale", "globale"]);
+        assert_eq!(files(&dirs).iter().filter(|p| p.file_stem().unwrap() == "deux").count(), 1);
+        assert!(files(&dirs)[0].starts_with(&dirs.project));
+
+        assert_eq!(resolve(&dirs, Path::new("globale")).unwrap(), dirs.user.clone().unwrap().join("companies/globale.toml"));
+        assert_eq!(resolve(&dirs, Path::new("globale.toml")).unwrap(), dirs.user.clone().unwrap().join("companies/globale.toml"));
+        let chemin = dirs.project.join(".claude/companies/locale.toml");
+        assert_eq!(resolve(&dirs, &chemin).unwrap(), chemin, "un chemin existant est pris tel quel");
+        let err = resolve(&dirs, Path::new("fantome")).unwrap_err().to_string();
+        assert!(err.contains("fantome") && err.contains("globale"), "{err}");
+        assert!(resolve(&dirs, Path::new("dossier/absent.toml")).is_err());
     }
 }

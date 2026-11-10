@@ -1,7 +1,7 @@
 //! Onglet Entreprise : liste des entreprises, organigramme en arbre, détail du poste.
 
 use super::app::{App, CompZone};
-use super::settings::tr;
+use super::settings::{Lang, current, tr};
 use crate::tf;
 use crate::model::company::Company;
 use ratatui::Frame;
@@ -27,6 +27,8 @@ fn draw_missions(f: &mut Frame, area: Rect, app: &App) {
             let waiting = !m.waiting_for.is_empty();
             let (flag, color) = if waiting {
                 (tr("⏳ en attente", "⏳ waiting"), Color::DarkGray)
+            } else if m.pause.is_some() {
+                (tr("⏸ en pause · r reprend", "⏸ paused · r resumes"), Color::Yellow)
             } else if m.done {
                 (tr("✔ réussie", "✔ succeeded"), Color::Green)
             } else if m.has_report {
@@ -42,6 +44,13 @@ fn draw_missions(f: &mut Frame, area: Rect, app: &App) {
             let open = app.mission_open.get(&m.id);
             let head = Style::new().fg(if waiting { Color::DarkGray } else { Color::Reset });
             let mut lines = vec![Line::styled(format!("{} {}", if open.is_some() { "▾" } else { "▸" }, m.title), head), Line::styled(format!("  {flag}"), Style::new().fg(color))];
+            // Pause due à la limite de l'abonnement : l'heure à laquelle la fenêtre se réinitialise.
+            if let Some(p) = m.pause.filter(|p| p.resets_at.is_some()) {
+                lines.push(Line::styled(
+                    format!("  ↻ {}", tf!("reprise {}", "resuming {}", crate::runtime::pause::reset_label(p.resets_at, current() == Lang::Fr))),
+                    Style::new().fg(Color::Yellow),
+                ));
+            }
             // Ordre de lancement : ce qu'il faut réussir avant, et ce que celle-ci débloque.
             for a in &m.after {
                 if let Some(t) = title_of(a) {
@@ -121,7 +130,8 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .map(|c| {
             let bad = c.parsed.is_err() || c.problem.is_some();
-            ListItem::new(format!("{}{}", if bad { "⚠ " } else { "" }, c.file.trim_end_matches(".toml")))
+            // « ~ » : entreprise du dossier personnel, donc visible depuis tous les dossiers.
+            ListItem::new(format!("{}{}{}", if bad { "⚠ " } else { "" }, c.file.trim_end_matches(".toml"), if c.global { " ~" } else { "" }))
         })
         .collect();
     let mut st = ListState::default().with_selected((!app.companies.is_empty()).then_some(app.comp_sel));
@@ -136,7 +146,7 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
 
     let Some(entry) = app.companies.get(app.comp_sel) else {
         f.render_widget(
-            Paragraph::new(tr("Aucune entreprise dans .claude/companies/.\n\nn : un assistant conçoit l'organigramme avec toi (et crée les agents manquants).\n`essaim init` en crée aussi une d'exemple.", "No company in .claude/companies/.\n\nn: an assistant designs the org chart with you (and creates the missing agents).\n`essaim init` also creates an example one."))
+            Paragraph::new(tr("Aucune entreprise.\n\nn : un assistant conçoit l'organigramme avec toi (et crée les agents manquants). Elle est enregistrée dans ~/.claude/companies/ : tu la retrouveras depuis n'importe quel dossier.\n`essaim init` en crée aussi une d'exemple.", "No company.\n\nn: an assistant designs the org chart with you (and creates the missing agents). It is saved in ~/.claude/companies/, so you will find it again from any folder.\n`essaim init` also creates an example one."))
                 .wrap(Wrap { trim: false })
                 .block(Block::bordered().title(tr(" Organigramme ", " Org chart "))),
             graph_area,
@@ -159,7 +169,7 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     // --- graphe ---
     let rows = company.tree_rows();
     let sel = app.seat_sel.min(rows.len().saturating_sub(1));
-    draw_graph(f, graph_area, company, sel, app, entry.problem.is_none());
+    draw_graph(f, graph_area, company, sel, app, entry.problem.is_none(), entry);
 
     // --- détail ---
     let mut lines: Vec<Line> = vec![];
@@ -258,10 +268,16 @@ fn joint(up: bool, down: bool, left: bool, right: bool) -> char {
 }
 
 /// Organigramme en arbre de boîtes (supérieur en haut, niveaux en lignes), centré sur le poste sélectionné.
-fn draw_graph(f: &mut Frame, area: Rect, company: &Company, sel: usize, app: &App, valid: bool) {
+fn draw_graph(f: &mut Frame, area: Rect, company: &Company, sel: usize, app: &App, valid: bool, entry: &crate::tui::app::CompanyEntry) {
+    // Portée : une entreprise du dossier personnel (~) suit l'utilisateur dans tous ses dossiers.
+    let ou = if entry.global {
+        tr("~ à vous, dans tous vos dossiers ", "~ yours, in all your folders ")
+    } else {
+        tr("propre à ce projet ", "specific to this project ")
+    };
     let title = match valid {
-        true => tf!(" {} — organigramme valide ✔ ", " {} — valid org chart ✔ ", company.name),
-        false => tf!(" {} — organigramme invalide ⚠ ", " {} — invalid org chart ⚠ ", company.name),
+        true => tf!(" {} — organigramme valide ✔ · {ou}", " {} — valid org chart ✔ · {ou}", company.name),
+        false => tf!(" {} — organigramme invalide ⚠ · {ou}", " {} — invalid org chart ⚠ · {ou}", company.name),
     };
     let hint = tr(" Entrée puis ←↑↓→ · a ajouter · e éditer · x retirer ", " Enter then ←↑↓→ · a add · e edit · x remove ");
     let block = zone_block(app, CompZone::Graph).title(title).title_bottom(hint);

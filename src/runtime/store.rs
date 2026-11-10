@@ -1,7 +1,8 @@
-use super::claude_proc::redact_secrets;
+use super::claude_proc::{redact_secrets, redact_secrets_cow};
 use super::executor::NodeStatus;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 /// Trace persistée d'un nœud.
@@ -18,6 +19,9 @@ pub struct NodeRecord {
     pub status: Option<NodeStatus>,
     #[serde(default)]
     pub tokens: u64,
+    /// Session `claude` de l'appel : relie le poste à sa consommation dans les transcriptions.
+    #[serde(default)]
+    pub session_id: Option<String>,
     pub log: Vec<String>,
 }
 
@@ -78,6 +82,21 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
+/// Texte d'un statut d'erreur, s'il en porte un.
+fn status_text(s: &NodeStatus) -> Option<&String> {
+    match s {
+        NodeStatus::Failed(t) | NodeStatus::Blocked(t) | NodeStatus::Skipped(t) => Some(t),
+        _ => None,
+    }
+}
+
+/// Vrai si un journal ou un statut contient un secret connu (donc si une copie masquée est nécessaire).
+fn has_secret(rec: &RunRecord) -> bool {
+    rec.nodes.iter().any(|n| {
+        n.log.iter().any(|l| matches!(redact_secrets_cow(l), Cow::Owned(_))) || n.status.as_ref().and_then(status_text).is_some_and(|t| matches!(redact_secrets_cow(t), Cow::Owned(_)))
+    })
+}
+
 /// Copie d'une trace dont les secrets connus sont masqués (journaux de nœud, statuts d'erreur).
 fn redacted(rec: &RunRecord) -> RunRecord {
     let mut r = rec.clone();
@@ -93,12 +112,20 @@ fn redacted(rec: &RunRecord) -> RunRecord {
 }
 
 /// Écriture atomique (fichier temporaire puis renommage), en 0600 et sans secret connu.
+/// Sans secret, la trace est sérialisée directement (aucune copie) ; si `run.json` contient déjà
+/// exactement ces octets, rien n'est réécrit.
 pub fn save(root: &Path, rec: &RunRecord) -> Result<()> {
     let dir = runs_dir(root).join(&rec.id);
     std::fs::create_dir_all(&dir)?;
+    let bytes = if has_secret(rec) { serde_json::to_vec_pretty(&redacted(rec))? } else { serde_json::to_vec_pretty(rec)? };
+    let target = dir.join("run.json");
+    // Longueur d'abord : la relecture n'a lieu que si la taille est identique.
+    if std::fs::metadata(&target).is_ok_and(|m| m.len() == bytes.len() as u64) && std::fs::read(&target).is_ok_and(|old| old == bytes) {
+        return Ok(());
+    }
     let tmp = dir.join("run.json.tmp");
-    write_private(&tmp, &serde_json::to_vec_pretty(&redacted(rec))?)?;
-    std::fs::rename(tmp, dir.join("run.json"))?;
+    write_private(&tmp, &bytes)?;
+    std::fs::rename(tmp, target)?;
     Ok(())
 }
 
@@ -132,7 +159,7 @@ mod tests {
             started_ms: 1_791_460_000_000,
             finished: ok,
             tokens: 0,
-            nodes: vec![NodeRecord { id: "a".into(), agent: "x".into(), label: String::new(), depth: 0, status: Some(NodeStatus::Failed("boum".into())), tokens: 0, log: vec!["l1".into()] }],
+            nodes: vec![NodeRecord { id: "a".into(), agent: "x".into(), label: String::new(), depth: 0, status: Some(NodeStatus::Failed("boum".into())), tokens: 0, session_id: None, log: vec!["l1".into()] }],
         }
     }
 
@@ -179,6 +206,22 @@ mod tests {
     #[test]
     fn libelle_de_date() {
         assert_ne!(rec("a", None).started_label(), "?");
+    }
+
+    #[test]
+    fn octets_identiques_pas_de_reecriture() {
+        let root = tmp();
+        let r = rec(&new_id(7), Some(true));
+        save(&root, &r).unwrap();
+        let path = runs_dir(&root).join(&r.id).join("run.json");
+        let t0 = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        save(&root, &r).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), t0, "fichier réécrit alors que le contenu est identique");
+        let mut r2 = r.clone();
+        r2.tokens = 5;
+        save(&root, &r2).unwrap();
+        assert_eq!(load_all(&root)[0].tokens, 5);
     }
 
     #[test]

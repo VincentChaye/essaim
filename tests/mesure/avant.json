@@ -1,0 +1,80 @@
+{
+  "duree_methode": "min de 2 exécutions par mission, indicative, hors comparaison (tests/mesure/README.md)",
+  "formule":"entree=ceil(octets(prompt+fiche+schema+agents)/4); sortie=ceil(octets(sortie structurée)/4); cache=ceil(préfixe commun de la fiche avec l'appel précédent/4) borné à l'entrée",
+  "max_parallel": 1,
+  "methode": "tests/mesure/README.md",
+  "missions": {
+    "M1": {
+      "appels": 6,
+      "appels_par_modele": {
+        "defaut": 6
+      },
+      "appels_par_type": {
+        "delegate": 2,
+        "report": 2,
+        "review": 1,
+        "work": 1
+      },
+      "description": "3 postes, brief court, conception seule",
+      "duree_ms": 470,
+      "jetons_cache": 1340,
+      "jetons_entree": 5540,
+      "jetons_sortie": 484,
+      "part_cache": 0.2419
+    },
+    "M2": {
+      "appels": 12,
+      "appels_par_modele": {
+        "defaut": 12
+      },
+      "appels_par_type": {
+        "delegate": 4,
+        "report": 4,
+        "review": 1,
+        "work": 3
+      },
+      "description": "7 postes, brief détaillé, conception seule",
+      "duree_ms": 727,
+      "jetons_cache": 4661,
+      "jetons_entree": 13277,
+      "jetons_sortie": 1193,
+      "part_cache": 0.3511
+    },
+    "M3": {
+      "appels": 21,
+      "appels_par_modele": {
+        "defaut": 21
+      },
+      "appels_par_type": {
+        "delegate": 7,
+        "report": 7,
+        "review": 2,
+        "work": 5
+      },
+      "description": "7 postes dont 2 de réalisation : conception + réalisation",
+      "duree_ms": 1170,
+      "jetons_cache": 7733,
+      "jetons_entree": 23329,
+      "jetons_sortie": 2060,
+      "part_cache": 0.3315
+    },
+    "M4": {
+      "appels": 21,
+      "appels_par_modele": {
+        "defaut": 21
+      },
+      "appels_par_type": {
+        "delegate": 7,
+        "report": 7,
+        "review": 1,
+        "work": 6
+      },
+      "description": "7 postes, revue rejetée puis relance, sorties volumineuses (troncature)",
+      "duree_ms": 1499,
+      "jetons_cache": 8286,
+      "jetons_entree": 43617,
+      "jetons_sortie": 66620,
+      "part_cache": 0.19
+    }
+  }
+}

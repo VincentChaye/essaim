@@ -71,6 +71,8 @@ pub struct CompanyOptions {
     pub lang: Lang,
     /// Reprend une mission interrompue : une conception déjà menée à terme n'est pas rejouée, on repart de son plan.
     pub resume: bool,
+    /// Pause du run, partagée avec l'interface : la limite de l'abonnement la ferme, la reprise l'ouvre.
+    pub pause: std::sync::Arc<crate::runtime::pause::Gate>,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +144,12 @@ pub struct Assignment {
     pub to: usize,
     /// Gabarit de réponse voulu par le délégant (vide = rapport libre).
     pub sections: Vec<Section>,
+    /// Les étapes confiées à ce poste, dans l'ordre, telles que le délégant les a écrites. Une feuille
+    /// les exécute **l'une après l'autre, chacune dans une session neuve** : un contexte qui ne contient
+    /// que l'étape en cours coûte bien moins qu'une session unique qui accumule tout (le coût d'une
+    /// session vaut tours × contexte moyen, donc il croît quadratiquement avec sa longueur).
+    /// Toujours au moins une entrée ; `task` en est la concaténation, pour les rapports et l'historique.
+    pub steps: Vec<String>,
     pub task: String,
     /// Périmètre de fichiers (phase de réalisation uniquement).
     pub scope: Vec<String>,
@@ -233,6 +241,25 @@ impl From<Outcome> for SeatOut {
     }
 }
 
+/// Résultat d'un poste qui a enchaîné plusieurs étapes : les rapports sont concaténés, étape par étape,
+/// et le statut est celui de la dernière étape exécutée (une étape non aboutie arrête les suivantes).
+fn join_steps(parts: Vec<(usize, SeatOut)>) -> SeatOut {
+    let n = parts.len();
+    let last = parts.last().map(|(_, o)| o.status.clone()).unwrap_or(Status::Failed);
+    let mut text = String::new();
+    let mut blockers = vec![];
+    for (i, o) in parts {
+        if n > 1 {
+            text.push_str(&format!("### Step {i}
+"));
+        }
+        text.push_str(o.text.trim());
+        text.push('\n');
+        blockers.extend(o.blockers);
+    }
+    SeatOut { status: last, text: text.trim_end().to_string(), blockers }
+}
+
 // ---------------------------------------------------------------- moteur
 
 #[cfg(test)]
@@ -310,6 +337,10 @@ reports_to = "ciso"
         peak: AtomicUsize,
         /// Passages par identifiant d'appel.
         seen: Mutex<std::collections::HashMap<String, usize>>,
+        /// Appels déjà refusés une fois pour limite d'abonnement (voir `Behavior::limit_once`).
+        limited: Mutex<Vec<String>>,
+        /// Appels déjà arrêtés une fois par la pause (voir `Behavior::interrupt_once`).
+        interrupted: Mutex<Vec<String>>,
     }
 
     #[derive(Default, Clone)]
@@ -346,6 +377,15 @@ reports_to = "ciso"
         deny_session: Vec<&'static str>,
         /// (supérieur, décision) sur les demandes de commande : approve par défaut.
         perm: Vec<(&'static str, &'static str)>,
+        /// Ces appels butent sur la limite de l'abonnement à leur premier passage, puis se comportent normalement.
+        limit_once: Vec<&'static str>,
+        /// Ces appels ne rendent jamais de sortie structurée : seulement du texte libre (outil `StructuredOutput` en échec).
+        no_structured: Vec<&'static str>,
+        /// Ces appels sont arrêtés par la pause à leur premier passage (bilan rendu, session connue),
+        /// puis se comportent normalement à la reprise.
+        interrupt_once: Vec<&'static str>,
+        /// Ces postes confient DEUX étapes successives à chacun de leurs subordonnés mobilisés.
+        two_steps: Vec<&'static str>,
     }
 
     fn enum_ids(schema: &str) -> Vec<String> {
@@ -361,7 +401,7 @@ reports_to = "ciso"
     }
 
     fn fake(p: Arc<Probe>, b: Behavior) -> Runner {
-        Arc::new(move |job, _tx, _c| {
+        Arc::new(move |job, _tx, _c, _p| {
             let (p, b) = (p.clone(), b.clone());
             Box::pin(async move {
                 p.started.lock().unwrap().push(job.id.clone());
@@ -375,10 +415,56 @@ reports_to = "ciso"
                 p.now.fetch_sub(1, Ordering::SeqCst);
                 p.finished.lock().unwrap().push(job.id.clone());
                 p.timeline.lock().unwrap().push(format!("E:{}", job.id));
+                // `kind` = le type d'appel seul. L'identifiant peut porter un suffixe d'étape (« work@2 »)
+                // ou de reprise (« work#7 ») : on garde ce dernier, que des scénarios testent.
                 let (seat, kind) = {
                     let parts: Vec<&str> = job.id.split('/').collect();
-                    (parts[0].to_string(), parts[2].to_string())
+                    let brut = parts[2];
+                    // « work@2#7 » → « work#7 » ; « work@2 » → « work ».
+                    let kind = match (brut.find('@'), brut.find('#')) {
+                        (Some(a), Some(h)) if h > a => format!("{}{}", &brut[..a], &brut[h..]),
+                        (Some(a), _) => brut[..a].to_string(),
+                        (None, _) => brut.to_string(),
+                    };
+                    (parts[0].to_string(), kind)
                 };
+                if b.limit_once.contains(&job.id.as_str()) && {
+                    let mut done = p.limited.lock().unwrap();
+                    let first = !done.contains(&job.id);
+                    if first {
+                        done.push(job.id.clone());
+                    }
+                    first
+                } {
+                    // Ce que renvoie `run_local` quand `claude` refuse l'appel faute de quota.
+                    return Ok(NodeResult {
+                        output: "Claude AI usage limit reached|1761580800".into(),
+                        is_error: true,
+                        limit: Some(crate::runtime::claude_proc::UsageLimit { resets_at: Some(crate::runtime::pause::now_s() + 1) }),
+                        ..Default::default()
+                    });
+                }
+                if b.interrupt_once.contains(&job.id.as_str()) && {
+                    let mut done = p.interrupted.lock().unwrap();
+                    let first = !done.contains(&job.id);
+                    if first {
+                        done.push(job.id.clone());
+                    }
+                    first
+                } {
+                    // Ce que rend `run_local` quand l'agent s'arrête sur le prompt prioritaire de la pause.
+                    return Ok(NodeResult {
+                        output: "Fait : la moitié. Reste : l'autre.".into(),
+                        tokens: 100,
+                        session_id: Some("sid-pause".into()),
+                        interrupted: Some(crate::runtime::executor::Interrupted {
+                            session: Some("sid-pause".into()),
+                            note: "Fait : la moitié. Reste : l'autre.".into(),
+                            killed: false,
+                        }),
+                        ..Default::default()
+                    });
+                }
                 if kind.starts_with("answer") && job.spec.json_schema.as_deref().is_some_and(|x| x.contains("\"decision\"")) {
                     let d = b.perm.iter().find(|(s, _)| *s == seat).map(|(_, d)| *d).unwrap_or("approve");
                     return Ok(NodeResult { structured: Some(json!({"decision": d, "reason": "r"})), output: "{}".into(), ..Default::default() });
@@ -402,6 +488,9 @@ reports_to = "ciso"
                 if kind == "work" && b.ask.contains(&job.id.as_str()) {
                     let q = json!({"status": "question", "question": {"kind": "decision", "text": "snake_case ou camelCase ?", "options": ["snake_case", "camelCase"]}});
                     return Ok(NodeResult { structured: Some(q), output: "q".into(), session_id: Some("sid-1".into()), ..Default::default() });
+                }
+                if b.no_structured.contains(&job.id.as_str()) {
+                    return Ok(NodeResult { output: "analyse en texte libre : trois failles XSS".into(), ..Default::default() });
                 }
                 if b.fail.contains(&job.id.as_str()) {
                     return Ok(NodeResult { output: "boum".into(), is_error: true, ..Default::default() });
@@ -442,6 +531,19 @@ reports_to = "ciso"
                                 a
                             })
                             .collect();
+                        // Deux affectations pour un même subordonné : deux étapes, exécutées en séquence.
+                        let items: Vec<Value> = if b.two_steps.contains(&seat.as_str()) {
+                            items
+                                .into_iter()
+                                .flat_map(|a| {
+                                    let mut deux = a.clone();
+                                    deux["task"] = json!(format!("etape2 pour {}", a["to"].as_str().unwrap_or_default()));
+                                    vec![a, deux]
+                                })
+                                .collect()
+                        } else {
+                            items
+                        };
                         NodeResult { structured: Some(json!({"assignments": items})), output: "{}".into(), tokens: 0, ..Default::default() }
                     }
                     "work" | "report" => {
@@ -548,7 +650,7 @@ reports_to = "ciso"
                 let _ = ctx.send(true);
             });
         }
-        let opts = CompanyOptions { base_dir: std::env::temp_dir(), mission_dir: cfg.mission_dir.clone(), lang: Lang::Fr, resume: cfg.resume };
+        let opts = CompanyOptions { base_dir: std::env::temp_dir(), mission_dir: cfg.mission_dir.clone(), lang: Lang::Fr, resume: cfg.resume, pause: crate::runtime::pause::Gate::new() };
         let out = run_mission(c, &agents(), "Brief de test", &opts, fake(p, b), tx, crx).await.unwrap();
         collector.await.unwrap();
         drop(ctx);
@@ -593,11 +695,21 @@ reports_to = "ciso"
         assert_ne!(secs[0].key, secs[1].key, "clés uniques");
         assert_eq!((secs[0].max_chars, secs[1].max_chars), (MAX_SECTION_CHARS, MIN_SECTION_CHARS), "tailles bornées");
         let v: serde_json::Value = serde_json::from_str(&schema::outcome_schema(&secs, false)).unwrap();
-        assert!(v["properties"]["report"].is_null() && v["properties"]["sections"]["properties"][&secs[0].key]["maxLength"] == 1000);
+        assert!(v["properties"]["report"].is_null());
+        let champ = &v["properties"]["sections"]["properties"][&secs[0].key];
+        // Aucune borne dans le schéma : elle ferait échouer l'outil `StructuredOutput` au moindre dépassement.
+        assert!(champ["maxLength"].is_null(), "taille jamais imposée par le schéma");
+        assert!(champ["description"].as_str().unwrap().contains("1000 chars"), "budget annoncé au modèle");
         assert_eq!(v["required"], json!(["status", "sections"]));
         let r = NodeResult { structured: Some(json!({"status": "done", "sections": {secs[0].key.clone(): "r1"}})), ..Default::default() };
         let o = parse_outcome(&r, &secs).unwrap();
         assert_eq!(o.report, "### Risques\nr1\n\n### Risques\n—", "ordre du gabarit, section vide visible");
+        // Dépassement du budget : tronqué à la lecture (la section la plus courte fait 60 caractères).
+        let long = "x".repeat(500);
+        let r = NodeResult { structured: Some(json!({"status": "done", "sections": {secs[1].key.clone(): long}})), ..Default::default() };
+        let coupe = parse_outcome(&r, &secs).unwrap().report;
+        assert!(coupe.contains("chars omitted"), "section trop longue tronquée : {coupe}");
+        assert!(coupe.chars().count() < 300, "budget tenu après troncature");
         assert!(Section::template((0..10).map(|i| (format!("s{i}"), String::new(), None))).len() <= MAX_SECTIONS);
     }
 
@@ -622,7 +734,7 @@ reports_to = "ciso"
         std::fs::create_dir_all(&base).unwrap();
         let bloque = base.join("bloque");
         std::fs::write(&bloque, "x").unwrap(); // un fichier à la place d'un dossier : la création du dossier de mission échoue
-        let opts = CompanyOptions { base_dir: base.clone(), mission_dir: Some(bloque.join("mission")), lang: Lang::Fr, resume: false };
+        let opts = CompanyOptions { base_dir: base.clone(), mission_dir: Some(bloque.join("mission")), lang: Lang::Fr, resume: false, pause: crate::runtime::pause::Gate::new() };
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (_ctx, crx) = watch::channel(false);
         let res = run_mission(&company(), &agents(), "Brief", &opts, fake(Arc::new(Probe::default()), Behavior::default()), tx, crx).await;
@@ -633,6 +745,138 @@ reports_to = "ciso"
         }
         assert!(matches!(evs.last(), Some(RunEvent::RunFinished { ok: false, .. })), "le run est clos en échec");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Limite de l'abonnement atteinte : le run se met en pause au lieu d'échouer, reprend seul à l'heure
+    /// annoncée, rejoue l'appel refusé, et ne lui compte ni coût ni appel. Horloge virtuelle : l'attente
+    /// jusqu'à la réinitialisation est franchie sans dormir.
+    #[tokio::test(start_paused = true)]
+    async fn limite_d_abonnement_met_le_run_en_pause_puis_le_reprend() {
+        let dir = tmpdir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = Arc::new(Probe::default());
+        let b = Behavior { limit_once: vec!["dev1/conception/work"], ..Default::default() };
+        let (out, evs) = run_cfg(&company(), p.clone(), b, Cfg { answer: Some(true), mission_dir: Some(dir.clone()), ..Default::default() }).await;
+        assert!(out.ok, "la limite ne fait pas échouer la mission");
+        assert_eq!(out.calls, 12, "l'appel refusé ne consomme pas le plafond");
+        assert_eq!(p.started.lock().unwrap().iter().filter(|id| *id == "dev1/conception/work").count(), 2, "appel rejoué à la reprise");
+        assert_eq!(evs.iter().filter(|e| matches!(e, RunEvent::Paused { .. })).count(), 1, "une seule annonce de pause");
+        assert!(evs.iter().any(|e| matches!(e, RunEvent::Paused { why: crate::runtime::pause::Why::Limit, resets_at: Some(_) })));
+        assert_eq!(evs.iter().filter(|e| matches!(e, RunEvent::Resumed)).count(), 1, "une seule annonce de reprise");
+        // Le nœud n'est clos qu'une fois, en réussite : la limite ne laisse aucune erreur derrière elle.
+        let finis: Vec<_> = evs
+            .iter()
+            .filter_map(|e| match e {
+                RunEvent::NodeFinished { id, status, .. } if id == "dev1/conception/work" => Some(status.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(finis, vec![NodeStatus::Succeeded]);
+        assert!(crate::runtime::missions::read_pause(&dir).is_none(), "marque de pause levée à la reprise");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deux affectations au même subordonné s'exécutent comme deux étapes **successives**, chacune dans
+    /// un appel `claude` neuf : c'est ce qui garde les contextes petits. Les fusionner en une tâche unique
+    /// ferait une session longue, dont le coût croît avec le carré de sa durée.
+    #[tokio::test]
+    async fn deux_etapes_pour_un_meme_poste_sont_deux_appels_successifs() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { two_steps: vec!["mgr"], ..Default::default() };
+        let (out, _) = run_cfg(&company(), p.clone(), b, Cfg { answer: Some(true), ..Default::default() }).await;
+        assert!(out.ok, "{out:?}");
+        // Un nœud distinct par étape, numéroté, pour que le journal et le coût ne se confondent pas.
+        let ids: Vec<String> = p.started.lock().unwrap().iter().filter(|id| id.starts_with("dev1/")).cloned().collect();
+        assert_eq!(ids, vec!["dev1/conception/work@1", "dev1/conception/work@2"], "deux étapes = deux nœuds nommés");
+        // Successives, jamais en parallèle : la 1re est finie avant que la 2e démarre.
+        let tl = p.timeline.lock().unwrap().clone();
+        let pos = |x: &str| tl.iter().position(|e| e == x).unwrap_or_else(|| panic!("absent de la chronologie : {x}\n{tl:?}"));
+        assert!(pos("E:dev1/conception/work@1") < pos("S:dev1/conception/work@2"), "{tl:?}");
+        // Chaque étape ne reçoit QUE la sienne : c'est là qu'est l'économie de contexte.
+        let prompts = p.prompts.lock().unwrap();
+        let un = &prompts.iter().find(|(id, _, _)| id == "dev1/conception/work@1").unwrap().1;
+        let deux = &prompts.iter().find(|(id, _, _)| id == "dev1/conception/work@2").unwrap().1;
+        assert!(un.contains("task for dev1") && !un.contains("etape2 pour dev1"), "{un}");
+        assert!(deux.contains("etape2 pour dev1") && !deux.contains("task for dev1"), "{deux}");
+        // Et chacune sait où elle en est, pour ne rien refaire ni anticiper.
+        assert!(un.contains("Step 1 of 2") && deux.contains("Step 2 of 2"), "{un}\n---\n{deux}");
+    }
+
+    /// Une étape qui n'aboutit pas arrête les suivantes : on ne construit pas sur une base cassée.
+    #[tokio::test]
+    async fn une_etape_en_echec_arrete_les_suivantes() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { two_steps: vec!["mgr"], fail: vec!["dev1/conception/work@1"], ..Default::default() };
+        let _ = run_cfg(&company(), p.clone(), b, Cfg { answer: Some(true), ..Default::default() }).await;
+        let ids: Vec<String> = p.started.lock().unwrap().iter().filter(|id| id.starts_with("dev1/conception/work")).cloned().collect();
+        assert!(ids.contains(&"dev1/conception/work@1".to_string()), "{ids:?}");
+        assert!(!ids.contains(&"dev1/conception/work@2".to_string()), "la 2e étape ne part pas après l'échec de la 1re : {ids:?}");
+    }
+
+    /// Pause demandée pendant qu'un poste travaille : il s'arrête avec un bilan, le poste n'échoue pas,
+    /// l'appel ne consomme pas le plafond, et il reprend **sa propre session** avec son bilan en main.
+    #[tokio::test]
+    async fn un_appel_arrete_par_la_pause_reprend_sa_session() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { interrupt_once: vec!["dev1/conception/work"], ..Default::default() };
+        let (out, evs) = run_cfg(&company(), p.clone(), b, Cfg { answer: Some(true), ..Default::default() }).await;
+        assert!(out.ok, "un arrêt demandé ne fait pas échouer la mission");
+        assert_eq!(out.calls, 12, "l'appel arrêté ne consomme pas le plafond");
+        // Le nœud n'est clos qu'une fois, en réussite : l'arrêt ne laisse aucune erreur derrière lui.
+        let finis: Vec<_> = evs
+            .iter()
+            .filter_map(|e| match e {
+                RunEvent::NodeFinished { id, status, .. } if id.starts_with("dev1/conception/work") => Some(status.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(finis, vec![NodeStatus::Succeeded]);
+        // La reprise passe par `--resume` sur la session rendue, et le prompt reprend le bilan de l'agent.
+        let reprise = p
+            .specs
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(id, s)| id.starts_with("dev1/conception/work") && s.resume.is_some())
+            .map(|(_, s)| s.clone())
+            .expect("un appel de reprise");
+        assert_eq!(reprise.resume.as_deref(), Some("sid-pause"));
+        assert!(reprise.prompt.contains("Reste : l'autre."), "le bilan sert de point de reprise : {}", reprise.prompt);
+        assert!(reprise.prompt.contains("Do not redo what you already completed"), "{}", reprise.prompt);
+        // Les jetons réellement brûlés avant l'arrêt sont comptés : sinon le coût du run est faux.
+        assert!(out.tokens >= 100, "les jetons de l'appel arrêté sont comptés : {}", out.tokens);
+    }
+
+    /// Run annulé pendant la pause (c'est ce qui se passe en quittant essaim) : la mission garde sa marque
+    /// de pause, donc elle est reprenable plus tard, et rien n'est annoncé comme une erreur de limite.
+    #[tokio::test(start_paused = true)]
+    async fn annulation_pendant_la_pause_laisse_la_mission_reprenable() {
+        let dir = tmpdir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let gate = crate::runtime::pause::Gate::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (ctx, crx) = watch::channel(false);
+        // Dès l'annonce de la pause, on annule : c'est la séquence « q » pendant une pause.
+        let stop = ctx.clone();
+        let collector = tokio::spawn(async move {
+            let mut evs = vec![];
+            while let Some(e) = rx.recv().await {
+                if matches!(e, RunEvent::Paused { .. }) {
+                    let _ = stop.send(true);
+                }
+                evs.push(e);
+            }
+            evs
+        });
+        let opts = CompanyOptions { base_dir: std::env::temp_dir(), mission_dir: Some(dir.clone()), lang: Lang::Fr, resume: false, pause: gate.clone() };
+        let b = Behavior { limit_once: vec!["dev1/conception/work"], ..Default::default() };
+        let out = run_mission(&company(), &agents(), "Brief", &opts, fake(Arc::new(Probe::default()), b), tx, crx).await.unwrap();
+        let evs = collector.await.unwrap();
+        assert!(!out.ok, "mission interrompue");
+        assert!(evs.iter().any(|e| matches!(e, RunEvent::Paused { .. })));
+        assert!(!evs.iter().any(|e| matches!(e, RunEvent::Resumed)), "annulée, pas reprise");
+        assert_eq!(crate::runtime::missions::read_pause(&dir).map(|p| p.resets_at.is_some()), Some(true), "mission toujours en pause, avec son heure de reprise");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ----------------------------------------------------------- conception
@@ -683,7 +927,13 @@ reports_to = "ciso"
         assert!(mgr_report.contains("travail(dev1)") && mgr_report.contains("travail(dev2)"));
         let sys = &prompts.iter().find(|(id, _, _)| id == "mgr/conception/delegate").unwrap().2;
         assert!(sys.contains("Engineering Manager") && sys.contains("N-2") && sys.contains("CEO → CTO → Engineering Manager (you)"));
-        assert!(sys.contains("dev1 · Backend Engineer") && sys.contains("Brief de test"));
+        assert!(sys.contains("dev1 · Backend Engineer"));
+        // Un manager ne voit pas le brief : il travaille sur la seule tâche écrite par son supérieur.
+        assert!(!sys.contains("Brief de test"), "le brief ne descend pas sous le boss");
+        assert!(sys.contains("You do not see the company brief"));
+        // Le boss, lui, l'a : c'est lui qui le digère.
+        let ceo_sys = &prompts.iter().find(|(id, _, _)| id == "ceo/conception/delegate").unwrap().2;
+        assert!(ceo_sys.contains("Brief de test"), "le boss garde le brief");
     }
 
     #[tokio::test]
@@ -930,10 +1180,11 @@ reports_to = "ciso"
         let cfg = Cfg { answer: Some(true), mission_dir: Some(dir.clone()), resume: true, ..Default::default() };
         let (out, _) = run_cfg(&c, p.clone(), Behavior::default(), cfg).await;
         assert!(out.ok && out.approved == Some(true) && out.realisation.is_some());
-        let started = p.started.lock().unwrap();
-        assert!(!started.iter().any(|id| id.contains("/conception/")), "{started:?}");
-        assert!(started.iter().any(|id| id.contains("/realisation/")));
-        drop(started);
+        {
+            let started = p.started.lock().unwrap();
+            assert!(!started.iter().any(|id| id.contains("/conception/")), "{started:?}");
+            assert!(started.iter().any(|id| id.contains("/realisation/")));
+        }
         assert!(dir.join("rapport.md").is_file());
         // Sans --resume, la conception est rejouée.
         let p = Arc::new(Probe::default());
@@ -952,7 +1203,7 @@ reports_to = "ciso"
         // Personne ne répond automatiquement : on retouche le plan puis on valide, comme la TUI.
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (_ctx, crx) = watch::channel(false);
-        let opts = CompanyOptions { base_dir: std::env::temp_dir(), mission_dir: cfg.mission_dir.clone(), lang: Lang::Fr, resume: false };
+        let opts = CompanyOptions { base_dir: std::env::temp_dir(), mission_dir: cfg.mission_dir.clone(), lang: Lang::Fr, resume: false, pause: crate::runtime::pause::Gate::new() };
         let d2 = dir.clone();
         let collector = tokio::spawn(async move {
             while let Some(e) = rx.recv().await {
@@ -1273,6 +1524,19 @@ reports_to = "ciso"
         assert!(fixes.len() >= 2 && !fixes[0].contains("DECISION") && fixes.iter().skip(1).all(|f| f.contains("DECISION: autoriser git")), "{fixes:?}");
     }
 
+    /// Sortie structurée perdue malgré le nouvel essai : le texte produit remonte comme blocage au lieu d'être jeté.
+    #[tokio::test]
+    async fn sortie_structuree_perdue_remonte_le_texte_produit() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { no_structured: vec!["dev1/conception/work"], ..Default::default() };
+        let (out, _) = run(&company(), p.clone(), b, false).await;
+        assert!(!out.ok, "rien ne prouve que la tâche est faite");
+        assert_eq!(p.started.lock().unwrap().iter().filter(|id| *id == "dev1/conception/work").count(), 2, "un seul nouvel essai");
+        let prompts = p.prompts.lock().unwrap();
+        let fix = &prompts.iter().find(|(id, _, _)| id == "mgr/conception/fix").unwrap().1;
+        assert!(fix.contains("trois failles XSS"), "le texte produit sert au correctif : {fix}");
+    }
+
     #[tokio::test]
     async fn refus_de_permission_est_un_blocage_meme_si_l_agent_dit_done() {
         let p = Arc::new(Probe::default());
@@ -1364,7 +1628,8 @@ reports_to = "ciso"
         ]});
         let a = parse_assignments(&v, &c, &kids, None).unwrap();
         assert_eq!(a.len(), 1);
-        assert_eq!(a[0].task, "A\n\nB", "doublons fusionnés, inconnus/vides ignorés");
+        assert_eq!(a[0].task, "A\n\nB", "doublons regroupés sur un seul poste, inconnus/vides ignorés");
+        assert_eq!(a[0].steps, vec!["A", "B"], "deux affectations au même poste = deux étapes successives, pas une tâche fusionnée");
         assert!(parse_assignments(&json!({"assignments": []}), &c, &kids, None).is_err());
         assert!(parse_assignments(&json!({}), &c, &kids, None).is_err());
     }

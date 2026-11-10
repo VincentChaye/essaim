@@ -11,19 +11,22 @@ essaim \- concevoir et exécuter des équipes d'agents Claude Code, organisées 
 [\fB\-\-root\fR \fIdossier\fR]
 .br
 .B essaim company show
-.I entreprise.toml
+.I entreprise
 .br
 .B essaim company check
-.I entreprise.toml
+.I entreprise
 [\fB\-\-root\fR \fIdossier\fR]
 .br
 .B essaim company run
-.I entreprise.toml
+.I entreprise
 (\fB\-\-brief\fR \fItexte\fR | \fB\-\-brief\fR \fB@\fR\fIfichier\fR | \fB\-\-mission\fR \fIid\fR [\fB\-\-resume\fR])
 [\fB\-\-yes\fR] [\fB\-\-root\fR \fIdossier\fR]
+.br
+.B essaim conso
+[\fB\-\-port\fR \fIport\fR] [\fB\-\-no\-open\fR] [\fB\-\-root\fR \fIdossier\fR]
 .SH DESCRIPTION
 Un agent est un fichier
-.IR .claude/agents/<nom>.md .
+.IR <nom>.md .
 On les assemble en entreprise : un organigramme (boss, VP, managers, workers) qui exécute des missions.
 Une mission se déroule en trois temps : conception en cascade (chaque niveau découpe et délègue à ses subordonnés directs,
 puis les rapports remontent), plan consolidé à valider, réalisation (les postes marqués ⚒ modifient le projet, chacun dans son périmètre).
@@ -34,13 +37,20 @@ et ton abonnement : les clés API sont ignorées (retirées de chaque processus 
 .PP
 Sans argument, essaim ouvre l'interface en onglets dans le dossier courant, qui sert de racine du projet.
 Au premier lancement, il demande la langue (français ou English), puis la mémorise.
+.PP
+Agents et entreprises sont à toi, pas au projet : ils sont rangés dans \fI~/.claude/agents\fR et
+\fI~/.claude/companies\fR, donc disponibles depuis n'importe quel dossier du système de fichiers, et toute
+création va là. Un projet peut avoir les siens dans \fI.claude/agents\fR et \fI.claude/companies\fR : à nom de
+fichier égal, celui du projet l'emporte, et seulement dans ce projet. Les missions et l'historique, eux,
+restent dans le projet (\fI.essaim/\fR).
 .SH COMMANDES
 .TP
 .B init
-Crée des agents et une entreprise d'exemple, sans rien écraser.
+Crée des agents et une entreprise d'exemple dans \fI~/.claude\fR, sans rien écraser ; avec
+\fB\-\-root\fR \fIprojet\fR, les crée dans ce projet seul.
 .TP
 .B agents
-Liste les agents (projet, puis \fI~/.claude/agents\fR).
+Liste les agents (projet, puis \fI~/.claude/agents\fR) ; \fB~\fR marque un agent personnel, disponible partout.
 .TP
 .B company show
 Affiche l'organigramme (niveaux N, N\-1\&...) et l'estimation d'appels.
@@ -49,8 +59,11 @@ Affiche l'organigramme (niveaux N, N\-1\&...) et l'estimation d'appels.
 Valide l'organigramme.
 .TP
 .B company run
-Exécute une mission. \fB\-\-brief\fR \fI@fichier\fR lit le brief dans un fichier ; \fB\-\-mission\fR \fIid\fR \fB\-\-resume\fR
+Exécute une mission. L'entreprise se désigne par son nom (\fIacme\-studio\fR, cherché dans le projet puis
+chez l'utilisateur) ou par un chemin de fichier. \fB\-\-brief\fR \fI@fichier\fR lit le brief dans un fichier ; \fB\-\-mission\fR \fIid\fR \fB\-\-resume\fR
 reprend une mission interrompue (une conception menée à terme n'est pas rejouée). \fB\-\-yes\fR valide sans demander.
+La limite d'abonnement met le run en pause et il reprend seul à l'heure annoncée ; \fBCtrl+C\fR pendant la pause
+laisse la mission reprenable.
 Sans \fB\-\-yes\fR, un plan consolidé demande \fB[o/N/e]\fR : \fBo\fR lance la réalisation, \fBe\fR modifie le plan avec le boss,
 toute autre réponse arrête.
 Si le point de contrôle est désactivé (\fBcheckpoint = false\fR dans le TOML), il n'y a ni invite ni pause : la réalisation démarre après la conception.
@@ -62,6 +75,30 @@ Revue : les supérieurs ne codent pas mais lisent et vérifient (commandes de le
 Modèles : sonnet par défaut pour les postes qui produisent le travail et ceux qui arbitrent. \fBhelpers\fR = \(dqhaiku\(dq sur un poste lui donne des assistants légers (sous-agent en lecture seule) pour les tâches mécaniques, sans décision.
 Choix du modèle : à chaque délégation, le CEO ou un manager peut fixer \fBmodel\fR (haiku, sonnet, opus) pour le poste mobilisé selon la difficulté réelle de la tâche (pour une feuille : son modèle ; pour un manager : le défaut de sa branche). Un \fBmodel\fR écrit dans le .toml d'un poste est épinglé.
 Avertissement d'exécution dans ce cas : \fB[À CONFIRMER]\fR (texte et canal à fixer).
+.TP
+.B conso
+Sert le tableau de bord de consommation sur la boucle locale et l'ouvre dans le navigateur (alias : \fBusage\fR).
+Plusieurs affectations au même subordonné sont des \fBétapes successives\fR, pas une tâche fusionnée : le poste
+les exécute l'une après l'autre, chacune dans un appel \fBclaude\fR neuf, donc avec un contexte qui ne porte que
+l'étape en cours. Une étape non aboutie arrête les suivantes. En réalisation, un poste qui a \fBgit\fR clôt chaque
+étape par un commit. Conséquence : une feuille qui découpe son travail en trois étapes consomme trois appels de
+\fBmax_calls\fR, que l'estimation affichée avant lancement ne compte pas.
+.PP
+Les jetons sont comptés en \fBcoût pondéré\fR (entrée ×1, sortie ×5, cache lu ×0,1, cache écrit ×1,25),
+pas en volume brut : le cache lu fait plus de 90 % du volume pour un dixième du prix, donc la somme à
+parité donne un chiffre une dizaine de fois trop gros. Le volume brut est affiché en second, et une case
+de la page le met au premier plan.
+La page montre les jetons dans le temps (entrée neuve, sortie, cache lu), les sessions les plus coûteuses avec
+leur dossier et leur poste, les terminaux \fBclaude\fR ouverts, la répartition par dossier et par modèle, et les
+postes et missions du projet. Deux vues, au choix en haut de la page : \fBConsommation\fR et \fBMission\fR.
+La vue Mission montre l'organigramme de l'entreprise pendant un run : état et jetons de chaque poste, en
+direct (rafraîchissement toutes les 2 s), que la mission ait été lancée depuis l'interface ou depuis
+\fBcompany run\fR. Un bandeau cliquable y mène dès qu'une mission tourne. Les chiffres viennent des transcriptions de Claude Code
+(\fI~/.claude/projects\fR), de \fBclaude agents\fR et de \fI.essaim/runs\fR : toute la consommation de
+l'abonnement est couverte, pas seulement celle d'essaim.
+\fB\-\-port\fR impose le port (par défaut 8787, puis le suivant s'il est pris) ; \fB\-\-no\-open\fR affiche
+seulement l'URL. L'écoute est limitée à \fI127.0.0.1\fR et l'URL porte une clé tirée au hasard à chaque
+lancement : sans elle, le serveur refuse de répondre. \fBCtrl+C\fR arrête.
 .SH INTERFACE
 .SS Navigation
 .TP
@@ -80,11 +117,16 @@ Onglet précédent, suivant.
 .B Ctrl+K
 Aide de l'onglet courant ; \fBm\fR bascule vers le manuel complet.
 .TP
+.B F9
+Tableau de bord de consommation dans le navigateur (voir \fBconso\fR). Le serveur démarre au premier appui
+et vit jusqu'à la fermeture d'essaim.
+.TP
 .B F10
 Réglages (langue).
 .TP
 .BR q ", " Ctrl+C
 Quitte. Si un run est en cours, demande confirmation (\fBo\fR ou \fBy\fR) : le run est alors annulé.
+Si le run est en pause, rien n'est perdu : la mission reste en pause et se reprend plus tard avec \fBr\fR.
 .SS Onglets
 Cinq onglets : 1 Agents, 2 Entreprise, 3 Run, 4 Sessions, 5 Claude.
 .TP
@@ -98,11 +140,19 @@ Trois zones : Entreprises, Missions, organigramme. \fB\(<- \(->\fR passent de l'
 Dans l'organigramme : \fBa\fR ajoute un poste, \fBe\fR l'édite, \fBx\fR le retire (confirmation).
 Dans la zone Missions : \fBEntrée\fR ou \fBo\fR ouvre la mission choisie (brief, plan, rapport) ; \fBEspace\fR déplie son résumé.
 Hors zone : \fBn\fR crée une entreprise avec l'assistant ; \fBm\fR cadre une mission avec le boss ;
-\fBr\fR la lance (reprend à la réalisation si la conception est menée à terme) ; \fBR\fR la relance depuis le début ;
+\fBr\fR la lance (reprend à la réalisation si la conception est menée à terme, et reprend sans confirmation une mission en pause) ; \fBR\fR la relance depuis le début ;
 \fBt\fR/\fBT\fR choisissent la mission ; \fBc\fR/\fBC\fR changent d'entreprise.
 .TP
 .B 3 Run
-\fB\(ua \(da\fR choisissent un nœud ; \fBs\fR annule le run en cours ; \fBh\fR ouvre l'historique (\fBEntrée\fR rouvre, \fBD\fR supprime).
+\fB\(ua \(da\fR choisissent un nœud ; \fBp\fR met en pause ou reprend ; \fBs\fR annule le run en cours ; \fBh\fR ouvre l'historique (\fBEntrée\fR rouvre, \fBD\fR supprime).
+Pause à la main (\fBp\fR) : aucun nouvel appel ne part, et les agents déjà en vol reçoivent un prompt
+prioritaire dans leur session qui leur demande de terminer proprement l'action en cours et de rendre un
+bilan court ; passé 45 s sans réponse, leur processus est tué. Le poste n'échoue pas, l'appel ne consomme
+pas le plafond, et à la reprise l'agent repart sur sa propre session (\fB--resume\fR) avec son bilan.
+Limite d'abonnement atteinte : le run se met en pause au lieu d'échouer (\fB⏸\fR dans l'en-tête et dans
+l'onglet, avec l'heure de reprise), repart seul à cette heure et rejoue l'appel refusé ;
+aucun poste n'est en échec et le refus ne compte pas dans le plafond d'appels. Contrairement à la pause
+à la main, elle laisse les appels déjà partis aller au bout.
 Au plan consolidé : \fBEntrée\fR lance la réalisation, \fBÉchap\fR arrête, \fBe\fR ouvre une conversation avec le boss pour modifier le plan.
 .TP
 .B 4 Sessions
@@ -113,17 +163,27 @@ Un vrai Claude Code dans un terminal intégré. \fBCtrl+\e\fR rend les touches d
 \fBEntrée\fR ou \fBi\fR reprend la session, \fBx\fR la termine (confirmation).
 .SH FICHIERS
 .TP
-.I .claude/agents/
-Un fichier .md par agent (format standard de Claude Code).
+.I ~/.claude/agents/
+Tes agents, un fichier .md chacun (format standard de Claude Code) : disponibles depuis tous tes dossiers.
+Les créations vont ici.
 .TP
-.I .claude/companies/
-Entreprises (TOML : postes, hiérarchie, périmètres).
+.I ~/.claude/companies/
+Tes entreprises (TOML : postes, hiérarchie, périmètres) : disponibles depuis tous tes dossiers.
+.TP
+.I .claude/agents/, .claude/companies/
+Agents et entreprises propres au projet ; à nom de fichier égal, ils masquent les tiens.
 .TP
 .I .essaim/missions/
-Brief, conception.md et rapport.md de chaque mission.
+Brief, conception.md et rapport.md de chaque mission. Le fichier \fIpause\fR marque un run interrompu par la
+limite d'abonnement (il contient l'heure de reprise) : la mission est reprenable telle quelle.
 .TP
 .I .essaim/runs/
-Historique des runs.
+Historique des runs. \fIlive.json\fR y suit le run en cours (organigramme, état et jetons de chaque poste),
+réécrit au plus une fois par seconde pour le tableau de bord.
+.TP
+.I ~/.claude/projects/
+Transcriptions de Claude Code (une par session), lues \fBen lecture seule\fR par \fBessaim conso\fR pour
+compter les jetons.
 .TP
 .I ~/.config/essaim/settings.toml
 Réglages mémorisés (langue). Emplacement propre à la plateforme ; \fBESSAIM_CONFIG_DIR\fR le remplace.
@@ -153,12 +213,10 @@ Un nœud ou un poste a échoué, ou la validation a échoué, ou \fB\-\-yes\fR m
 .SH EXEMPLES
 .nf
 essaim init && essaim
-essaim company check .claude/companies/acme\-studio.toml
+essaim company check acme\-studio
 printf '%s\en' "Ajouter une page d'accueil" > brief.md
-essaim company run .claude/companies/acme\-studio.toml \e
-      \-\-brief @brief.md
-essaim company run .claude/companies/acme\-studio.toml \e
-      \-\-mission <id> \-\-resume
+essaim company run acme\-studio \-\-brief @brief.md
+essaim company run acme\-studio \-\-mission <id> \-\-resume
 .fi
 .SH VOIR AUSSI
 .BR claude (1)

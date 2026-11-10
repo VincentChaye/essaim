@@ -1,0 +1,12 @@
+name = "minimale"
+
+[[seat]]
+id = "ceo"
+title = "CEO"
+agent = "boss"
+
+[[seat]]
+id = "dev"
+title = "Développeur"
+agent = "developer"
+reports_to = "ceo"

@@ -21,6 +21,15 @@ pub struct Mission {
     pub done: bool,
     /// Prérequis existants et pas encore réussis : tant qu'il en reste, la mission est grisée et non lançable.
     pub waiting_for: Vec<String>,
+    /// Run mis en pause (limite de l'abonnement ou demande de l'utilisateur) puis quitté : reprenable tel quel.
+    pub pause: Option<Pause>,
+}
+
+/// Pause persistée d'une mission : son run s'est arrêté sur une pause et reprendra plus tard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Pause {
+    /// Réinitialisation de la fenêtre d'abonnement (epoch secondes) ; `None` si elle n'a pas été annoncée.
+    pub resets_at: Option<u64>,
 }
 
 pub fn missions_dir(root: &Path) -> PathBuf {
@@ -66,29 +75,37 @@ pub fn list(root: &Path) -> Vec<Mission> {
     let Ok(rd) = std::fs::read_dir(missions_dir(root)) else { return vec![] };
     let mut v: Vec<Mission> = rd
         .flatten()
-        .filter(|e| e.path().join("brief.md").is_file())
-        .map(|e| {
+        .filter_map(|e| {
             let dir = e.path();
-            let brief = std::fs::read_to_string(dir.join("brief.md")).unwrap_or_default();
-            Mission {
+            // Lecture unique du brief : absent (ou non-fichier) = pas une mission ; illisible mais présent = brief vide.
+            let brief_path = dir.join("brief.md");
+            let brief = match std::fs::read_to_string(&brief_path) {
+                Ok(b) => b,
+                Err(_) if brief_path.is_file() => String::new(),
+                Err(_) => return None,
+            };
+            let has_report = dir.join("rapport.md").is_file();
+            Some(Mission {
                 id: e.file_name().to_string_lossy().into_owned(),
                 title: title_of(&brief),
                 has_conception: dir.join("conception.md").is_file(),
-                has_report: dir.join("rapport.md").is_file(),
-                resumable: !dir.join("rapport.md").is_file() && resumable_plan(&dir).is_some(),
+                has_report,
+                resumable: !has_report && resumable_plan(&dir).is_some(),
                 company: std::fs::read_to_string(dir.join(COMPANY_FILE)).ok().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()),
                 after: read_after(&dir),
                 done: dir.join(DONE_FILE).is_file(),
                 waiting_for: vec![],
+                pause: read_pause(&dir),
                 dir,
-            }
+            })
         })
         .collect();
     v.sort_by(|a, b| b.id.cmp(&a.id));
     // Un prérequis supprimé ne bloque plus : seuls les prérequis existants et non réussis font attendre.
-    let state: std::collections::HashMap<String, bool> = v.iter().map(|m| (m.id.clone(), m.done)).collect();
-    for m in &mut v {
-        m.waiting_for = m.after.iter().filter(|a| state.get(*a) == Some(&false)).cloned().collect();
+    let state: std::collections::HashMap<&str, bool> = v.iter().map(|m| (m.id.as_str(), m.done)).collect();
+    let waiting: Vec<Vec<String>> = v.iter().map(|m| m.after.iter().filter(|a| state.get(a.as_str()) == Some(&false)).cloned().collect()).collect();
+    for (m, w) in v.iter_mut().zip(waiting) {
+        m.waiting_for = w;
     }
     v
 }
@@ -168,6 +185,29 @@ pub fn mark_done(dir: &Path, done: bool) {
     } else {
         let _ = std::fs::remove_file(dir.join(DONE_FILE));
     }
+}
+
+/// Marque « run en pause » d'une mission : écrite dès la mise en pause, pour qu'un essaim quitté puis
+/// relancé retrouve la mission en pause et la reprenne. Contient l'heure de réinitialisation si connue.
+const PAUSE_FILE: &str = "pause";
+
+pub fn mark_paused(dir: &Path, resets_at: Option<u64>) {
+    let _ = std::fs::create_dir_all(dir);
+    let _ = write_private(&dir.join(PAUSE_FILE), resets_at.map(|t| t.to_string()).unwrap_or_default().as_bytes());
+}
+
+pub fn clear_pause(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(PAUSE_FILE));
+}
+
+/// Pause en cours de la mission, s'il y en a une. Un fichier vide ou illisible = pause sans heure connue.
+pub fn read_pause(dir: &Path) -> Option<Pause> {
+    let text = match std::fs::read_to_string(dir.join(PAUSE_FILE)) {
+        Ok(t) => t,
+        Err(_) if dir.join(PAUSE_FILE).is_file() => String::new(),
+        Err(_) => return None,
+    };
+    Some(Pause { resets_at: text.trim().parse::<u64>().ok().filter(|t| *t > 0) })
 }
 
 /// Missions que la réussite de `id` vient de débloquer : elles l'attendaient, plus rien ne les retient, et elles ne sont pas encore réussies.
@@ -310,6 +350,8 @@ pub struct ReportData<'a> {
     pub realised: bool,
     pub tokens: u64,
     /// Part de `tokens` lue dans le cache de prompt (0 = non mesuré).
+    /// Volume brut de jetons, dont `tokens` est la pondération.
+    pub volume: u64,
     pub cached: u64,
     pub steps: Vec<StepLine>,
     /// Points d'attention : (libellé, message) des appels échoués ou ignorés.
@@ -319,11 +361,18 @@ pub struct ReportData<'a> {
 }
 
 /// « N » ou « N (dont M lus en cache) » : le cache coûte bien moins cher qu'une entrée normale.
-pub fn with_cache(tokens: u64, cached: u64, fr: bool) -> String {
+/// Coût pondéré en chiffre principal, volume brut et cache lu en second. Le volume ne sert qu'à
+/// expliquer le coût : le cache lu en fait l'essentiel et ne vaut qu'un dixième de l'entrée neuve,
+/// donc l'afficher seul donne un chiffre spectaculaire et faux.
+pub fn with_cache(tokens: u64, volume: u64, cached: u64, fr: bool) -> String {
+    if volume <= tokens {
+        return tokens.to_string();
+    }
     match (cached, fr) {
-        (0, _) => tokens.to_string(),
-        (c, true) => format!("{tokens} (dont {c} lus en cache)"),
-        (c, false) => format!("{tokens} ({c} read from cache)"),
+        (0, true) => format!("{tokens} pondérés · volume {volume}"),
+        (0, false) => format!("{tokens} weighted · volume {volume}"),
+        (c, true) => format!("{tokens} pondérés · volume {volume} dont {c} lus en cache"),
+        (c, false) => format!("{tokens} weighted · volume {volume}, {c} read from cache"),
     }
 }
 
@@ -337,7 +386,7 @@ pub fn compte_rendu(d: &ReportData, fr: bool) -> String {
         (false, _) => t("✖ terminée avec des échecs ou interrompue", "✖ finished with failures or interrupted"),
     };
     let mut s = format!("# {} — {}\n\n", t("Compte rendu", "Report"), d.title);
-    s.push_str(&format!("- **{}** : {}\n- **{}** : {}\n- **{}** : {}\n- **Tokens** : {}\n- **{}** : {}\n\n", t("Entreprise", "Company"), d.company, t("Date", "Date"), d.date, t("Résultat", "Result"), verdict, with_cache(d.tokens, d.cached, fr), t("Appels", "Calls"), d.steps.len()));
+    s.push_str(&format!("- **{}** : {}\n- **{}** : {}\n- **{}** : {}\n- **Tokens** : {}\n- **{}** : {}\n\n", t("Entreprise", "Company"), d.company, t("Date", "Date"), d.date, t("Résultat", "Result"), verdict, with_cache(d.tokens, d.volume, d.cached, fr), t("Appels", "Calls"), d.steps.len()));
     s.push_str(&format!("## {}\n\n", t("Ce qui a été fait", "What was done")));
     if d.final_report.trim().is_empty() {
         s.push_str(t("_Aucun rapport final n'a été produit._\n\n", "_No final report was produced._\n\n"));
@@ -373,15 +422,15 @@ mod tests {
 
     #[test]
     fn jetons_avec_part_du_cache() {
-        assert_eq!(with_cache(10, 0, true), "10");
-        assert_eq!(with_cache(10, 4, true), "10 (dont 4 lus en cache)");
-        assert_eq!(with_cache(10, 4, false), "10 (4 read from cache)");
+        assert_eq!(with_cache(10, 10, 0, true), "10", "volume égal au coût : un seul chiffre");
+        assert_eq!(with_cache(10, 100, 80, true), "10 pondérés · volume 100 dont 80 lus en cache");
+        assert_eq!(with_cache(10, 100, 80, false), "10 weighted · volume 100, 80 read from cache");
     }
 
     #[test]
     fn compte_rendu_resume_la_mission() {
         let d = ReportData {
-            title: "Site", company: "Acme", date: "01/01 10:00", ok: false, blocked: false, realised: true, tokens: 1234, cached: 800,
+            title: "Site", company: "Acme", date: "01/01 10:00", ok: false, blocked: false, realised: true, tokens: 1234, volume: 9000, cached: 800,
             steps: vec![StepLine { label: "CEO · reports".into(), agent: "boss".into(), status: "✔".into(), tokens: 10 }],
             issues: vec![("Dev · builds".into(), "boum\nsuite".into())],
             final_report: "Tout est fait.",
@@ -463,6 +512,22 @@ mod tests {
         assert!(!list(&root)[0].resumable, "rapport présent : terminée");
         clear_conception_mark(&dir);
         assert!(resumable_plan(&dir).is_none());
+    }
+
+    #[test]
+    fn pause_persistee_relue_et_levee() {
+        let root = tmp();
+        let dir = create(&root, &new_id(1)).unwrap();
+        write_output(&dir, "brief.md", "# M").unwrap();
+        assert!(read_pause(&dir).is_none() && list(&root)[0].pause.is_none());
+        mark_paused(&dir, Some(1_761_580_800));
+        assert_eq!(read_pause(&dir), Some(Pause { resets_at: Some(1_761_580_800) }));
+        assert_eq!(list(&root)[0].pause.and_then(|p| p.resets_at), Some(1_761_580_800), "la liste voit la mission en pause");
+        mark_paused(&dir, None);
+        assert_eq!(read_pause(&dir), Some(Pause { resets_at: None }), "en pause, heure de reprise inconnue");
+        clear_pause(&dir);
+        assert!(read_pause(&dir).is_none() && list(&root)[0].pause.is_none());
+        clear_pause(&dir); // deux fois de suite : sans effet et sans erreur
     }
 
     #[test]

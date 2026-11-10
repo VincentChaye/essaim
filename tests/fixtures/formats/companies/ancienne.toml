@@ -1,0 +1,28 @@
+name = "ancienne"
+max_calls = 60
+max_parallel = 1
+checkpoint = false
+max_fix_rounds = 2
+max_review_rounds = 1
+
+[[seat]]
+id = "ceo"
+title = "CEO"
+agent = "boss"
+
+[[seat]]
+id = "lead"
+title = "Tech Lead"
+agent = "manager"
+reports_to = "ceo"
+expertise = "architecture et livraison"
+model = "sonnet"
+
+[[seat]]
+id = "dev"
+title = "Backend Engineer"
+agent = "developer"
+reports_to = "lead"
+builds = true
+allow_bash = ["cargo test", "cargo build"]
+helpers = "haiku"

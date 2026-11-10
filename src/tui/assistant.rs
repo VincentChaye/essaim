@@ -4,6 +4,37 @@
 //! which language the user chose.
 
 use super::settings::Lang;
+use crate::model::ConfigDirs;
+
+/// Où l'assistant écrit agents et entreprises. Chemins absolus : le modèle travaille dans le dossier
+/// du projet, alors que ce qu'il crée doit aller chez l'utilisateur pour rester disponible partout.
+pub struct Dirs {
+    pub agents: String,
+    pub companies: String,
+    /// Dossier `.claude` du projet, quand il peut aussi en contenir : un fichier déjà là s'y modifie.
+    pub project: Option<String>,
+}
+
+impl Dirs {
+    pub fn of(d: &ConfigDirs) -> Self {
+        let project = d.user.as_ref().map(|_| d.project.join(".claude").display().to_string());
+        Self { agents: d.agents_write().display().to_string(), companies: d.companies_write().display().to_string(), project }
+    }
+
+    /// Rappel joint au prompt : où écrire, et pourquoi pas dans le projet.
+    fn note(&self) -> String {
+        let local = match &self.project {
+            Some(p) => format!(
+                "\nThis project may carry its own agents and companies in {p}/agents and {p}/companies, and they take precedence there. A file that already exists there must be edited in place, never duplicated into the folders above."
+            ),
+            None => String::new(),
+        };
+        format!(
+            "Where files go (use these ABSOLUTE paths; the current directory is the project, and anything written under it would exist for this project only):\n- an agent: {}/<name>.md\n- a company: {}/<name>.toml\nThese folders belong to the user, not to the project: what you write there is available from every folder of their file system. Create the folder if it does not exist.{local}",
+            self.agents, self.companies
+        )
+    }
+}
 
 /// Tells the model the user's language (English instructions, user-facing text in the user's language).
 fn lang_note(lang: Lang) -> String {
@@ -23,7 +54,7 @@ Steps, in order:
    - model: haiku (simple, fast tasks), sonnet (general use), opus or fable (hard reasoning) — or omitted for the default model
    - tools: MINIMAL list of Claude Code tools (Read, Grep, Glob, Edit, Write, Bash, WebFetch…) — or omitted for all tools
    - system prompt: the outline (role, method, output format, limits)
-3. Once the plan is approved, write ONE file only: .claude/agents/<name>.md (path relative to the current directory). Exact format (description in double quotes: an unprotected ":" makes the YAML invalid and the agent is ignored):
+3. Once the plan is approved, write ONE file only: <AGENTS_DIR>/<name>.md. Exact format (description in double quotes: an unprotected ":" makes the YAML invalid and the agent is ignored):
 
 ---
 name: <name>
@@ -40,15 +71,16 @@ Rules: create or modify no other file; never overwrite an existing agent."#;
 
 /// `claude` arguments for the agent-creation session.
 /// `existing`: agent names already taken, to avoid collisions.
-pub fn agent_creation_args(lang: Lang, existing: &[String]) -> Vec<String> {
+pub fn agent_creation_args(lang: Lang, existing: &[String], dirs: &Dirs) -> Vec<String> {
     let taken = if existing.is_empty() { "none".to_string() } else { existing.join(", ") };
+    let instructions = INSTRUCTIONS.replace("<AGENTS_DIR>", &dirs.agents);
     vec![
         "--permission-mode".into(),
         "plan".into(),
         "--name".into(),
         "essaim: new agent".into(),
         "--append-system-prompt".into(),
-        format!("{INSTRUCTIONS}\n\nAgent names already in use (do not reuse): {taken}.\n\n{}", lang_note(lang)),
+        format!("{instructions}\n\n{}\n\nAgent names already in use (do not reuse): {taken}.\n\n{}", dirs.note(), lang_note(lang)),
         "--".into(),
         "I want to create a new agent. Ask me your questions.".into(),
     ]
@@ -61,7 +93,7 @@ A company is a tree of seats: a boss (root, level N), VPs or directors (N-1), mi
 Steps, in order:
 1. Understand the need: business domain, what the company must produce, which projects it will serve. Ask 1 to 4 short questions (AskUserQuestion fits): domains to cover (tech, security, design, product, data…), desired size (small team of 4 to 6 seats, medium 8 to 12, large beyond), who may modify the project, call budget. Decide alone what is reasonable.
 2. Propose the org chart as an annotated tree for the user to approve or correct: for each seat, its id, title, agent (existing or to create), level, area of expertise. Reuse existing agents when they fit; several seats may share the same agent (e.g. dev-api and dev-ui → "developer"). State how many calls a mission costs at most (≈ 2 per seat with subordinates + 1 per leaf, per phase) and stay frugal: 5 to 12 seats almost always suffice.
-3. Once the plan is approved, write, IN ONE GO: (a) the file .claude/companies/<name>.toml, (b) for each missing agent, the file .claude/agents/<agent>.md. Touch no existing agent. Paths relative to the current directory.
+3. Once the plan is approved, write, IN ONE GO: (a) the file <COMPANIES_DIR>/<name>.toml, (b) for each missing agent, the file <AGENTS_DIR>/<agent>.md. Touch no existing agent.
 
 Company format:
 
@@ -97,7 +129,7 @@ Validity rules (essaim rejects the company otherwise):
 - add `builds` only to seats that really must modify the project; without them, the company only produces documents;
 - every referenced agent exists; realistic job titles for the level (N: CEO; N-1: CTO, CISO, VP Design…; N-2: Head of…, Director of…; N-3: Engineering Manager, Team Lead…; leaves: Backend Engineer, Security Analyst, UX Designer…).
 
-Format of an agent to create (.claude/agents/<agent>.md):
+Format of an agent to create (<AGENTS_DIR>/<agent>.md):
 
 ---
 name: <agent>
@@ -113,9 +145,14 @@ The description is in double quotes (an unprotected ":" makes the YAML invalid).
 
 Rules: create or modify no other file; never overwrite an existing company or agent."#;
 
+/// Guide de création d'entreprise, avec les vrais dossiers d'écriture.
+fn company_instructions(dirs: &Dirs) -> String {
+    COMPANY_INSTRUCTIONS.replace("<COMPANIES_DIR>", &dirs.companies).replace("<AGENTS_DIR>", &dirs.agents)
+}
+
 /// `claude` arguments for the company-creation session.
 /// `agents`: (name, description) of existing agents; `existing`: companies already present.
-pub fn company_creation_args(lang: Lang, agents: &[(String, String)], existing: &[String]) -> Vec<String> {
+pub fn company_creation_args(lang: Lang, agents: &[(String, String)], existing: &[String], dirs: &Dirs) -> Vec<String> {
     let list = if agents.is_empty() {
         "(no agent exists yet: create all those the company needs)".to_string()
     } else {
@@ -128,7 +165,12 @@ pub fn company_creation_args(lang: Lang, agents: &[(String, String)], existing: 
         "--name".into(),
         "essaim: new company".into(),
         "--append-system-prompt".into(),
-        format!("{COMPANY_INSTRUCTIONS}\n\nExisting agents (reusable as is):\n{list}\n\nCompanies already present (names not to reuse): {taken}.\n\n{}", lang_note(lang)),
+        format!(
+            "{}\n\n{}\n\nExisting agents (reusable as is):\n{list}\n\nCompanies already present (names not to reuse): {taken}.\n\n{}",
+            company_instructions(dirs),
+            dirs.note(),
+            lang_note(lang)
+        ),
         "--".into(),
         "I want to create a new company of agents. Ask me your questions.".into(),
     ]
@@ -221,7 +263,17 @@ Rules: start no realisation and delegate nothing yourself; modify no file other 
 /// next correction round). It may also create/adjust seats, agents or permissions the team lacks. Plan mode:
 /// every write is approved by the user first.
 #[allow(clippy::too_many_arguments)]
-pub fn escalation_args(lang: Lang, company: &str, boss_title: &str, boss_prompt: &str, outline: &[String], brief_path: &str, resolution_path: &str, blockage: &str) -> Vec<String> {
+pub fn escalation_args(
+    lang: Lang,
+    company: &str,
+    boss_title: &str,
+    boss_prompt: &str,
+    outline: &[String],
+    brief_path: &str,
+    resolution_path: &str,
+    blockage: &str,
+    dirs: &Dirs,
+) -> Vec<String> {
     let blockage: String = blockage.chars().take(6000).collect();
     let system = format!(
         r###"You are "{boss_title}" of the company "{company}". A mission is BLOCKED: your team tried to correct the problem inside the hierarchy and nobody could, so the run is paused and escalated to you and to the user who requested the mission.
@@ -241,14 +293,17 @@ Files (paths relative to the current directory):
 Steps, in order:
 1. Explain the blockage to the user plainly: what is blocked, why, what was already tried, what is missing (a permission, a tool, a prerequisite, a decision, a seat or agent that does not exist).
 2. Propose a clean correction plan, then discuss it with the user (AskUserQuestion fits for precise choices). Do not ask what you can decide alone. Do not minimize the problem and do not propose to skip it.
-3. If something must be created or adjusted for the team (a seat or its allow_bash in .claude/companies/*.toml, an agent in .claude/agents/*.md), do it once the user approves. Never touch the project's source code yourself: the team does that when the correction is retried.
+3. If something must be created or adjusted for the team (a seat or its allow_bash in the company file, an agent file), do it once the user approves. Never touch the project's source code yourself: the team does that when the correction is retried.
 4. Write {resolution_path} IN FULL: the decisions agreed with the user, the correction plan, and who should do what. This file is handed to you as the requester's decision at the next correction round.
 5. Tell the user they can leave the session (/exit) to go back to the run: Enter retries the correction, Esc stops the mission. If you changed a company file, tell them the new organization only applies to a new run (stop, then resume the mission).
 
 Rules: modify no file other than {resolution_path}, company files and agent files; start no realisation yourself.
 
+{dirs}
+
 {note}"###,
         org = outline.join("\n"),
+        dirs = dirs.note(),
         note = lang_note(lang),
     );
     vec![
@@ -267,26 +322,34 @@ Rules: modify no file other than {resolution_path}, company files and agent file
 mod tests {
     use super::*;
 
+    /// Dossiers de test : agents et entreprises chez l'utilisateur, projet à part.
+    fn dirs() -> Dirs {
+        Dirs::of(&ConfigDirs { project: "/projet".into(), user: Some("/maison/.claude".into()) })
+    }
+
     #[test]
     fn la_langue_choisie_est_annoncee_au_modele() {
-        let fr = agent_creation_args(Lang::Fr, &[]).join(" ");
-        let en = agent_creation_args(Lang::En, &[]).join(" ");
+        let fr = agent_creation_args(Lang::Fr, &[], &dirs()).join(" ");
+        let en = agent_creation_args(Lang::En, &[], &dirs()).join(" ");
         assert!(fr.contains("The user's language is Français") && en.contains("The user's language is English"));
     }
 
     #[test]
     fn args_mode_plan_et_noms_pris() {
-        let a = agent_creation_args(Lang::Fr, &["poete".into(), "critique".into()]);
+        let a = agent_creation_args(Lang::Fr, &["poete".into(), "critique".into()], &dirs());
         assert!(a.windows(2).any(|w| w == ["--permission-mode", "plan"]));
         let sys = &a[a.iter().position(|x| x == "--append-system-prompt").unwrap() + 1];
-        assert!(sys.contains(".claude/agents/<name>.md"));
+        // Un agent créé est écrit chez l'utilisateur : disponible depuis tous les dossiers.
+        assert!(sys.contains("/maison/.claude/agents/<name>.md"), "{sys}");
+        assert!(!sys.contains(".claude/agents/<name>.md\n") || sys.contains("/maison"));
+        assert!(sys.contains("/projet/.claude/agents"), "le projet reste prioritaire, et l'assistant le sait : {sys}");
         assert!(sys.contains("poete, critique"));
         assert_eq!(a[a.len() - 2], "--");
     }
 
     #[test]
     fn sans_agent_existant() {
-        let a = agent_creation_args(Lang::Fr, &[]);
+        let a = agent_creation_args(Lang::Fr, &[], &dirs());
         assert!(a.iter().any(|x| x.contains("(do not reuse): none.")));
     }
 
@@ -320,10 +383,10 @@ mod tests {
 
     #[test]
     fn entreprise_args_agents_et_entreprises_existants() {
-        let a = company_creation_args(Lang::Fr, &[("developer".into(), "Développeur".into())], &["acme".into()]);
+        let a = company_creation_args(Lang::Fr, &[("developer".into(), "Développeur".into())], &["acme".into()], &dirs());
         assert!(a.windows(2).any(|w| w == ["--permission-mode", "plan"]));
         let sys = &a[a.iter().position(|x| x == "--append-system-prompt").unwrap() + 1];
-        assert!(sys.contains(".claude/companies/<name>.toml") && sys.contains(".claude/agents/<agent>.md"));
+        assert!(sys.contains("/maison/.claude/companies/<name>.toml") && sys.contains("/maison/.claude/agents/<agent>.md"), "{sys}");
         assert!(sys.contains("- developer: Développeur"));
         assert!(sys.contains("not to reuse): acme."));
         assert!(sys.contains("exactly ONE seat without `reports_to`") && sys.contains("builds = true"));
@@ -331,9 +394,19 @@ mod tests {
         assert_eq!(a[a.len() - 2], "--");
     }
 
+    /// Sans dossier personnel accessible, tout retombe dans le projet (et on ne parle pas d'ailleurs).
+    #[test]
+    fn sans_dossier_utilisateur_tout_reste_dans_le_projet() {
+        let d = Dirs::of(&ConfigDirs::project_only("/projet"));
+        let a = agent_creation_args(Lang::Fr, &[], &d);
+        let sys = &a[a.iter().position(|x| x == "--append-system-prompt").unwrap() + 1];
+        assert!(sys.contains("/projet/.claude/agents/<name>.md"), "{sys}");
+        assert!(!sys.contains("take precedence"), "rien à dire sur le projet : {sys}");
+    }
+
     #[test]
     fn entreprise_sans_agent_existant() {
-        let a = company_creation_args(Lang::Fr, &[], &[]);
+        let a = company_creation_args(Lang::Fr, &[], &[], &dirs());
         assert!(a.iter().any(|x| x.contains("no agent exists yet") && x.contains("not to reuse): none.")));
     }
 }
@@ -373,7 +446,7 @@ Rules: create or modify no other file; never delete the file.
 /// `claude` arguments to discuss a finished mission's report with the user and turn it into actions.
 /// Plan mode: every write is approved by the user first. `companies`: (file name, org chart lines);
 /// `agents`: (name, description).
-pub fn debrief_args(lang: Lang, mission_dir: &str, followup_id: &str, agents: &[(String, String)], companies: &[(String, Vec<String>)]) -> Vec<String> {
+pub fn debrief_args(lang: Lang, mission_dir: &str, followup_id: &str, agents: &[(String, String)], companies: &[(String, Vec<String>)], dirs: &Dirs) -> Vec<String> {
     let comps = if companies.is_empty() {
         "(no company exists yet)".to_string()
     } else {
@@ -385,7 +458,7 @@ pub fn debrief_args(lang: Lang, mission_dir: &str, followup_id: &str, agents: &[
 
 Mission folder: {dir} (paths relative to the current directory). Read, in this order: compte-rendu.md (the report), then rapport.md (final report of the boss), conception.md (the plan) and brief.md (the request) when they exist.
 
-Existing companies (file in .claude/companies/, then org chart):
+Existing companies (file name, then org chart):
 {comps}
 
 Existing agents:
@@ -400,11 +473,13 @@ Steps, in order:
 4. Once the user approves, put the approved actions in place, nothing more:
    - write the list to {dir}/actions.md (checklist, one line per action: [ ] what, who (company or person), why);
    - a follow-up mission: write its brief to .essaim/missions/{followup}/brief.md (Markdown, first line "# <title>", then the goal, constraints and expected deliverables; use a different folder name for each extra brief), and assign the company by writing its file name (for example acme.toml, nothing else) to .essaim/missions/<same folder>/company;
-   - a new company: follow the "New company guide" below, write .claude/companies/<name>.toml and the agents it lacks, then assign it to the follow-up mission as above;
-   - changing an agent: edit .claude/agents/<name>.md. Changing an existing org chart: edit its file. Keep their exact format.
+   - a new company: follow the "New company guide" below, write the company file and the agents it lacks, then assign it to the follow-up mission as above;
+   - changing an agent or an existing org chart: edit its file, keeping its exact format.
 5. Re-read what you wrote, then tell the user they can leave the session (/exit) to go back to essaim, where new briefs appear in the Missions list (launch with r from the Company tab).
 
 Rules: never modify compte-rendu.md, rapport.md, conception.md or brief.md of this mission; do not touch project source code; do not launch missions yourself; never create a company or an agent without the user's approval of the org chart.
+
+{dirs}
 
 === New company guide (only if a company must be created) ===
 {guide}
@@ -412,7 +487,8 @@ Rules: never modify compte-rendu.md, rapport.md, conception.md or brief.md of th
 {note}"###,
         dir = mission_dir,
         followup = followup_id,
-        guide = COMPANY_INSTRUCTIONS,
+        dirs = dirs.note(),
+        guide = company_instructions(dirs),
         note = lang_note(lang),
     );
     vec![

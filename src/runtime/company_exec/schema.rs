@@ -4,6 +4,7 @@ use super::{Assignment, Blocker, Kind, Outcome, Question, Section, Status};
 use crate::model::company::Company;
 use crate::runtime::executor::{NodeResult, NodeStatus};
 use crate::runtime::scope;
+use crate::runtime::textutil::{take_chars, truncate_middle};
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
@@ -11,8 +12,13 @@ use serde_json::{Value, json};
 pub(super) const MODELS: [&str; 3] = ["haiku", "sonnet", "opus"];
 
 /// Schéma de sortie des appels de travail et de rapport. Avec un gabarit, `report` est remplacé par un champ
-/// obligatoire par section (taille bornée) : la forme de la réponse est celle que le délégant a demandée.
+/// obligatoire par section : la forme de la réponse est celle que le délégant a demandée.
 /// `ask` : l'employé peut poser une question cadrée (statut `question`) et attendre la réponse de son supérieur.
+///
+/// Aucune borne `maxLength` n'est posée dans le schéma : `claude` valide la sortie structurée et renvoie une
+/// erreur d'outil au moindre dépassement (« must NOT have more than N characters »), que le modèle ne sait pas
+/// éviter — il compte mal les caractères. L'appel partait alors en boucle d'erreurs puis échouait sans rien
+/// rendre. Les tailles restent annoncées dans le prompt (budget) et appliquées à la lecture, par troncature.
 pub(super) fn outcome_schema(sections: &[Section], ask: bool) -> String {
     let mut v = outcome_base();
     if ask {
@@ -21,16 +27,18 @@ pub(super) fn outcome_schema(sections: &[Section], ask: bool) -> String {
             "type": "object",
             "properties": {
                 "kind": {"type": "string", "enum": ["missing_info", "decision", "permission", "ambiguity"]},
-                "text": {"type": "string", "maxLength": QUESTION_CHARS},
-                "command": {"type": "string", "maxLength": COMMAND_CHARS},
-                "options": {"type": "array", "items": {"type": "string", "maxLength": 60}}
+                "text": {"type": "string", "description": format!("one short question, about {QUESTION_CHARS} chars")},
+                "command": {"type": "string", "description": format!("the exact shell command, about {COMMAND_CHARS} chars")},
+                "options": {"type": "array", "items": {"type": "string"}}
             },
             "required": ["kind", "text"]
         });
     }
     if !sections.is_empty() {
-        let props: serde_json::Map<String, Value> =
-            sections.iter().map(|s| (s.key.clone(), json!({"type": "string", "maxLength": s.max_chars, "description": s.expect}))).collect();
+        let props: serde_json::Map<String, Value> = sections
+            .iter()
+            .map(|s| (s.key.clone(), json!({"type": "string", "description": format!("{} (about {} chars, cut past that)", s.expect, s.max_chars)})))
+            .collect();
         v["properties"].as_object_mut().map(|p| p.remove("report"));
         v["properties"]["sections"] = json!({"type": "object", "properties": props, "required": sections.iter().map(|s| s.key.clone()).collect::<Vec<_>>()});
         v["required"] = json!(["status", "sections"]);
@@ -42,10 +50,13 @@ pub(super) fn outcome_schema(sections: &[Section], ask: bool) -> String {
     v.to_string()
 }
 
-/// Taille maximale d'une question d'employé et d'une réponse de supérieur.
+/// Taille maximale d'une question d'employé et d'une réponse de supérieur. Appliquée à la lecture (troncature),
+/// jamais par le schéma : voir `outcome_schema`.
 pub(super) const QUESTION_CHARS: usize = 150;
 pub(super) const COMMAND_CHARS: usize = 120;
 pub(super) const ANSWER_CHARS: usize = 300;
+/// Taille maximale d'une option proposée dans une question.
+const OPTION_CHARS: usize = 60;
 
 /// Schéma de la réponse d'un supérieur : une réponse courte, ou l'aveu qu'il ne peut pas répondre.
 pub(super) fn answer_schema() -> String {
@@ -53,7 +64,7 @@ pub(super) fn answer_schema() -> String {
         "type": "object",
         "properties": {
             "can_answer": {"type": "boolean"},
-            "answer": {"type": "string", "maxLength": ANSWER_CHARS}
+            "answer": {"type": "string", "description": format!("the answer, about {ANSWER_CHARS} chars")}
         },
         "required": ["can_answer", "answer"]
     })
@@ -73,7 +84,7 @@ pub(super) fn permission_schema() -> String {
         "type": "object",
         "properties": {
             "decision": {"type": "string", "enum": ["approve", "deny", "escalate"]},
-            "reason": {"type": "string", "maxLength": 150}
+            "reason": {"type": "string", "description": "one short sentence"}
         },
         "required": ["decision", "reason"]
     })
@@ -93,7 +104,7 @@ pub(super) fn parse_decision(r: &NodeResult) -> Decision {
 pub(super) fn parse_answer(r: &NodeResult) -> Option<String> {
     let v = r.structured.as_ref().filter(|_| !r.is_error)?;
     let a = v["answer"].as_str()?.trim();
-    (v["can_answer"].as_bool() == Some(true) && !a.is_empty()).then(|| a.to_string())
+    (v["can_answer"].as_bool() == Some(true) && !a.is_empty()).then(|| take_chars(a, ANSWER_CHARS))
 }
 
 fn outcome_base() -> Value {
@@ -133,11 +144,20 @@ pub(super) fn parse_outcome(r: &NodeResult, sections: &[Section]) -> Option<Outc
         "question" => Status::Blocked,
         _ => return None,
     };
+    // Tailles appliquées ici, et non par le schéma : un dépassement raccourcit la question, il ne fait plus échouer l'appel.
     let question = (v["status"] == "question").then(|| Question {
         kind: v["question"]["kind"].as_str().unwrap_or("ambiguity").to_string(),
-        text: v["question"]["text"].as_str().unwrap_or_default().trim().to_string(),
-        command: v["question"]["command"].as_str().unwrap_or_default().trim().to_string(),
-        options: v["question"]["options"].as_array().into_iter().flatten().filter_map(|o| o.as_str()).map(|o| o.trim().to_string()).filter(|o| !o.is_empty()).take(4).collect(),
+        text: take_chars(v["question"]["text"].as_str().unwrap_or_default().trim(), QUESTION_CHARS),
+        command: take_chars(v["question"]["command"].as_str().unwrap_or_default().trim(), COMMAND_CHARS),
+        options: v["question"]["options"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|o| o.as_str())
+            .map(|o| take_chars(o.trim(), OPTION_CHARS))
+            .filter(|o| !o.is_empty())
+            .take(4)
+            .collect(),
     });
     let text = |x: &Value| x.as_str().unwrap_or_default().trim().to_string();
     let mut blockers: Vec<Blocker> = v["blockers"]
@@ -169,10 +189,11 @@ pub(super) fn parse_outcome(r: &NodeResult, sections: &[Section]) -> Option<Outc
     let report = if sections.is_empty() {
         text(&v["report"])
     } else {
-        // Sections dans l'ordre voulu par le délégant ; une section vide reste visible (« — »).
+        // Sections dans l'ordre voulu par le délégant ; une section vide reste visible (« — »),
+        // une section trop longue est tronquée (le budget du délégant tient, sans erreur d'outil).
         sections
             .iter()
-            .map(|s| format!("### {}\n{}", s.title, Some(text(&v["sections"][&s.key])).filter(|t| !t.is_empty()).unwrap_or_else(|| "—".into())))
+            .map(|s| format!("### {}\n{}", s.title, Some(truncate_middle(&text(&v["sections"][&s.key]), s.max_chars)).filter(|t| !t.is_empty()).unwrap_or_else(|| "—".into())))
             .collect::<Vec<_>>()
             .join("\n\n")
     };
@@ -328,12 +349,16 @@ pub(super) fn parse_assignments(v: &Value, c: &Company, kids: &[usize], parent_s
             (s["name"].as_str().unwrap_or_default().to_string(), s["expect"].as_str().unwrap_or_default().to_string(), s["max_chars"].as_u64())
         }));
         let model = a["model"].as_str().map(str::trim).filter(|m| MODELS.contains(m)).map(String::from);
+        // Plusieurs affectations au même subordonné = plusieurs **étapes successives**, pas une tâche
+        // fusionnée : chacune repart d'une session neuve, ce qui garde les contextes petits. `task` reste
+        // leur concaténation, pour les rapports et l'historique du supérieur.
         match out.iter_mut().find(|x| x.to == idx) {
             Some(x) => {
                 x.model = x.model.clone().or(model);
                 if x.sections.is_empty() {
                     x.sections = sections;
                 }
+                x.steps.push(task.trim().to_string());
                 x.task.push_str("\n\n");
                 x.task.push_str(task.trim());
                 for m in sc {
@@ -342,7 +367,7 @@ pub(super) fn parse_assignments(v: &Value, c: &Company, kids: &[usize], parent_s
                     }
                 }
             }
-            None => out.push(Assignment { sections, to: idx, task: task.trim().to_string(), scope: sc, model }),
+            None => out.push(Assignment { sections, to: idx, steps: vec![task.trim().to_string()], task: task.trim().to_string(), scope: sc, model }),
         }
     }
     if out.is_empty() {

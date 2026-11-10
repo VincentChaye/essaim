@@ -46,7 +46,7 @@ pub(super) async fn run_phase(
         grants: Mutex::new(Default::default()),
     });
     let root_scope = if phase == Phase::Realisation { vec!["**".to_string()] } else { vec![] };
-    let out = run_seat(sh.clone(), root, phase, root_task.to_string(), root_scope, vec![]).await;
+    let out = run_seat(sh.clone(), root, phase, vec![root_task.to_string()], root_scope, vec![]).await;
     let cost = *cost_guard(&sh.cost);
     let used = sh.calls.load(Ordering::SeqCst).min(company.max_calls).saturating_sub(before);
     let ok = out.ok();
@@ -83,6 +83,11 @@ pub async fn run_mission(
     let calls = Arc::new(AtomicU32::new(0));
     if let Some(d) = &opts.mission_dir {
         missions::mark_done(d, false); // un run neuf invalide l'ancien succès
+        // Le run repart : la marque de pause ne vaut plus — sauf si la porte est déjà fermée (reprise avant
+        // la réinitialisation de la fenêtre : la mission reste en pause jusqu'à l'heure annoncée).
+        if !opts.pause.paused() {
+            missions::clear_pause(d);
+        }
     }
     let save = |name: &str, text: &str| -> Result<()> {
         match &opts.mission_dir {
@@ -111,10 +116,11 @@ pub async fn run_mission(
             }
         };
         save("conception.md", &c.report).map_err(|e| fail(e, c.tokens))?;
-        if c.ok && !*cancel.borrow() {
-            if let Some(d) = &opts.mission_dir {
-                missions::mark_conception_done(d).map_err(|e| fail(e, c.tokens))?;
-            }
+        if c.ok
+            && !*cancel.borrow()
+            && let Some(d) = &opts.mission_dir
+        {
+            missions::mark_conception_done(d).map_err(|e| fail(e, c.tokens))?;
         }
         c
     };
@@ -177,6 +183,11 @@ pub async fn run_mission(
     // Réussie = menée à terme : conception ok, et réalisation faite si l'entreprise en a une (un plan refusé n'est pas un succès).
     if let Some(d) = &opts.mission_dir {
         missions::mark_done(d, outcome.ok && (!has_builders || outcome.realisation.is_some()));
+        // Mission allée au bout : elle n'est plus en pause. Après une annulation, la marque est laissée en
+        // place : c'est ce qui permet de quitter essaim pendant une pause et de reprendre plus tard.
+        if !*cancel.borrow() {
+            missions::clear_pause(d);
+        }
     }
     emit(&tx, RunEvent::RunFinished { ok: outcome.ok, tokens: outcome.tokens });
     Ok(outcome)

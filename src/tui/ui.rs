@@ -2,6 +2,7 @@ use super::settings::{Lang, tr};
 use crate::tf;
 use super::app::{App, form_labels, Field, Mode, NodeState, PendingAction, RunView, Tab};
 use crate::runtime::executor::NodeStatus;
+use crate::runtime::pause::Why as PauseWhy;
 use crate::runtime::sessions::{Phase, Session};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -25,7 +26,10 @@ pub fn draw(f: &mut Frame, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            let label = if *t == Tab::Run && app.running() {
+            let label = if *t == Tab::Run && app.run.as_ref().is_some_and(|r| r.finished.is_none() && r.paused().is_some()) {
+                // Pause visible depuis n'importe quel onglet : le run n'avance plus, il n'est pas perdu.
+                format!("{} {} ⏸", i + 1, t.title(app.lang))
+            } else if *t == Tab::Run && app.running() {
                 format!("{} {}", i + 1, format!("{} {}", t.title(app.lang), SPINNER[app.tick as usize % 10]))
             } else if *t == Tab::Terminal && app.term.as_ref().is_some_and(|s| !s.exited) {
                 format!("{} {} ●", i + 1, t.title(app.lang))
@@ -42,7 +46,7 @@ pub fn draw(f: &mut Frame, app: &App) {
                 Block::bordered()
                     .title(" essaim ")
                     .title_top(Line::from(Span::styled(quota_title.unwrap_or_default(), Style::new().fg(Color::Cyan))).centered())
-                    .title_top(Line::from(Span::styled(app.lang.t(" Ctrl+K aide · F10 réglages ", " Ctrl+K help · F10 settings "), Style::new().fg(Color::Yellow))).right_aligned()),
+                    .title_top(Line::from(Span::styled(app.lang.t(" Ctrl+K aide · F9 conso · F10 réglages ", " Ctrl+K help · F9 usage · F10 settings "), Style::new().fg(Color::Yellow))).right_aligned()),
             )
             .highlight_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         tabs,
@@ -209,7 +213,8 @@ fn help_text(app: &App) -> &'static str {
         (_, Tab::Agents) => "↑↓ choisir · n créer avec l'assistant · N formulaire · e éditer · D supprimer · q quitter",
         (_, Tab::Company) => "←↑↓→ zones · Entrée entrer · Échap sortir · dans une zone : e éditer (a ajouter · x retirer dans l'organigramme) · r lancer · Ctrl+K toutes les touches",
         (_, Tab::Run) if app.show_history => "↑↓ choisir · Entrée ouvrir · D supprimer · h retour · Tab onglet · q quitter",
-        (_, Tab::Run) => "↑↓ nœud · c copier le journal (C tous) · s annuler le run · h historique · Tab onglet · q quitter",
+        (_, Tab::Run) if app.run.as_ref().is_some_and(|r| r.paused().is_some()) => "run en pause · p reprendre · s annuler · q quitter (la mission reprendra plus tard)",
+        (_, Tab::Run) => "↑↓ nœud · c copier le journal (C tous) · p pause · s annuler le run · h historique · q quitter",
         (_, Tab::Terminal) => match &app.term {
             None => "n dans Agents ou Entreprise ouvre un assistant ici · Tab onglet · q quitter",
             Some(t) if t.exited => "session terminée — appuyez sur une touche pour fermer",
@@ -230,7 +235,8 @@ fn help_text_en(app: &App) -> &'static str {
         (_, Tab::Agents) => "↑↓ pick · n create with assistant · N form · e edit · D delete · q quit",
         (_, Tab::Company) => "←↑↓→ zones · Enter enter · Esc leave · in a zone: e edit (a add · x remove in the org chart) · r run · Ctrl+K all keys",
         (_, Tab::Run) if app.show_history => "↑↓ pick · Enter open · D delete · h back · Tab tab · q quit",
-        (_, Tab::Run) => "↑↓ node · c copy log (C all) · s cancel run · h history · Tab tab · q quit",
+        (_, Tab::Run) if app.run.as_ref().is_some_and(|r| r.paused().is_some()) => "run paused · p resume · s cancel · q quit (the mission will resume later)",
+        (_, Tab::Run) => "↑↓ node · c copy log (C all) · p pause · s cancel run · h history · q quit",
         (_, Tab::Terminal) => match &app.term {
             None => "n in Agents or Company opens an assistant here · Tab tab · q quit",
             Some(t) if t.exited => "session ended — press any key to close",
@@ -271,6 +277,8 @@ fn draw_agents(f: &mut Frame, area: Rect, app: &App) {
                 field_line("Description", &a.description),
                 field_line(tr("Modèle", "Model"), a.model.as_deref().unwrap_or(tr("(défaut)", "(default)"))),
                 field_line(tr("Outils", "Tools"), &a.tools.as_ref().map(|t| t.join(", ")).unwrap_or_else(|| tr("(tous)", "(all)").into())),
+                // Fichier : dit si l'agent est à vous (dossier personnel, donc partout) ou propre au projet.
+                field_line(tr("Fichier", "File"), &agent_file_label(app, a)),
                 Line::raw(""),
             ];
             v.extend(a.prompt.lines().map(|l| Line::raw(l.to_string())));
@@ -279,6 +287,18 @@ fn draw_agents(f: &mut Frame, area: Rect, app: &App) {
     };
     let block = Block::bordered().title(tr(" Détail ", " Details "));
     f.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }).block(block), right);
+}
+
+/// Fichier d'un agent, raccourci, suivi de sa portée (tous les dossiers, ou ce projet seul).
+fn agent_file_label(app: &App, a: &crate::model::agent::AgentDef) -> String {
+    match &a.path {
+        Some(p) => format!(
+            "{}{}",
+            crate::model::display_short(p),
+            if app.dirs.is_global(p) { tr(" (toutes vos sessions)", " (all your sessions)") } else { tr(" (ce projet)", " (this project)") }
+        ),
+        None => tr("(non enregistré)", "(not saved)").to_string(),
+    }
 }
 
 fn field_line(k: &str, v: &str) -> Line<'static> {
@@ -444,20 +464,34 @@ fn draw_run(f: &mut Frame, area: Rect, app: &App) {
         return;
     };
     let [head, main] = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
-    let (label, color) = match run.finished {
-        None => (tr("en cours", "running").to_string(), Color::Cyan),
-        Some(true) => (tr("terminé ✔", "done ✔").to_string(), Color::Green),
-        Some(false) => (tr("terminé avec erreurs ✖", "done with errors ✖").to_string(), Color::Red),
+    let fr = super::settings::current() == Lang::Fr;
+    let (label, color) = match (run.finished, run.paused()) {
+        // Une pause de limite se lève seule : l'heure de reprise est dite ici, elle se met à jour à chaque dessin.
+        (None, Some(st)) => (
+            match st.why {
+                PauseWhy::Limit => tf!(
+                    "⏸ en pause — limite d'abonnement, reprise {}",
+                    "⏸ paused — subscription limit, resuming {}",
+                    crate::runtime::pause::reset_label(st.resets_at, fr)
+                ),
+                PauseWhy::User => tr("⏸ en pause (p : reprendre)", "⏸ paused (p: resume)").to_string(),
+            },
+            Color::Yellow,
+        ),
+        (None, None) => (tr("en cours", "running").to_string(), Color::Cyan),
+        (Some(true), _) => (tr("terminé ✔", "done ✔").to_string(), Color::Green),
+        (Some(false), _) => (tr("terminé avec erreurs ✖", "done with errors ✖").to_string(), Color::Red),
     };
     // En cours : le total final du nœud s'il est connu, sinon le cumul temps réel des messages reçus.
-    let live = |n: &super::app::NodeView| if n.tokens > 0 { (n.tokens, n.cached) } else { (n.live.0 + n.live_msg.1, n.live.1 + n.live_msg.2) };
+    let live = |n: &super::app::NodeView| if n.tokens > 0 { (n.tokens, n.volume, n.cached) } else { (n.live.0 + n.live_msg.1, 0, n.live.1 + n.live_msg.2) };
     let tokens: u64 = if run.finished.is_some() { run.tokens } else { run.nodes.iter().map(|n| live(n).0).sum() };
-    let cached: u64 = run.nodes.iter().map(|n| live(n).1).sum();
+    let volume: u64 = run.nodes.iter().map(|n| live(n).1).sum();
+    let cached: u64 = run.nodes.iter().map(|n| live(n).2).sum();
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(format!("{} — ", run.name), Style::new().add_modifier(Modifier::BOLD)),
             Span::styled(label, Style::new().fg(color)),
-            Span::raw(format!("   {} tokens", crate::runtime::missions::with_cache(tokens, cached, super::settings::current() == Lang::Fr))),
+            Span::raw(format!("   {} tokens", crate::runtime::missions::with_cache(tokens, volume, cached, fr))),
         ]))
         .block(Block::bordered().title(" Run ")),
         head,

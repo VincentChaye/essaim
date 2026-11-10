@@ -3,13 +3,17 @@
 use super::prompt::{escalation_summary, report_prompt, work_prompt};
 use super::schema::{FixPlan, ReviewPlan};
 use super::shared::Shared;
-use super::{Assignment, Blocker, Kind, Phase, SeatOut, Section, Status};
+use super::{Assignment, Blocker, Kind, Phase, SeatOut, Section, Status, join_steps};
 use crate::runtime::executor::EscalationReply;
 use crate::runtime::scope;
+use crate::runtime::textutil::truncate_middle;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::task::JoinSet;
+
+/// Taille conservée (début+fin) du texte d'un résultat d'un tour précédent dans l'historique du poste.
+const OLD_ROUND_CHARS: usize = 2000;
 
 /// Exécute des affectations : en conception tout en parallèle ; en réalisation par lots sans chevauchement de
 /// fichiers, l'un après l'autre. Un lot qui échoue arrête les suivants (on ne construit pas sur une base cassée).
@@ -30,7 +34,7 @@ async fn run_batch(sh: &Arc<Shared>, from: usize, phase: Phase, todo: Vec<Assign
             started[n] = true;
             let a = &todo[n];
             sh.set_hint(from, a);
-            let (sh2, to, t, s2, sec) = (sh.clone(), a.to, a.task.clone(), a.scope.clone(), a.sections.clone());
+            let (sh2, to, t, s2, sec) = (sh.clone(), a.to, a.steps.clone(), a.scope.clone(), a.sections.clone());
             set.spawn(async move { (n, run_seat(sh2, to, phase, t, s2, sec).await) });
         }
         while let Some(joined) = set.join_next().await {
@@ -59,13 +63,37 @@ fn result_row(sh: &Shared, a: &Assignment, out: &SeatOut) -> (String, String, St
     (s.title.clone(), s.id.clone(), a.task.clone(), out.ok(), out.for_supervisor())
 }
 
-pub(super) fn run_seat(sh: Arc<Shared>, i: usize, phase: Phase, task: String, sc: Vec<String>, sections: Vec<Section>) -> Pin<Box<dyn Future<Output = SeatOut> + Send>> {
+/// `steps` : les étapes confiées au poste, dans l'ordre (au moins une).
+pub(super) fn run_seat(sh: Arc<Shared>, i: usize, phase: Phase, steps: Vec<String>, sc: Vec<String>, sections: Vec<Section>) -> Pin<Box<dyn Future<Output = SeatOut> + Send>> {
     Box::pin(async move {
         let kids = sh.kids(i, phase);
+        // Un poste interne raisonne sur l'ensemble de ce qu'on lui confie : il le redécoupe lui-même.
+        let task = steps.join("\n\n");
 
-        // Feuille : travail direct.
+        // Feuille : travail direct, une étape après l'autre. Chaque étape est un appel `claude` neuf,
+        // donc un contexte qui ne porte que cette étape — c'est tout l'intérêt du découpage. Une étape
+        // qui n'aboutit pas arrête les suivantes : on ne construit pas sur une base cassée.
         if kids.is_empty() {
-            return sh.act(i, phase, Kind::Work, work_prompt(&task, phase, &sections), &kids, &sc, &sections).await.into();
+            let mut done: Vec<(usize, SeatOut)> = vec![];
+            for (n, step) in steps.iter().enumerate() {
+                if sh.cancelled() {
+                    break;
+                }
+                let only = steps.len() == 1;
+                let out: SeatOut = sh
+                    .act(i, phase, Kind::Work, work_prompt(step, phase, &sections, (!only).then_some((n + 1, steps.len())), sh.company.allows_git(i)), &kids, &sc, &sections, (!only).then_some(n as u32))
+                    .await
+                    .into();
+                let ok = out.ok();
+                done.push((n + 1, out));
+                if !ok {
+                    break;
+                }
+            }
+            if done.is_empty() {
+                return SeatOut::failed("cancelled");
+            }
+            return join_steps(done);
         }
 
         // Poste interne : délégation → travail des subordonnés → (correction des échecs) → rapport de synthèse.
@@ -83,8 +111,15 @@ pub(super) fn run_seat(sh: Arc<Shared>, i: usize, phase: Phase, task: String, sc
         let mut reason: Option<String> = None;
         // Problèmes non résolus à la fin : (titre, texte avec blocages, blocages).
         let mut unresolved: Vec<(String, String, Vec<Blocker>)> = vec![];
+        // Rangées de `history` déjà réduites (tours précédents) : une seule réduction, jamais deux.
+        let mut compacted = 0;
         loop {
             let (ran, pending) = run_batch(&sh, i, phase, todo).await;
+            // Les résultats des tours précédents ne servent plus qu'en rappel : début+fin, le tour courant reste entier.
+            for row in &mut history[compacted..] {
+                row.4 = truncate_middle(&row.4, OLD_ROUND_CHARS);
+            }
+            compacted = history.len();
             let mut failed_rows = vec![];
             unresolved.clear();
             for (a, out) in &ran {
@@ -158,7 +193,7 @@ pub(super) fn run_seat(sh: Arc<Shared>, i: usize, phase: Phase, task: String, sc
             }
         }
 
-        let rep = sh.act(i, phase, Kind::Report, report_prompt(&task, &history, &sections), &kids, &sc, &sections).await;
+        let rep = sh.act(i, phase, Kind::Report, report_prompt(&task, &history, &sections), &kids, &sc, &sections, None).await;
         let mut blockers: Vec<Blocker> = unresolved.iter().flat_map(|(_, _, b)| b.clone()).collect();
         if unresolved.is_empty() && rep.status == Status::Done {
             return SeatOut { status: Status::Done, text: rep.report, blockers: vec![] };

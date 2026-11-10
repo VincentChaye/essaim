@@ -6,7 +6,7 @@ use crate::runtime::executor::{NodeStatus, RunEvent};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
 fn tmp_root() -> PathBuf {
@@ -15,9 +15,20 @@ fn tmp_root() -> PathBuf {
     d
 }
 
-fn new_app(root: &PathBuf) -> App {
+/// App de test : projet seul, sans dossier personnel, pour que le vrai `~/.claude` de la machine
+/// n'entre jamais dans ce que les tests comptent.
+fn new_app(root: &Path) -> App {
     let (tx, _rx) = mpsc::unbounded_channel();
-    App::new(root.clone(), tx)
+    App::with_dirs(crate::model::ConfigDirs::project_only(root), root.to_path_buf(), tx)
+}
+
+/// App de test avec un dossier personnel jetable : `<root>/maison/.claude`.
+fn new_app_avec_maison(root: &Path) -> App {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let dirs = crate::model::ConfigDirs { project: root.to_path_buf(), user: Some(root.join("maison/.claude")) };
+    std::fs::create_dir_all(dirs.user.clone().unwrap().join("companies")).unwrap();
+    std::fs::create_dir_all(dirs.user.clone().unwrap().join("agents")).unwrap();
+    App::with_dirs(dirs, root.to_path_buf(), tx)
 }
 
 fn screen(app: &App) -> String {
@@ -40,7 +51,7 @@ fn type_str(app: &mut App, s: &str) {
     }
 }
 
-fn write_agent(root: &PathBuf, name: &str) {
+fn write_agent(root: &Path, name: &str) {
     std::fs::write(root.join(format!(".claude/agents/{name}.md")), format!("---\nname: {name}\ndescription: desc de {name}\n---\nprompt de {name}\n")).unwrap();
 }
 
@@ -85,6 +96,45 @@ fn creation_d_agent_au_clavier() {
     assert_eq!(a.tools, Some(vec!["Read".into(), "Grep".into()]));
     assert_eq!(a.prompt, "Tu relis.\nSois bref.");
     assert!(app.agents.iter().any(|x| x.name == "relecteur"));
+}
+
+/// Ce que l'on crée est à soi, pas au projet : un agent saisi au clavier est écrit dans
+/// `~/.claude/agents`, et le détail le dit.
+#[test]
+fn un_agent_cree_va_dans_le_dossier_personnel() {
+    let root = tmp_root();
+    let mut app = new_app_avec_maison(&root);
+    press(&mut app, KeyCode::Char('N'));
+    type_str(&mut app, "relecteur");
+    press(&mut app, KeyCode::Tab);
+    type_str(&mut app, "Relit le code");
+    app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    assert!(matches!(app.mode, Mode::Normal), "{}", app.status);
+    let attendu = root.join("maison/.claude/agents/relecteur.md");
+    assert!(attendu.is_file(), "écrit chez l'utilisateur, pas dans le projet : {}", app.status);
+    assert!(!root.join(".claude/agents/relecteur.md").exists());
+    app.agent_sel = app.agents.iter().position(|a| a.name == "relecteur").unwrap();
+    assert!(screen(&app).contains("toutes vos sessions"), "{}", screen(&app));
+    // Et il se supprime depuis l'outil, où qu'il soit.
+    press(&mut app, KeyCode::Char('D'));
+    press(&mut app, KeyCode::Char('o'));
+    assert!(!attendu.exists(), "{}", app.status);
+    assert!(app.status.contains("supprimé"), "{}", app.status);
+}
+
+/// Un agent du projet garde la main sur l'agent personnel de même nom, et le détail le dit.
+#[test]
+fn un_agent_du_projet_prime_sur_celui_du_dossier_personnel() {
+    let root = tmp_root();
+    let app = new_app_avec_maison(&root);
+    std::fs::write(root.join("maison/.claude/agents/poete.md"), "---\nname: poete\ndescription: version personnelle\n---\np\n").unwrap();
+    write_agent(&root, "poete");
+    let mut app = app;
+    app.reload();
+    assert_eq!(app.agents.iter().filter(|a| a.name == "poete").count(), 1);
+    let s = screen(&app);
+    assert!(s.contains("desc de poete") && s.contains("(ce projet)"), "{s}");
+    assert!(!s.contains("version personnelle"), "{s}");
 }
 
 #[test]
@@ -151,6 +201,7 @@ fn affichage_d_un_run() {
         tokens: 0,
         finished: None,
         cancel,
+        pause: crate::runtime::pause::Gate::new(),
     });
     app.tab = Tab::Run;
     app.on_run_event(RunEvent::NodeStarted { id: "a".into() });
@@ -186,7 +237,7 @@ fn navigation_onglets_et_quitter_annule_le_run() {
     assert!(sans_run.quit);
 
     let (cancel, rx) = tokio::sync::watch::channel(false);
-    app.run = Some(RunView { name: "x".into(), nodes: vec![], sel: 0, tokens: 0, finished: None, cancel });
+    app.run = Some(RunView { name: "x".into(), nodes: vec![], sel: 0, tokens: 0, finished: None, cancel, pause: crate::runtime::pause::Gate::new() });
     press(&mut app, KeyCode::Char('q'));
     assert!(!app.quit && matches!(app.mode, Mode::ConfirmAction(PendingAction::QuitRun(_))), "run en cours : confirmation");
     assert!(screen(&app).contains("Quitter et annuler le run « x »"));
@@ -204,7 +255,7 @@ fn ctrl_c_pendant_un_run_demande_confirmation() {
     let root = tmp_root();
     let mut app = new_app(&root);
     let (cancel, rx) = tokio::sync::watch::channel(false);
-    app.run = Some(RunView { name: "x".into(), nodes: vec![], sel: 0, tokens: 0, finished: None, cancel });
+    app.run = Some(RunView { name: "x".into(), nodes: vec![], sel: 0, tokens: 0, finished: None, cancel, pause: crate::runtime::pause::Gate::new() });
     app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
     assert!(!app.quit && matches!(app.mode, Mode::ConfirmAction(_)));
     press(&mut app, KeyCode::Esc);
@@ -216,7 +267,7 @@ fn annulation_du_run_demande_confirmation() {
     let root = tmp_root();
     let mut app = new_app(&root);
     let (cancel, rx) = tokio::sync::watch::channel(false);
-    app.run = Some(RunView { name: "coupe".into(), nodes: vec![], sel: 0, tokens: 0, finished: None, cancel });
+    app.run = Some(RunView { name: "coupe".into(), nodes: vec![], sel: 0, tokens: 0, finished: None, cancel, pause: crate::runtime::pause::Gate::new() });
     app.tab = Tab::Run;
     press(&mut app, KeyCode::Char('s'));
     assert!(screen(&app).contains("Annuler le run « coupe » ? (o/n)"));
@@ -358,6 +409,7 @@ fn run_view(names: &[&str]) -> RunView {
         tokens: 0,
         finished: None,
         cancel,
+        pause: crate::runtime::pause::Gate::new(),
     }
 }
 
@@ -415,7 +467,7 @@ fn run_interrompu_et_suppression_d_historique() {
         started_ms: 9000,
         finished: None,
         tokens: 0,
-        nodes: vec![crate::runtime::store::NodeRecord { id: "a".into(), agent: "x".into(), label: String::new(), depth: 0, status: None, tokens: 0, log: vec![] }],
+        nodes: vec![crate::runtime::store::NodeRecord { id: "a".into(), agent: "x".into(), label: String::new(), depth: 0, status: None, tokens: 0, session_id: None, log: vec![] }],
     };
     crate::runtime::store::save(&root, &rec).unwrap();
     let mut app = new_app(&root);
@@ -768,6 +820,23 @@ fn company_app() -> App {
     new_app(&root)
 }
 
+/// Une entreprise du dossier personnel est listée (marquée `~`) et exploitable depuis un projet qui
+/// n'en contient aucune : c'est ce qui la rend disponible dans tout le système de fichiers.
+#[test]
+fn entreprise_du_dossier_personnel_visible_depuis_un_projet_vierge() {
+    let root = tmp_root();
+    let mut app = new_app_avec_maison(&root);
+    std::fs::write(root.join("maison/.claude/agents/boss.md"), "---\nname: boss\ndescription: dirige\n---\np\n").unwrap();
+    std::fs::write(root.join("maison/.claude/agents/poete.md"), "---\nname: poete\ndescription: écrit\n---\np\n").unwrap();
+    std::fs::write(root.join("maison/.claude/companies/globale.toml"), ACME).unwrap();
+    app.reload();
+    press(&mut app, KeyCode::Char('2'));
+    let s = screen(&app);
+    assert!(s.contains("globale ~"), "entreprise personnelle marquée dans la liste : {s}");
+    assert!(s.contains("organigramme valide ✔"), "ses agents personnels sont bien trouvés : {s}");
+    assert!(s.contains("dans tous vos dossiers"), "sa portée est annoncée : {s}");
+}
+
 #[test]
 fn onglet_entreprise_arbre_niveaux_et_validation() {
     let mut app = company_app();
@@ -1060,7 +1129,7 @@ fn le_manuel_suit_la_largeur_du_terminal() {
 
 // ---------- missions (touche m) ----------
 
-fn write_brief(root: &PathBuf, id: &str, text: &str) {
+fn write_brief(root: &std::path::Path, id: &str, text: &str) {
     let dir = crate::runtime::missions::create(root, id).unwrap();
     crate::runtime::missions::set_company(&dir, "acme.toml").unwrap();
     crate::runtime::missions::write_output(&dir, "brief.md", text).unwrap();
@@ -1744,7 +1813,7 @@ fn interface_en_anglais_apres_le_choix_de_langue() {
     press(&mut app, KeyCode::Char('2'));
     press(&mut app, KeyCode::Char('2')); // onglet Company
     let s = screen(&app);
-    assert!(s.contains("No company in .claude/companies/") && s.contains("Missions (0)"), "{s}");
+    assert!(s.contains("No company.") && s.contains("Missions (0)"), "{s}");
     assert!(!s.contains("Aucune entreprise"), "{s}");
     app.on_key(ctrl_k());
     press(&mut app, KeyCode::Char('m'));
@@ -2056,7 +2125,7 @@ fn characterize_e07_agent_par_name_resolu_vers_mauvais_fichier() {
     let fm = |prompt: &str| format!("---\nname: cible\ndescription: d\nmodel: haiku\n---\n\n{prompt}\n");
     std::fs::write(dir.join("a-fichier.md"), fm("PROMPT-ANCIEN")).unwrap();
     std::fs::write(dir.join("cible.md"), fm("PROMPT-ECRIT-PAR-SAVE")).unwrap();
-    let agents = load_all(&root);
+    let agents = load_all(&crate::model::ConfigDirs::project_only(&root));
     let a = agents.iter().find(|a| a.name == "cible").expect("agent « cible » chargé");
     // Comportement actuel, attendu après correctif : `cible.md` (fichier écrit par `save`) prime, ou le doublon est signalé.
     assert!(a.prompt.contains("PROMPT-ANCIEN"), "prompt chargé : {:?}", a.prompt);
@@ -2084,11 +2153,11 @@ async fn characterize_r4_descendants_survivent_a_l_annulation() {
     let mut p = ClaudeProc::spawn_with(cmd, &spec, tx).unwrap();
     let mut pid = String::new();
     for _ in 0..100 {
-        if let Ok(s) = std::fs::read_to_string(&pidfile) {
-            if !s.trim().is_empty() {
-                pid = s.trim().to_string();
-                break;
-            }
+        if let Ok(s) = std::fs::read_to_string(&pidfile)
+            && !s.trim().is_empty()
+        {
+            pid = s.trim().to_string();
+            break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -2174,4 +2243,79 @@ fn echec_ne_propose_rien_et_un_cycle_est_refuse() {
     app.run_ctx = Some((company, m::dir_of(&app.root, &a)));
     app.on_run_event(RunEvent::RunFinished { ok: false, tokens: 0 });
     assert!(matches!(app.mode, Mode::Normal));
+}
+
+// ---------- pause d'un run (limite d'abonnement, pause voulue) ----------
+
+/// Un run en pause le dit dans l'en-tête avec son heure de reprise, la limite n'apparaît pas comme une
+/// erreur dans le journal, `p` met en pause / reprend, et `q` propose de quitter sans rien perdre.
+#[test]
+fn run_en_pause_affiche_la_reprise_et_quitter_ne_perd_rien() {
+    use crate::runtime::pause::{Gate, Why, now_s};
+    let root = tmp_root();
+    write_agent(&root, "poete");
+    let mut app = new_app(&root);
+    let (cancel, _rx) = tokio::sync::watch::channel(false);
+    let gate = Gate::new();
+    app.run = Some(RunView {
+        name: "demo".into(),
+        nodes: vec![NodeView::new("a", "poete")],
+        sel: 0,
+        tokens: 0,
+        finished: None,
+        cancel,
+        pause: gate.clone(),
+    });
+    app.tab = Tab::Run;
+    app.on_run_event(RunEvent::Node {
+        id: "a".into(),
+        event: ClaudeEvent::Result { text: "Claude AI usage limit reached|1761580800".into(), is_error: true, tokens: 0, volume: 0, cached: 0, duration_ms: 0, structured: None, denials: vec![] },
+    });
+    let log = app.run.as_ref().unwrap().nodes[0].log.clone();
+    assert!(log.iter().any(|l| l.starts_with('⏸')), "{log:?}");
+    assert!(!log.iter().any(|l| l.contains('✖')), "la limite n'est pas une erreur du poste : {log:?}");
+
+    gate.pause(Why::Limit, Some(now_s() + 3600));
+    app.on_run_event(RunEvent::Paused { why: Why::Limit, resets_at: Some(now_s() + 3600) });
+    let s = screen(&app);
+    assert!(s.contains("en pause") && s.contains("limite d'abonnement") && s.contains("reprise"), "{s}");
+
+    // q pendant la pause : la confirmation dit que la mission reprendra, elle ne parle pas d'annulation.
+    press(&mut app, KeyCode::Char('q'));
+    assert!(matches!(app.mode, Mode::ConfirmAction(PendingAction::QuitPaused(_))), "confirmation de sortie en pause");
+    let s = screen(&app);
+    assert!(s.contains("en pause") && s.contains("reste en pause") && !s.contains("annuler le run"), "{s}");
+    press(&mut app, KeyCode::Esc); // toute autre touche annule la sortie
+    assert!(!app.quit && matches!(app.mode, Mode::Normal));
+
+    // p : reprendre, puis p : remettre en pause à la main.
+    press(&mut app, KeyCode::Char('p'));
+    assert!(!gate.paused(), "{}", app.status);
+    press(&mut app, KeyCode::Char('p'));
+    assert_eq!(gate.state().map(|s| s.why), Some(Why::User));
+    assert!(screen(&app).contains("en pause"));
+}
+
+/// Une mission laissée en pause est signalée dans la liste et se relance sans question (rien à écraser),
+/// et son run repart porte fermée si la fenêtre d'abonnement n'est pas encore réinitialisée : aucun appel
+/// `claude` ne part avant l'heure, c'est la porte close qui le garantit.
+#[tokio::test]
+async fn mission_en_pause_est_signalee_et_se_reprend() {
+    use crate::runtime::missions as m;
+    use crate::runtime::pause::now_s;
+    let (mut app, a, _b) = linked_app();
+    let dir = m::dir_of(&app.root, &a);
+    m::write_output(&dir, "conception.md", "PLAN").unwrap();
+    m::mark_paused(&dir, Some(now_s() + 7200));
+    app.missions = m::list(&app.root);
+    app.mission_sel = app.missions.iter().position(|x| x.id == a).unwrap();
+    let s = screen(&app);
+    assert!(s.contains("en pause") && s.contains("reprise"), "{s}");
+    // `r` reprend directement : pas de confirmation d'écrasement du plan existant.
+    press(&mut app, KeyCode::Char('r'));
+    assert!(matches!(app.mode, Mode::Normal), "relance sans confirmation");
+    assert!(app.run.is_some(), "{}", app.status);
+    let run = app.run.as_ref().unwrap();
+    assert!(run.paused().is_some(), "le run repart en pause jusqu'à l'heure de reprise : {}", app.status);
+    assert!(app.status.contains("pause"), "{}", app.status);
 }

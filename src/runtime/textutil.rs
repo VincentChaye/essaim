@@ -11,7 +11,6 @@ pub fn is_blank(s: &str) -> bool {
 
 /// F6 : les `max` premiers caractères (et non les octets).
 /// Équivalent à `s.chars().take(max).collect::<String>()`.
-#[allow(dead_code)] // retiré à l'adoption (étape 4)
 pub fn take_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }

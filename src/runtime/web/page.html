@@ -1,0 +1,1104 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>essaim — consommation</title>
+<style>
+/* Palette de données validée (voir les contrôles de séparation CVD) : trois séries suffisent ici.
+   Les valeurs sombres sont choisies pour le fond sombre, ce n'est pas une inversion automatique. */
+:root {
+  color-scheme: light;
+  --plane: #f9f9f7;
+  --surface: #fcfcfb;
+  --ink: #0b0b0b;
+  --ink2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --ring: rgba(11,11,11,.10);
+  --s1: #2a78d6;
+  --s2: #eb6834;
+  --s3: #1baf7a;
+  --good: #0ca30c;
+  --warn: #fab219;
+  --crit: #d03b3b;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --plane: #0d0d0d;
+    --surface: #1a1a19;
+    --ink: #f0efec;
+    --ink2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --ring: rgba(255,255,255,.10);
+    --s1: #3987e5;
+    --s2: #d95926;
+    --s3: #199e70;
+  }
+}
+* { box-sizing: border-box; }
+/* `hidden` doit l'emporter sur les display: flex des composants (sinon l'élément reste visible). */
+[hidden] { display: none !important; }
+body {
+  margin: 0;
+  background: var(--plane);
+  color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  padding: 20px 20px 48px;
+}
+h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: .01em; }
+h2 { font-size: 13px; font-weight: 600; margin: 0 0 2px; }
+p.sub { margin: 0; color: var(--muted); font-size: 12px; }
+header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+header .spacer { flex: 1; }
+#etat { color: var(--muted); font-size: 12px; }
+.filters { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+.presets { display: flex; gap: 2px; background: var(--surface); border: 1px solid var(--ring); border-radius: 8px; padding: 2px; }
+.presets button {
+  font: inherit; font-size: 12px; color: var(--ink2); background: none; border: 0;
+  padding: 4px 10px; border-radius: 6px; cursor: pointer;
+}
+.presets button:hover { background: var(--grid); }
+.presets button[aria-pressed="true"] { background: var(--ink); color: var(--surface); }
+label.check { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink2); cursor: pointer; }
+.cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+@media (max-width: 900px) { .cards { grid-template-columns: minmax(0, 1fr); } }
+.card {
+  background: var(--surface); border: 1px solid var(--ring); border-radius: 12px;
+  padding: 14px 16px 12px; min-width: 0;
+}
+.card.wide { grid-column: 1 / -1; }
+.hero { display: flex; align-items: flex-end; gap: 28px; flex-wrap: wrap; }
+.hero .figure { font-size: 48px; line-height: 1.05; font-weight: 600; letter-spacing: -.02em; }
+.tiles { display: flex; gap: 26px; flex-wrap: wrap; }
+.tile .label { font-size: 12px; color: var(--muted); }
+.tile .value { font-size: 20px; font-weight: 600; }
+.tile .delta { font-size: 12px; color: var(--ink2); }
+.meter { height: 6px; border-radius: 3px; background: var(--grid); overflow: hidden; width: 140px; margin-top: 4px; }
+.meter > i { display: block; height: 100%; background: var(--s1); }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; margin: 2px 0 8px; font-size: 12px; color: var(--ink2); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+figure { margin: 0; }
+svg { display: block; width: 100%; overflow: visible; }
+svg:focus-visible { outline: 2px solid var(--s1); outline-offset: 3px; border-radius: 4px; }
+table { border-collapse: collapse; width: 100%; font-size: 12px; }
+th, td { text-align: left; padding: 5px 8px 5px 0; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; position: sticky; top: 0; background: var(--surface); }
+th.sortable { cursor: pointer; user-select: none; }
+th.sortable:hover { color: var(--ink); }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.name { white-space: normal; max-width: 420px; }
+/* Barres : une ligne par libellé, coupée à l'ellipse ; le texte entier est dans l'infobulle et la table. */
+table.bars { table-layout: fixed; }
+table.bars td { border-bottom: 0; padding: 3px 0; }
+table.bars tr:focus-visible { outline: 2px solid var(--s1); outline-offset: -2px; }
+table.bars .lab, table.bars .det { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+table.bars .det { color: var(--muted); font-size: 11px; }
+.scroll { max-height: 420px; overflow: auto; }
+/* Organigramme : taille naturelle, centré s'il tient, défilement horizontal sinon (jamais étiré). */
+.orga { overflow-x: auto; padding-bottom: 4px; display: flex; justify-content: safe center; }
+.orga svg { width: auto; flex: none; }
+.runhead { display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap; margin-bottom: 8px; }
+.runhead b { font-size: 20px; font-weight: 600; }
+.runhead .k { color: var(--muted); font-size: 12px; }
+.views { display: flex; gap: 2px; background: var(--surface); border: 1px solid var(--ring); border-radius: 8px; padding: 2px; }
+.views button { font: inherit; font-size: 12px; color: var(--ink2); background: none; border: 0; padding: 4px 12px; border-radius: 6px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+.views button:hover { background: var(--grid); }
+.views button[aria-pressed="true"] { background: var(--ink); color: var(--surface); }
+.banniere {
+  display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; cursor: pointer;
+  font: inherit; color: var(--ink); background: var(--surface);
+  border: 1px solid var(--ring); border-left: 3px solid var(--s1); border-radius: 12px; padding: 12px 16px;
+}
+.banniere:hover { border-color: var(--s1); }
+.banniere .go { margin-left: auto; color: var(--s1); font-size: 12px; white-space: nowrap; }
+.pulse { animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: .45 } }
+@media (prefers-reduced-motion: reduce) { .pulse { animation: none } }
+details { margin-top: 8px; }
+summary { font-size: 12px; color: var(--muted); cursor: pointer; }
+summary:hover { color: var(--ink); }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; box-shadow: 0 0 0 2px var(--surface); }
+.dot.on { background: var(--good); }
+.dot.off { background: var(--axis); }
+.tag { font-size: 11px; color: var(--ink2); border: 1px solid var(--ring); border-radius: 999px; padding: 1px 7px; }
+.banner { background: var(--surface); border: 1px solid var(--crit); color: var(--ink); border-radius: 8px; padding: 8px 12px; margin-bottom: 12px; font-size: 12px; }
+.empty { color: var(--muted); font-size: 12px; padding: 8px 0; }
+#wrap { transition: opacity .15s; }
+#wrap.busy { opacity: .6; }
+#tip {
+  position: fixed; z-index: 10; pointer-events: none; opacity: 0;
+  background: var(--surface); color: var(--ink); border: 1px solid var(--ring);
+  border-radius: 8px; padding: 8px 10px; font-size: 12px; min-width: 120px;
+  box-shadow: 0 6px 24px rgba(0,0,0,.18);
+}
+#tip .t { color: var(--muted); margin-bottom: 4px; }
+#tip .r { display: flex; align-items: center; gap: 6px; justify-content: space-between; }
+#tip .r b { font-variant-numeric: tabular-nums; }
+#tip .k { display: inline-block; width: 10px; height: 2px; border-radius: 1px; }
+footer { color: var(--muted); font-size: 11px; margin-top: 18px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>essaim — <span id="titre">consommation de jetons</span></h1>
+  <span class="spacer"></span>
+  <span id="etat"></span>
+</header>
+
+<div class="filters">
+  <div class="views" id="vues" role="group" aria-label="vue"></div>
+  <div class="presets" id="periodes" role="group" aria-label="période"></div>
+  <label class="check" id="cache-box"><input type="checkbox" id="cache"> <span id="cache-lbl"></span></label>
+  <label class="check"><input type="checkbox" id="auto" checked> <span id="auto-lbl"></span></label>
+</div>
+
+<div id="alerte"></div>
+
+<div id="wrap" class="cards">
+  <button class="banniere wide" id="bandeau" type="button" hidden></button>
+
+  <section class="card wide" data-vue="conso">
+    <div class="hero">
+      <div>
+        <p class="sub" id="hero-lbl"></p>
+        <div class="figure" id="hero"></div>
+        <p class="sub" id="hero-sub"></p>
+      </div>
+      <div class="tiles" id="tiles"></div>
+    </div>
+  </section>
+
+  <section class="card wide" id="carte-run" data-vue="mission" hidden>
+    <h2 id="t-run"></h2>
+    <p class="sub" id="s-run"></p>
+    <p class="empty" id="run-vide" hidden></p>
+    <div id="run-corps">
+      <div class="runhead" id="run-head"></div>
+      <div class="legend" id="l-run"></div>
+      <figure><div class="orga" id="orga"></div></figure>
+      <details><summary id="v-run"></summary><div class="scroll" id="run-table"></div></details>
+    </div>
+  </section>
+
+  <section class="card wide" data-vue="conso">
+    <h2 id="t-serie"></h2>
+    <p class="sub" id="s-serie"></p>
+    <div class="legend" id="l-serie"></div>
+    <figure><div id="serie"></div></figure>
+    <details><summary id="v-serie"></summary><div class="scroll" id="serie-table"></div></details>
+  </section>
+
+  <section class="card" data-vue="conso">
+    <h2 id="t-sessions"></h2>
+    <p class="sub" id="s-sessions"></p>
+    <figure><div id="bars-sessions"></div></figure>
+  </section>
+
+  <section class="card" data-vue="conso">
+    <h2 id="t-projets"></h2>
+    <p class="sub" id="s-projets"></p>
+    <figure><div id="bars-projets"></div></figure>
+    <h2 style="margin-top:14px" id="t-modeles"></h2>
+    <figure><div id="bars-modeles"></div></figure>
+  </section>
+
+  <section class="card wide" data-vue="conso">
+    <h2 id="t-term"></h2>
+    <p class="sub" id="s-term"></p>
+    <div id="term"></div>
+  </section>
+
+  <section class="card wide" data-vue="conso">
+    <h2 id="t-table"></h2>
+    <p class="sub" id="s-table"></p>
+    <div class="scroll" id="table"></div>
+  </section>
+
+  <section class="card wide" data-vue="conso">
+    <h2 id="t-essaim"></h2>
+    <p class="sub" id="s-essaim"></p>
+    <figure><div id="bars-agents"></div></figure>
+    <div class="scroll" id="runs"></div>
+  </section>
+</div>
+
+<div id="tip" role="status" aria-live="polite"></div>
+<footer id="pied"></footer>
+
+<script>
+"use strict";
+
+/* ——— textes ——————————————————————————————————————————————————————————— */
+const T = {
+  fr: {
+    titre: "consommation de jetons", cacheLbl: "volume brut (cache lu compris)", autoLbl: "rafraîchir",
+    heroLbl: "jetons consommés", msgs: "messages", sessions: "sessions", terminaux: "terminaux ouverts",
+    interactifs: "interactifs", fond: "de fond", partCache: "servi par le cache", sortie: "sortie générée",
+    entree: "entrée neuve", cacheLu: "cache lu", cacheLuPondere: "cache lu (×0,1)", sortiePonderee: "sortie (×5)", debit: "jetons par heure",
+    tSerie: "Dans le temps", sSerie: "jetons par tranche, par nature",
+    vSerie: "voir les valeurs", tranche: "tranche",
+    tSessions: "Qui consomme", sSessions: "les 12 sessions les plus coûteuses de la fenêtre",
+    tProjets: "Par dossier de travail", sProjets: "où les jetons ont été dépensés",
+    tModeles: "Par modèle",
+    tTerm: "Terminaux et agents ouverts", sTerm: "sessions claude vivantes, d'après « claude agents »",
+    tTable: "Toutes les sessions de la fenêtre", sTable: "cliquez un en-tête pour trier",
+    tEssaim: "essaim : postes et missions", sEssaim: "jetons facturés aux appels des postes, d'après .essaim/runs",
+    colEtat: "état", colSession: "session", colPoste: "poste essaim", colProjet: "dossier", colModele: "modèle",
+    colDebut: "début", colFin: "dernière activité", colJetons: "jetons", colCache: "part cache",
+    colMsgs: "msg", colType: "type", colPid: "pid", colNom: "nom", colAgent: "agent", colAppels: "appels",
+    colMission: "mission", colResultat: "résultat", colPostes: "postes",
+    vide: "rien à afficher sur cette fenêtre", videTerm: "aucune session claude vivante",
+    videEssaim: "aucun run enregistré dans ce projet",
+    fini: "terminé", echec: "échec", encours: "en cours", interactif: "interactif", arriere: "arrière-plan",
+    maj: "mis à jour", lecture: "transcriptions lues", aucunClaude: "liste des sessions indisponible",
+    pied: "Données locales : transcriptions de Claude Code, sessions claude vivantes et traces de runs du projet.",
+    chargement: "lecture des transcriptions…", erreur: "le tableau de bord ne répond plus",
+    presets: { "6h": "6 h", "24h": "24 h", "7j": "7 j", "30j": "30 j", tout: "tout" },
+    tRun: "Mission en cours", tRunFini: "Dernière mission",
+    sRun: "organigramme de l'entreprise : jetons et état de chaque poste, mis à jour pendant le run",
+    vRun: "voir les appels", runTotal: "jetons de la mission", runDuree: "durée", runAppels: "appels",
+    etEnCours: "en cours", etAttente: "en attente", etOk: "terminé", etEchec: "échec",
+    etBloque: "bloqué", etIgnore: "ignoré", etAnnule: "annulé",
+    runPause: "en pause", runPauseLimite: "en pause (limite d'abonnement)", runFini: "mission terminée",
+    runEchec: "mission en échec", runPerdu: "run interrompu (plus de nouvelles)",
+    colAppel: "appel", colEtat2: "état",
+    vueConso: "Consommation", vueMission: "Mission",
+    banniere: "mission en cours", bannVoir: "voir le suivi →",
+    sansRun: "Aucune mission suivie dans ce projet. Lancez-en une (TUI : onglet Entreprise, touche r — ou « essaim company run ») : l'organigramme s'affichera ici, poste par poste, pendant le run.",
+  },
+  en: {
+    titre: "token usage", cacheLbl: "raw volume (incl. cache reads)", autoLbl: "auto-refresh",
+    heroLbl: "tokens used", msgs: "messages", sessions: "sessions", terminaux: "open terminals",
+    interactifs: "interactive", fond: "background", partCache: "served from cache", sortie: "output generated",
+    entree: "fresh input", cacheLu: "cache read", cacheLuPondere: "cache read (×0.1)", sortiePonderee: "output (×5)", debit: "tokens per hour",
+    tSerie: "Over time", sSerie: "tokens per slice, by kind",
+    vSerie: "show the values", tranche: "slice",
+    tSessions: "Who is spending", sSessions: "the 12 most expensive sessions of the window",
+    tProjets: "By working directory", sProjets: "where the tokens went",
+    tModeles: "By model",
+    tTerm: "Open terminals and agents", sTerm: "live claude sessions, from “claude agents”",
+    tTable: "Every session in the window", sTable: "click a header to sort",
+    tEssaim: "essaim: seats and missions", sEssaim: "tokens billed to seat calls, from .essaim/runs",
+    colEtat: "state", colSession: "session", colPoste: "essaim seat", colProjet: "directory", colModele: "model",
+    colDebut: "start", colFin: "last activity", colJetons: "tokens", colCache: "cache share",
+    colMsgs: "msg", colType: "kind", colPid: "pid", colNom: "name", colAgent: "agent", colAppels: "calls",
+    colMission: "mission", colResultat: "result", colPostes: "seats",
+    vide: "nothing to show for this window", videTerm: "no live claude session",
+    videEssaim: "no run recorded in this project",
+    fini: "done", echec: "failed", encours: "running", interactif: "interactive", arriere: "background",
+    maj: "updated", lecture: "transcripts read", aucunClaude: "session list unavailable",
+    pied: "Local data: Claude Code transcripts, live claude sessions and this project's run traces.",
+    chargement: "reading transcripts…", erreur: "the dashboard stopped answering",
+    presets: { "6h": "6 h", "24h": "24 h", "7j": "7 d", "30j": "30 d", tout: "all" },
+    tRun: "Mission in progress", tRunFini: "Last mission",
+    sRun: "company org chart: tokens and state of every seat, updated as the run goes",
+    vRun: "show the calls", runTotal: "mission tokens", runDuree: "elapsed", runAppels: "calls",
+    etEnCours: "running", etAttente: "waiting", etOk: "done", etEchec: "failed",
+    etBloque: "blocked", etIgnore: "skipped", etAnnule: "cancelled",
+    runPause: "paused", runPauseLimite: "paused (subscription limit)", runFini: "mission completed",
+    runEchec: "mission failed", runPerdu: "run interrupted (no news)",
+    colAppel: "call", colEtat2: "state",
+    vueConso: "Usage", vueMission: "Mission",
+    banniere: "mission in progress", bannVoir: "follow it →",
+    sansRun: "No mission tracked in this project. Start one (TUI: Company tab, r — or “essaim company run”) and the org chart will show up here, seat by seat, while it runs.",
+  },
+};
+
+const S = {
+  lang: "fr",
+  vue: "conso",
+  periode: "24h",
+  cache: false,
+  auto: true,
+  data: null,
+  busy: false,
+  tri: { col: "tokens", sens: -1 },
+};
+const PERIODES = [["6h", 6 * 36e5], ["24h", 24 * 36e5], ["7j", 7 * 24 * 36e5], ["30j", 30 * 24 * 36e5], ["tout", 0]];
+const KEY = new URLSearchParams(location.search).get("k") || "";
+
+const t = (k) => (T[S.lang] || T.fr)[k] ?? k;
+const loc = () => (S.lang === "en" ? "en-US" : "fr-FR");
+const nf = (n) => new Intl.NumberFormat(loc(), { notation: "compact", maximumFractionDigits: 1 }).format(n || 0);
+const nFull = (n) => new Intl.NumberFormat(loc()).format(Math.round(n || 0));
+const pct = (a, b) => (b > 0 ? Math.round((a / b) * 100) : 0);
+
+/* Volume brut : le cache lu y pèse autant que l'entrée neuve alors qu'il coûte dix fois moins. */
+const volumeBrut = (u) => (u ? u.input + u.output + u.cache_write + u.cache_read : 0);
+/* Coût pondéré, en équivalents jetons d'entrée (mêmes poids que `claude_proc::weigh`). */
+const pondere = (u) => (u ? u.input + u.output * 5 + u.cache_read / 10 + u.cache_write * 1.25 : 0);
+/* Chiffre affiché : pondéré par défaut, volume brut si la case est cochée. */
+const tot = (u) => (S.cache ? volumeBrut(u) : pondere(u));
+
+function heure(ms, avecDate) {
+  if (!ms) return "—";
+  const d = new Date(ms);
+  const o = avecDate ? { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" } : { hour: "2-digit", minute: "2-digit" };
+  return new Intl.DateTimeFormat(loc(), o).format(d);
+}
+function jour(ms) {
+  return ms ? new Intl.DateTimeFormat(loc(), { day: "2-digit", month: "2-digit" }).format(new Date(ms)) : "—";
+}
+/* Chemin raccourci : seules les dernières parties portent l'information. */
+function court(p, n = 3) {
+  if (!p) return "—";
+  const parts = p.split("/").filter(Boolean);
+  return (parts.length > n ? "…/" : "/") + parts.slice(-n).join("/");
+}
+
+/* ——— fabrique de DOM (jamais d'innerHTML : les libellés viennent de données) ———— */
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined && text !== null) n.textContent = String(text);
+  return n;
+}
+function svgEl(tag, attrs) {
+  const n = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const k in attrs || {}) n.setAttribute(k, attrs[k]);
+  return n;
+}
+function vide(node) {
+  while (node.firstChild) node.removeChild(node.firstChild);
+  return node;
+}
+function tableau(colonnes, lignes, opts) {
+  const o = opts || {};
+  const tb = el("table");
+  const thead = el("thead");
+  const tr = el("tr");
+  colonnes.forEach((c) => {
+    const th = el("th", c.num ? "num" : null, c.titre);
+    if (c.tri) {
+      th.className = (c.num ? "num " : "") + "sortable";
+      th.setAttribute("role", "button");
+      th.tabIndex = 0;
+      const actif = S.tri.col === c.tri;
+      th.textContent = c.titre + (actif ? (S.tri.sens < 0 ? " ↓" : " ↑") : "");
+      const trier = () => {
+        S.tri = { col: c.tri, sens: actif ? -S.tri.sens : -1 };
+        o.onTri && o.onTri();
+      };
+      th.onclick = trier;
+      th.onkeydown = (e) => {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); trier(); }
+      };
+    }
+    tr.appendChild(th);
+  });
+  thead.appendChild(tr);
+  tb.appendChild(thead);
+  const tbody = el("tbody");
+  lignes.forEach((cells) => {
+    const r = el("tr");
+    cells.forEach((c, i) => {
+      const td = el("td", colonnes[i].num ? "num" : colonnes[i].name ? "name" : null);
+      if (c instanceof Node) td.appendChild(c);
+      else td.textContent = c === null || c === undefined ? "—" : String(c);
+      if (colonnes[i].titreAttr && typeof c === "string") td.title = c;
+      r.appendChild(td);
+    });
+    tbody.appendChild(r);
+  });
+  tb.appendChild(tbody);
+  return tb;
+}
+
+/* ——— infobulle partagée ——————————————————————————————————————————————— */
+const tip = document.getElementById("tip");
+function montreTip(x, y, titre, lignes) {
+  vide(tip);
+  tip.appendChild(el("div", "t", titre));
+  lignes.forEach(([couleur, nom, valeur]) => {
+    const r = el("div", "r");
+    const g = el("span");
+    if (couleur) {
+      const k = el("span", "k");
+      k.style.background = couleur;
+      g.appendChild(k);
+      g.appendChild(document.createTextNode(" "));
+    }
+    g.appendChild(document.createTextNode(nom));
+    r.appendChild(el("b", null, valeur));
+    r.insertBefore(g, r.firstChild);
+    tip.appendChild(r);
+  });
+  tip.style.opacity = "1";
+  const r = tip.getBoundingClientRect();
+  tip.style.left = Math.min(Math.max(8, x + 14), innerWidth - r.width - 8) + "px";
+  tip.style.top = Math.min(Math.max(8, y - r.height - 12), innerHeight - r.height - 8) + "px";
+}
+function cacheTip() {
+  tip.style.opacity = "0";
+}
+document.addEventListener("scroll", cacheTip, true);
+
+/* ——— colonnes empilées (séries temporelles) ——————————————————————————— */
+function colonnes(hote, buckets, series, step) {
+  vide(hote);
+  if (!buckets.length) {
+    hote.appendChild(el("p", "empty", t("vide")));
+    return;
+  }
+  const H = 180, PAD_L = 46, PAD_B = 22, PAD_T = 8;
+  const W = Math.max(hote.clientWidth || 640, 320);
+  const plot = W - PAD_L - 6;
+  const totaux = buckets.map((b) => series.reduce((s, se) => s + se.get(b.u), 0));
+  const max = Math.max(1, ...totaux);
+  const ech = echelle(max);
+  const y = (v) => PAD_T + (H - PAD_T - PAD_B) * (1 - v / ech.max);
+  const bande = plot / buckets.length;
+  const larg = Math.max(1, Math.min(24, bande - 2));
+
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, height: H, role: "img" });
+  svg.setAttribute("aria-label", t("tSerie") + " — " + t("heroLbl"));
+  svg.tabIndex = 0;
+
+  // Grille et graduations : traits pleins d'un cran, en retrait.
+  ech.ticks.forEach((v) => {
+    svg.appendChild(svgEl("line", { x1: PAD_L, x2: W - 6, y1: y(v), y2: y(v), stroke: "var(--grid)", "stroke-width": 1 }));
+    const tx = svgEl("text", { x: PAD_L - 8, y: y(v) + 4, "text-anchor": "end", fill: "var(--muted)", "font-size": 10 });
+    tx.textContent = nf(v);
+    svg.appendChild(tx);
+  });
+  svg.appendChild(svgEl("line", { x1: PAD_L, x2: W - 6, y1: y(0), y2: y(0), stroke: "var(--axis)", "stroke-width": 1 }));
+
+  const GAP = 2;
+  buckets.forEach((b, i) => {
+    const x = PAD_L + i * bande + (bande - larg) / 2;
+    let bas = y(0);
+    const hauts = series.map((se) => se.get(b.u));
+    const dernier = hauts.reduce((acc, v, j) => (v > 0 ? j : acc), -1);
+    hauts.forEach((v, j) => {
+      if (v <= 0) return;
+      const h = (H - PAD_T - PAD_B) * (v / ech.max);
+      const haut = bas - h;
+      const hv = Math.max(1, h - (j === dernier ? 0 : GAP));
+      const forme = j === dernier
+        ? svgEl("path", { d: hautArrondi(x, haut, larg, Math.max(1, h), 4), fill: series[j].couleur })
+        : svgEl("rect", { x, y: haut + GAP, width: larg, height: hv, fill: series[j].couleur });
+      svg.appendChild(forme);
+      bas = haut;
+    });
+    // Cible de survol : toute la bande, au moins 24 px de large (jamais un pixel à viser).
+    const cible = svgEl("rect", { x: PAD_L + i * bande - Math.max(0, (24 - bande) / 2), y: PAD_T, width: Math.max(bande, 24), height: H - PAD_T - PAD_B, fill: "transparent" });
+    cible.style.cursor = "crosshair";
+    const survol = (e) => {
+      vide(curseur);
+      curseur.appendChild(svgEl("line", { x1: PAD_L + i * bande + bande / 2, x2: PAD_L + i * bande + bande / 2, y1: PAD_T, y2: y(0), stroke: "var(--axis)", "stroke-width": 1 }));
+      const r = svg.getBoundingClientRect();
+      montreTip(e ? e.clientX : r.left + PAD_L + i * bande, e ? e.clientY : r.top + 40, libelleTranche(b.t, step), series.map((se) => [se.couleur, se.nom, nFull(se.get(b.u))]).concat([[null, "∑", nFull(totaux[i])]]));
+    };
+    cible.addEventListener("pointermove", survol);
+    cible.addEventListener("pointerleave", () => { vide(curseur); cacheTip(); });
+    svg.appendChild(cible);
+    cible.dataset.i = i;
+  });
+  const curseur = svgEl("g", {});
+  svg.appendChild(curseur);
+
+  // Graduations de temps : assez peu pour rester lisibles.
+  const pas = Math.max(1, Math.ceil(buckets.length / Math.max(2, Math.floor(plot / 70))));
+  buckets.forEach((b, i) => {
+    if (i % pas) return;
+    const tx = svgEl("text", { x: PAD_L + i * bande + bande / 2, y: H - 6, "text-anchor": "middle", fill: "var(--muted)", "font-size": 10 });
+    tx.textContent = step >= 864e5 ? jour(b.t) : heure(b.t, step >= 6 * 36e5);
+    svg.appendChild(tx);
+  });
+
+  // Clavier : les flèches parcourent les tranches et montrent la même lecture que le survol.
+  let sel = buckets.length - 1;
+  svg.addEventListener("keydown", (e) => {
+    if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+    e.preventDefault();
+    sel = Math.min(buckets.length - 1, Math.max(0, sel + (e.key === "ArrowRight" ? 1 : -1)));
+    const cible = svg.querySelector(`rect[data-i="${sel}"]`);
+    cible && cible.dispatchEvent(new PointerEvent("pointermove", { clientX: svg.getBoundingClientRect().left + PAD_L + sel * bande, clientY: svg.getBoundingClientRect().top + 30 }));
+  });
+  svg.addEventListener("blur", () => { vide(curseur); cacheTip(); });
+  hote.appendChild(svg);
+}
+
+function libelleTranche(ms, step) {
+  if (step >= 864e5) return jour(ms);
+  return heure(ms, true) + " – " + heure(ms + step, false);
+}
+
+/* Échelle ronde : 3 graduations au-dessus de la valeur maximale. */
+function echelle(max) {
+  const brut = max / 3;
+  const e = Math.pow(10, Math.floor(Math.log10(brut || 1)));
+  const pas = [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10].map((m) => m * e).find((p) => p >= brut) || e * 10;
+  const haut = pas * 3;
+  return { max: haut, ticks: [0, pas, pas * 2, haut] };
+}
+
+function hautArrondi(x, y, w, h, r) {
+  const rr = Math.min(r, w / 2, h);
+  return `M${x} ${y + h} L${x} ${y + rr} Q${x} ${y} ${x + rr} ${y} L${x + w - rr} ${y} Q${x + w} ${y} ${x + w} ${y + rr} L${x + w} ${y + h} Z`;
+}
+
+/* ——— barres horizontales (une série, étiquette de valeur au bout) ——————— */
+function barres(hote, lignes, opts) {
+  const o = opts || {};
+  vide(hote);
+  if (!lignes.length) {
+    hote.appendChild(el("p", "empty", o.vide || t("vide")));
+    return;
+  }
+  const max = Math.max(1, ...lignes.map((l) => l.valeur));
+  const table = el("table", "bars");
+  const tb = el("tbody");
+  lignes.forEach((l) => {
+    const tr = el("tr");
+    tr.tabIndex = 0;
+    const nom = el("td");
+    nom.style.width = "44%";
+    const lab = el("div", "lab");
+    if (l.puce) {
+      lab.appendChild(l.puce);
+      lab.appendChild(document.createTextNode(" "));
+    }
+    lab.appendChild(document.createTextNode(l.nom || "—"));
+    lab.title = l.nom || "";
+    nom.appendChild(lab);
+    if (l.detail) {
+      const d = el("div", "det", l.detail);
+      d.title = l.detail;
+      nom.appendChild(d);
+    }
+    tr.appendChild(nom);
+
+    const cell = el("td");
+    const jauge = el("div");
+    jauge.style.display = "flex";
+    jauge.style.alignItems = "center";
+    jauge.style.gap = "8px";
+    const piste = el("div");
+    piste.style.flex = "1";
+    piste.style.minWidth = "40px";
+    const b = el("div");
+    b.style.height = "14px";
+    b.style.width = Math.max(1, (l.valeur / max) * 100) + "%";
+    b.style.background = o.couleur || "var(--s1)";
+    b.style.borderRadius = "0 4px 4px 0";
+    piste.appendChild(b);
+    jauge.appendChild(piste);
+    const v = el("span", null, nf(l.valeur));
+    v.style.fontVariantNumeric = "tabular-nums";
+    v.style.color = "var(--ink2)";
+    v.style.whiteSpace = "nowrap";
+    jauge.appendChild(v);
+    cell.appendChild(jauge);
+    tr.appendChild(cell);
+
+    const montre = (e) => {
+      const r = tr.getBoundingClientRect();
+      montreTip(e && e.clientX ? e.clientX : r.left + 60, e && e.clientY ? e.clientY : r.top, l.nom || "—", l.lignes || [[o.couleur || "var(--s1)", t("colJetons"), nFull(l.valeur)]]);
+    };
+    tr.addEventListener("pointermove", montre);
+    tr.addEventListener("focus", montre);
+    tr.addEventListener("pointerleave", cacheTip);
+    tr.addEventListener("blur", cacheTip);
+    tb.appendChild(tr);
+  });
+  table.appendChild(tb);
+  hote.appendChild(table);
+}
+
+/* ——— organigramme du run (une boîte par poste, reliée à son supérieur) ——————— */
+const ETATS = {
+  running: { cle: "etEnCours", couleur: "var(--s1)" },
+  ok: { cle: "etOk", couleur: "var(--good)" },
+  failed: { cle: "etEchec", couleur: "var(--crit)" },
+  blocked: { cle: "etBloque", couleur: "var(--warn)" },
+  skipped: { cle: "etIgnore", couleur: "var(--muted)" },
+  cancelled: { cle: "etAnnule", couleur: "var(--muted)" },
+  waiting: { cle: "etAttente", couleur: "var(--axis)" },
+};
+/* Un poste porte l'état le plus parlant de ses appels. */
+const RANG = ["running", "failed", "blocked", "ok", "skipped", "cancelled", "waiting"];
+
+function parPoste(run) {
+  const m = new Map(run.seats.map((s) => [s.id, { seat: s, tokens: 0, appels: 0, etats: new Set(), nodes: [] }]));
+  (run.nodes || []).forEach((n) => {
+    const e = m.get(n.seat);
+    if (!e) return;
+    e.tokens += n.tokens > 0 ? n.tokens : n.live;
+    e.nodes.push(n);
+    if (n.state !== "waiting") e.appels++;
+    e.etats.add(n.state);
+  });
+  m.forEach((e) => { e.etat = RANG.find((r) => e.etats.has(r)) || "waiting"; });
+  return m;
+}
+
+/* Place chaque poste : profondeur = niveau hiérarchique, x = centre au-dessus de ses subordonnés. */
+function places(seats) {
+  const par = new Map(seats.map((s) => [s.id, s]));
+  const fils = new Map(seats.map((s) => [s.id, []]));
+  const racines = [];
+  seats.forEach((s) => {
+    const p = s.reports_to && s.reports_to !== s.id && par.has(s.reports_to) ? s.reports_to : null;
+    if (p) fils.get(p).push(s.id); else racines.push(s.id);
+  });
+  const pos = new Map();
+  let slot = 0;
+  const vus = new Set();
+  const marche = (id, prof) => {
+    if (vus.has(id)) return null;
+    vus.add(id);
+    const enfants = fils.get(id).map((c) => marche(c, prof + 1)).filter(Boolean);
+    const x = enfants.length ? (enfants[0].x + enfants[enfants.length - 1].x) / 2 : slot++;
+    const n = { id, prof, x };
+    pos.set(id, n);
+    return n;
+  };
+  racines.forEach((r) => marche(r, 0));
+  seats.forEach((s) => { if (!pos.has(s.id)) pos.set(s.id, { id: s.id, prof: 0, x: slot++ }); });
+  return pos;
+}
+
+function organigramme(hote, run) {
+  vide(hote);
+  const seats = run.seats || [];
+  if (!seats.length) {
+    hote.appendChild(el("p", "empty", t("vide")));
+    return;
+  }
+  const agg = parPoste(run);
+  const pos = places(seats);
+  const BW = 176, BH = 54, SLOT = 190, NIV = 92, PAD = 6;
+  const max = Math.max(1, ...[...agg.values()].map((e) => e.tokens));
+  const cols = Math.max(...[...pos.values()].map((p) => p.x)) + 1;
+  const profs = Math.max(...[...pos.values()].map((p) => p.prof)) + 1;
+  const W = cols * SLOT + PAD * 2, H = profs * NIV + PAD * 2;
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", preserveAspectRatio: "xMinYMin meet" });
+  svg.setAttribute("aria-label", t("tRun"));
+  const bx = (p) => PAD + p.x * SLOT + (SLOT - BW) / 2;
+  const by = (p) => PAD + p.prof * NIV;
+
+  // Liens vers le supérieur, tracés d'abord : ils passent sous les boîtes.
+  seats.forEach((s) => {
+    const p = pos.get(s.id);
+    const sup = s.reports_to && pos.get(s.reports_to);
+    if (!p || !sup || s.reports_to === s.id) return;
+    const [x1, y1] = [bx(sup) + BW / 2, by(sup) + BH];
+    const [x2, y2] = [bx(p) + BW / 2, by(p)];
+    const mid = (y1 + y2) / 2;
+    svg.appendChild(svgEl("path", { d: `M${x1} ${y1} L${x1} ${mid} L${x2} ${mid} L${x2} ${y2}`, fill: "none", stroke: "var(--grid)", "stroke-width": 1 }));
+  });
+
+  seats.forEach((s) => {
+    const p = pos.get(s.id);
+    const e = agg.get(s.id) || { tokens: 0, appels: 0, etat: "waiting" };
+    const et = ETATS[e.etat] || ETATS.waiting;
+    const [x, y] = [bx(p), by(p)];
+    const g = svgEl("g", { tabindex: "0", role: "listitem" });
+    g.setAttribute("aria-label", `${s.title} — ${t(et.cle)} — ${nFull(e.tokens)}`);
+    g.appendChild(svgEl("rect", { x, y, width: BW, height: BH, rx: 8, fill: "var(--surface)", stroke: "var(--ring)", "stroke-width": 1 }));
+    // Liseré d'état à gauche : l'état est aussi écrit, jamais porté par la couleur seule.
+    const bord = svgEl("rect", { x, y, width: 3, height: BH, rx: 1.5, fill: et.couleur });
+    if (e.etat === "running") bord.setAttribute("class", "pulse");
+    g.appendChild(bord);
+
+    const titre = svgEl("text", { x: x + 12, y: y + 18, fill: "var(--ink)", "font-size": 12, "font-weight": 600 });
+    titre.textContent = coupe(s.title, 20) + (s.builds ? " ⚒" : "");
+    g.appendChild(titre);
+    const sous = svgEl("text", { x: x + 12, y: y + 33, fill: "var(--muted)", "font-size": 10.5 });
+    sous.textContent = coupe(s.agent, 14) + " · " + t(et.cle);
+    g.appendChild(sous);
+    const val = svgEl("text", { x: x + BW - 12, y: y + 33, fill: "var(--ink2)", "font-size": 11, "text-anchor": "end" });
+    val.textContent = e.tokens ? nf(e.tokens) : "—";
+    g.appendChild(val);
+    // Jauge : part de ce poste dans le plus gros consommateur du run.
+    g.appendChild(svgEl("rect", { x: x + 12, y: y + BH - 12, width: BW - 24, height: 4, rx: 2, fill: "var(--grid)" }));
+    if (e.tokens > 0) {
+      g.appendChild(svgEl("rect", { x: x + 12, y: y + BH - 12, width: Math.max(2, ((BW - 24) * e.tokens) / max), height: 4, rx: 2, fill: et.couleur }));
+    }
+
+    const montre = (ev) => {
+      const r = g.getBoundingClientRect();
+      montreTip(ev && ev.clientX ? ev.clientX : r.left, ev && ev.clientY ? ev.clientY : r.top, `${s.title} · ${s.agent}`, [
+        [et.couleur, t("colEtat2"), t(et.cle)],
+        [null, t("colJetons"), nFull(e.tokens)],
+        [null, t("runAppels"), String(e.appels)],
+      ]);
+    };
+    g.addEventListener("pointermove", montre);
+    g.addEventListener("focus", montre);
+    g.addEventListener("pointerleave", cacheTip);
+    g.addEventListener("blur", cacheTip);
+    svg.appendChild(g);
+  });
+  hote.appendChild(svg);
+}
+
+function coupe(s, n) {
+  s = s || "";
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+function duree(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return h ? `${h} h ${String(m).padStart(2, "0")}` : `${m} min ${String(s % 60).padStart(2, "0")}`;
+}
+
+function rendreRun(d) {
+  const run = d.run;
+  // Bandeau cliquable dans la vue Consommation : le seul endroit d'où l'on « entre » dans la mission.
+  const band = document.getElementById("bandeau");
+  band.hidden = !(run && run.running && S.vue === "conso");
+  if (!band.hidden) {
+    vide(band);
+    const p = dot(true);
+    p.classList.add("pulse");
+    band.appendChild(p);
+    band.appendChild(el("span", null, run.company + (run.mission ? " · " + run.mission : "")));
+    band.appendChild(el("span", "k", t("banniere") + " · " + nf(run.tokens) + " " + t("colJetons") + " · " + run.calls + " " + t("runAppels")));
+    band.appendChild(el("span", "go", t("bannVoir")));
+  }
+  vues();
+  if (S.vue !== "mission") return;
+  const vide_ = document.getElementById("run-vide");
+  vide_.hidden = !!run;
+  document.getElementById("run-corps").hidden = !run;
+  if (!run) {
+    document.getElementById("t-run").textContent = t("tRun");
+    document.getElementById("s-run").textContent = "";
+    vide_.textContent = t("sansRun");
+    return;
+  }
+  const vivant = run.running;
+  document.getElementById("t-run").textContent = vivant ? t("tRun") : t("tRunFini");
+  document.getElementById("s-run").textContent = t("sRun");
+  const etat = run.paused
+    ? (run.paused === "limit" ? t("runPauseLimite") : t("runPause"))
+    : run.finished === true ? t("runFini")
+    : run.finished === false ? t("runEchec")
+    : vivant ? t("etEnCours") : t("runPerdu");
+  const head = vide(document.getElementById("run-head"));
+  const bloc = (cle, valeur) => {
+    const n = el("span");
+    n.appendChild(el("span", "k", cle + " "));
+    n.appendChild(el("b", null, valeur));
+    head.appendChild(n);
+  };
+  const titre = el("span");
+  const pt = dot(vivant && !run.paused);
+  if (vivant && !run.paused) pt.classList.add("pulse");
+  titre.appendChild(pt);
+  titre.appendChild(document.createTextNode(" " + run.company + (run.mission ? " · " + run.mission : "") + " — " + etat));
+  head.appendChild(titre);
+  bloc(t("runTotal"), nf(run.tokens));
+  bloc(t("runAppels"), String(run.calls) + (run.max_calls ? " / " + run.max_calls : ""));
+  bloc(t("runDuree"), duree((vivant ? Date.now() : run.updated_ms) - run.started_ms));
+
+  const leg = vide(document.getElementById("l-run"));
+  ["running", "ok", "blocked", "failed", "waiting"].forEach((k) => {
+    const sp = el("span");
+    const i = el("i");
+    i.style.background = ETATS[k].couleur;
+    sp.appendChild(i);
+    sp.appendChild(document.createTextNode(t(ETATS[k].cle)));
+    leg.appendChild(sp);
+  });
+  organigramme(document.getElementById("orga"), run);
+
+  document.getElementById("v-run").textContent = t("vRun");
+  const cols = [
+    { titre: t("colPoste") }, { titre: t("colAppel"), name: true }, { titre: t("colAgent") },
+    { titre: t("colEtat2") }, { titre: t("colJetons"), num: true },
+  ];
+  const seatTitre = new Map(run.seats.map((s) => [s.id, s.title]));
+  vide(document.getElementById("run-table")).appendChild(
+    (run.nodes || []).length
+      ? tableau(cols, run.nodes.slice().sort((a, b) => (b.tokens || b.live) - (a.tokens || a.live)).map((n) => [
+          seatTitre.get(n.seat) || n.seat, n.label, n.agent, t((ETATS[n.state] || ETATS.waiting).cle), nFull(n.tokens || n.live),
+        ]))
+      : el("p", "empty", t("etAttente"))
+  );
+}
+
+/* ——— rendu ——————————————————————————————————————————————————————————— */
+function series(d) {
+  const w = !S.cache; // mode pondéré : chaque bande porte le même poids que dans `tot`
+  return [
+    { nom: t("entree"), couleur: "var(--s1)", get: (u) => u.input + (w ? u.cache_write * 1.25 : u.cache_write) },
+    { nom: w ? t("sortiePonderee") : t("sortie"), couleur: "var(--s2)", get: (u) => (w ? u.output * 5 : u.output) },
+    { nom: w ? t("cacheLuPondere") : t("cacheLu"), couleur: "var(--s3)", get: (u) => (w ? u.cache_read / 10 : u.cache_read) },
+  ];
+}
+
+function rendu() {
+  const d = S.data;
+  if (!d) return;
+  document.documentElement.lang = S.lang;
+  const total = tot(d.total);
+  const span = d.since_ms ? d.now_ms - d.since_ms : Math.max(36e5, d.now_ms - (d.buckets.length ? d.buckets[0].t : d.now_ms));
+
+  // Chiffre phare et tuiles.
+  document.getElementById("hero-lbl").textContent = t("heroLbl") + " · " + (T[S.lang] || T.fr).presets[S.periode];
+  document.getElementById("hero").textContent = nf(total);
+  document.getElementById("hero-sub").textContent = `${nFull(total)} · ${nFull(d.total.messages)} ${t("msgs")} · ${d.sessions.length} ${t("sessions")}`;
+  const term = d.terminals.list || [];
+  const inter = term.filter((x) => x.kind === "interactive");
+  const fond = term.filter((x) => x.kind !== "interactive");
+  const tuiles = vide(document.getElementById("tiles"));
+  const tuile = (label, valeur, detail, meter) => {
+    const n = el("div", "tile");
+    n.appendChild(el("div", "label", label));
+    n.appendChild(el("div", "value", valeur));
+    if (detail) n.appendChild(el("div", "delta", detail));
+    if (meter !== undefined) {
+      const m = el("div", "meter");
+      const i = el("i");
+      i.style.width = Math.min(100, meter) + "%";
+      m.appendChild(i);
+      n.appendChild(m);
+    }
+    tuiles.appendChild(n);
+  };
+  tuile(t("terminaux"), String(inter.length), `${fond.length} ${t("fond")}`);
+  tuile(t("debit"), nf(total / Math.max(1, span / 36e5)));
+  tuile(t("sortie"), nf(d.total.output), nFull(d.total.output));
+  const part = pct(d.total.cache_read, d.total.input + d.total.output + d.total.cache_write + d.total.cache_read);
+  tuile(t("partCache"), part + " %", nFull(d.total.cache_read), part);
+
+  rendreRun(d);
+
+  // Série temporelle.
+  const se = series(d);
+  document.getElementById("t-serie").textContent = t("tSerie");
+  document.getElementById("s-serie").textContent = t("sSerie");
+  const leg = vide(document.getElementById("l-serie"));
+  se.forEach((x) => {
+    const s = el("span");
+    const i = el("i");
+    i.style.background = x.couleur;
+    s.appendChild(i);
+    s.appendChild(document.createTextNode(x.nom));
+    leg.appendChild(s);
+  });
+  colonnes(document.getElementById("serie"), d.buckets, se, d.step_ms);
+  document.getElementById("v-serie").textContent = t("vSerie");
+  const colsSerie = [{ titre: t("tranche") }].concat(se.map((x) => ({ titre: x.nom, num: true })), [{ titre: "∑", num: true }]);
+  vide(document.getElementById("serie-table")).appendChild(
+    tableau(colsSerie, d.buckets.map((b) => [libelleTranche(b.t, d.step_ms)].concat(se.map((x) => nFull(x.get(b.u))), [nFull(se.reduce((s, x) => s + x.get(b.u), 0))])))
+  );
+
+  // Qui consomme : 12 sessions les plus coûteuses.
+  document.getElementById("t-sessions").textContent = t("tSessions");
+  document.getElementById("s-sessions").textContent = t("sSessions");
+  const nomSession = (s) => s.seat || s.label || s.id.slice(0, 8);
+  barres(
+    document.getElementById("bars-sessions"),
+    d.sessions.slice().sort((a, b) => tot(b.u) - tot(a.u)).slice(0, 12).map((s) => ({
+      nom: nomSession(s),
+      detail: court(s.cwd) + (s.models.length ? " · " + s.models[0].replace("claude-", "") : ""),
+      valeur: tot(s.u),
+      puce: s.live ? dot(true) : null,
+      lignes: se.map((x) => [x.couleur, x.nom, nFull(x.get(s.u))]).concat([[null, "∑", nFull(tot(s.u))]]),
+    }))
+  );
+
+  // Dossiers et modèles.
+  document.getElementById("t-projets").textContent = t("tProjets");
+  document.getElementById("s-projets").textContent = t("sProjets");
+  barres(document.getElementById("bars-projets"), d.projects.slice(0, 10).map((p) => ({
+    nom: court(p.name), valeur: tot(p.u),
+    lignes: se.map((x) => [x.couleur, x.nom, nFull(x.get(p.u))]).concat([[null, "∑", nFull(tot(p.u))]]),
+  })));
+  document.getElementById("t-modeles").textContent = t("tModeles");
+  barres(document.getElementById("bars-modeles"), d.models.slice(0, 8).map((m) => ({
+    nom: m.name.replace("claude-", ""), valeur: tot(m.u),
+    lignes: se.map((x) => [x.couleur, x.nom, nFull(x.get(m.u))]),
+  })));
+
+  // Terminaux vivants.
+  document.getElementById("t-term").textContent = t("tTerm") + " · " + term.length;
+  document.getElementById("s-term").textContent = d.terminals.error ? t("aucunClaude") + " : " + d.terminals.error : t("sTerm");
+  const colsTerm = [
+    { titre: t("colEtat") }, { titre: t("colType") }, { titre: t("colNom"), name: true }, { titre: t("colProjet"), name: true },
+    { titre: t("colPid"), num: true }, { titre: t("colDebut") }, { titre: t("colJetons"), num: true },
+  ];
+  const vivant = (x) => x.state === "working" || x.status === "busy";
+  vide(document.getElementById("term")).appendChild(
+    term.length
+      ? tableau(colsTerm, term.slice().sort((a, b) => b.tokens - a.tokens).map((x) => [
+          dot(vivant(x)), x.kind === "interactive" ? t("interactif") : t("arriere"),
+          x.name + (x.essaim ? " ✦" : ""), court(x.cwd), x.pid ?? "—", heure(x.started_ms, true), nFull(S.cache ? x.volume : x.tokens),
+        ]))
+      : el("p", "empty", t("videTerm"))
+  );
+
+  // Table complète, triable.
+  document.getElementById("t-table").textContent = t("tTable");
+  document.getElementById("s-table").textContent = t("sTable");
+  const clefs = {
+    tokens: (s) => tot(s.u),
+    session: (s) => (nomSession(s) || "").toLowerCase(),
+    projet: (s) => s.cwd || "",
+    debut: (s) => s.first_ms,
+    fin: (s) => s.last_ms,
+    cache: (s) => pct(s.u.cache_read, s.u.input + s.u.output + s.u.cache_write + s.u.cache_read),
+    msgs: (s) => s.u.messages,
+  };
+  const k = clefs[S.tri.col] || clefs.tokens;
+  const cols = [
+    { titre: t("colEtat") },
+    { titre: t("colSession"), name: true, tri: "session" },
+    { titre: t("colPoste"), name: true },
+    { titre: t("colProjet"), name: true, tri: "projet" },
+    { titre: t("colModele") },
+    { titre: t("colDebut"), tri: "debut" },
+    { titre: t("colFin"), tri: "fin" },
+    { titre: t("colJetons"), num: true, tri: "tokens" },
+    { titre: t("colCache"), num: true, tri: "cache" },
+    { titre: t("colMsgs"), num: true, tri: "msgs" },
+  ];
+  vide(document.getElementById("table")).appendChild(
+    d.sessions.length
+      ? tableau(cols, triees(d.sessions, k).map((s) => [
+          dot(!!s.live), s.label || s.id.slice(0, 8), s.seat || "—", court(s.cwd), (s.models[0] || "?").replace("claude-", ""),
+          heure(s.first_ms, true), heure(s.last_ms, true), nFull(tot(s.u)),
+          pct(s.u.cache_read, s.u.input + s.u.output + s.u.cache_write + s.u.cache_read) + " %", nFull(s.u.messages),
+        ]), { onTri: rendu })
+      : el("p", "empty", t("vide"))
+  );
+
+  // essaim : postes et missions.
+  document.getElementById("t-essaim").textContent = t("tEssaim");
+  document.getElementById("s-essaim").textContent = t("sEssaim") + " — " + d.root;
+  barres(document.getElementById("bars-agents"), (d.agents || []).slice(0, 10).map((a) => ({
+    nom: a.name, detail: a.calls + " " + t("colAppels"), valeur: a.tokens,
+  })), { vide: t("videEssaim") });
+  const colsRuns = [
+    { titre: t("colMission"), name: true }, { titre: t("colDebut") }, { titre: t("colResultat") },
+    { titre: t("colPostes"), num: true }, { titre: t("colJetons"), num: true },
+  ];
+  vide(document.getElementById("runs")).appendChild(
+    (d.runs || []).length
+      ? tableau(colsRuns, d.runs.map((r) => [
+          r.pipeline, heure(r.started_ms, true),
+          r.finished === true ? t("fini") : r.finished === false ? t("echec") : t("encours"),
+          r.nodes.length, nFull(r.tokens),
+        ]))
+      : el("p", "empty", t("videEssaim"))
+  );
+
+  const maj = new Intl.DateTimeFormat(loc(), { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date());
+  document.getElementById("etat").textContent = `${t("maj")} ${maj} · ${d.scan.files} ${t("lecture")}`;
+  document.getElementById("pied").textContent = t("pied");
+}
+
+function dot(on) {
+  const d = el("span", "dot " + (on ? "on" : "off"));
+  d.setAttribute("role", "img");
+  d.setAttribute("aria-label", on ? t("encours") : "—");
+  return d;
+}
+function triees(sessions, k) {
+  return sessions.slice().sort((a, b) => {
+    const x = k(a), y = k(b);
+    const c = typeof x === "string" ? x.localeCompare(y) : x - y;
+    return S.tri.sens < 0 ? -c : c;
+  });
+}
+
+/* ——— cycle de vie ———————————————————————————————————————————————————— */
+async function charge() {
+  if (S.busy) return;
+  S.busy = true;
+  document.getElementById("wrap").classList.add("busy");
+  const p = PERIODES.find((x) => x[0] === S.periode);
+  const since = p && p[1] ? Date.now() - p[1] : 0;
+  try {
+    const r = await fetch(`/api/snapshot?k=${encodeURIComponent(KEY)}&since=${since}`, { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    S.data = d;
+    S.lang = d.lang === "en" ? "en" : "fr";
+    vide(document.getElementById("alerte"));
+    textes();
+    rendu();
+  } catch (e) {
+    const a = vide(document.getElementById("alerte"));
+    a.appendChild(el("div", "banner", t("erreur") + " — " + e.message));
+  } finally {
+    S.busy = false;
+    document.getElementById("wrap").classList.remove("busy");
+  }
+}
+
+/* Montre les cartes de la vue courante ; la mission a sa propre page. */
+function vues() {
+  document.querySelectorAll("[data-vue]").forEach((n) => { n.hidden = n.dataset.vue !== S.vue; });
+  document.getElementById("periodes").hidden = S.vue !== "conso";
+  document.getElementById("cache-box").hidden = S.vue !== "conso";
+  const b = document.getElementById("bandeau");
+  if (S.vue === "mission") b.hidden = true;
+}
+
+function changeVue(v) {
+  S.vue = v;
+  textes();
+  vues();
+  if (S.data) rendu();
+  scrollTo({ top: 0, behavior: "smooth" });
+}
+
+function textes() {
+  document.title = "essaim — " + t("titre");
+  document.getElementById("titre").textContent = t("titre");
+  document.getElementById("cache-lbl").textContent = t("cacheLbl");
+  document.getElementById("auto-lbl").textContent = t("autoLbl");
+  const onglets = vide(document.getElementById("vues"));
+  [["conso", "vueConso"], ["mission", "vueMission"]].forEach(([id, cle]) => {
+    const b = el("button", null, t(cle));
+    b.setAttribute("aria-pressed", String(S.vue === id));
+    if (id === "mission" && S.data && S.data.run && S.data.run.running) {
+      const p = dot(true);
+      p.classList.add("pulse");
+      b.insertBefore(p, b.firstChild);
+    }
+    b.onclick = () => changeVue(id);
+    onglets.appendChild(b);
+  });
+  const box = vide(document.getElementById("periodes"));
+  PERIODES.forEach(([id]) => {
+    const b = el("button", null, (T[S.lang] || T.fr).presets[id]);
+    b.setAttribute("aria-pressed", String(S.periode === id));
+    b.onclick = () => { S.periode = id; textes(); charge(); };
+    box.appendChild(b);
+  });
+}
+
+document.getElementById("bandeau").onclick = () => changeVue("mission");
+document.getElementById("cache").onchange = (e) => { S.cache = e.target.checked; rendu(); };
+document.getElementById("auto").onchange = (e) => { S.auto = e.target.checked; };
+addEventListener("resize", () => { clearTimeout(window.__r); window.__r = setTimeout(rendu, 150); });
+document.getElementById("etat").textContent = T.fr.chargement;
+textes();
+
+/* Pendant un run, la page se rafraîchit deux fois plus souvent : on suit la mission en direct. */
+function boucle() {
+  clearTimeout(window.__t);
+  const vite = S.data && S.data.run && S.data.run.running;
+  window.__t = setTimeout(async () => {
+    if (S.auto && !document.hidden) await charge();
+    boucle();
+  }, vite ? 2000 : 5000);
+}
+charge().then(boucle);
+</script>
+</body>
+</html>

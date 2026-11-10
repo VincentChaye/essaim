@@ -1,10 +1,12 @@
+use crate::model::ConfigDirs;
 use crate::model::agent::{self, AgentDef};
-use crate::model::company::{Company, Seat, graph_nav};
+use crate::model::company::{self, Company, Seat, graph_nav};
 use crate::model::roles;
 use crate::runtime::claude_proc::ClaudeEvent;
 use crate::runtime::company_exec::{CompanyOptions, run_mission};
 use crate::runtime::executor::{EscalationReply, NodeStatus, RunEvent, claude_runner};
 use crate::runtime::missions::{self, Mission};
+use crate::runtime::pause::{self, Gate};
 use crate::runtime::sessions::{self, Session};
 use crate::runtime::store::{self, NodeRecord, RunRecord};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -147,6 +149,8 @@ pub enum AppEvent {
     TermExit(u64),
     /// Texte collé dans le terminal de l'outil.
     Paste(String),
+    /// Tableau de bord web : URL servie, ou cause de l'échec.
+    Dashboard(Result<String, String>),
 }
 
 /// Modèles proposés (alias acceptés par `claude --model`). La chaîne vide = modèle par défaut.
@@ -244,6 +248,7 @@ impl AgentForm {
             model: Some(t(2)).filter(|m| !m.is_empty()),
             tools: (!tools.is_empty()).then_some(tools),
             prompt: self.fields[4].text().trim_matches('\n').to_string(),
+            path: None,
         }
     }
 }
@@ -288,6 +293,7 @@ impl SeatForm {
             builds: false,
             allow_bash: vec![],
             helpers: None,
+            max_budget_usd: None,
         });
         let (depth, is_leaf) = match (seat, parent) {
             (Some(i), _) => (c.depth(i), c.is_leaf(i)),
@@ -350,8 +356,9 @@ impl SeatForm {
             expertise: Some(t(5)).filter(|e| !e.is_empty()),
             builds: t(6) == "oui",
             allow_bash: t(7).split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(),
-            // Non éditable dans le formulaire (TOML) : conservé tel quel à l'enregistrement.
+            // Non éditables dans le formulaire (TOML) : conservés tels quels à l'enregistrement.
             helpers: self.initial.helpers.clone(),
+            max_budget_usd: self.initial.max_budget_usd,
         }
     }
 }
@@ -382,6 +389,8 @@ pub enum PendingAction {
     CancelRun(String),
     /// Sortie de l'outil alors qu'un run est en cours (il sera annulé) : nom du run.
     QuitRun(String),
+    /// Sortie de l'outil alors que le run est en pause (rien n'est perdu, il reprendra) : nom du run.
+    QuitPaused(String),
     /// Mission relancée alors qu'elle écraserait conception / rapport : (titre, reprise).
     StartMission(String, bool),
     /// Mission débloquée par la réussite de la précédente : (id, titre).
@@ -409,6 +418,7 @@ impl PendingAction {
             Self::RemoveSession(_, name) => ask_delete("la session", "the session", name),
             Self::CancelRun(name) => tf!("Annuler le run « {name} » ? (o/n)", "Cancel the run \"{name}\"? (o/n)"),
             Self::QuitRun(name) => tf!("Quitter et annuler le run « {name} » ? (o/n)", "Quit and cancel the run \"{name}\"? (o/n)"),
+            Self::QuitPaused(name) => tf!("Quitter avec le run « {name} » en pause ? (o/n)", "Quit with the run \"{name}\" paused? (o/n)"),
             Self::StartMission(title, _) => tf!("Relancer « {title} » depuis le début ? Le plan et le rapport précédents seront remplacés. (o/n)", "Restart \"{title}\" from scratch? The previous plan and report will be replaced. (o/n)"),
             Self::NextMission(_, title) => tf!("Mission réussie. Lancer maintenant la suivante, « {title} » ? (o/n)", "Mission succeeded. Start the next one, \"{title}\", now? (o/n)"),
             Self::FinishTerm => tr("Terminer la session Claude en cours ? (o/n)", "End the current Claude session? (o/n)").into(),
@@ -423,6 +433,7 @@ impl PendingAction {
             Self::DeleteSeat(..) => Some(tr("Ses subordonnés remontent d'un cran.", "Its subordinates move up one level.").into()),
             Self::DeleteMission(..) => Some(tr("Brief, plan, rapport et compte rendu sont effacés. Les missions qui l'attendaient ne l'attendent plus.", "Brief, plan, report and summary are erased. Missions that waited for it no longer do.").into()),
             Self::DeleteHistory(..) => Some(tr("L'historique du run est effacé ; les missions restent.", "The run history is erased; missions are kept.").into()),
+            Self::QuitPaused(..) => Some(tr("La mission reste en pause : r la reprend plus tard, dans cette session ou une autre.", "The mission stays paused: r resumes it later, in this session or another.").into()),
             _ => None,
         }
     }
@@ -443,9 +454,14 @@ pub struct NodeView {
     pub depth: usize,
     pub state: NodeState,
     pub log: Vec<String>,
+    /// Coût pondéré de l'appel (voir `claude_proc::weigh`).
     pub tokens: u64,
-    /// Part de `tokens` lue dans le cache de prompt.
+    /// Volume brut de jetons, dont `tokens` est la pondération.
+    pub volume: u64,
+    /// Part du volume lue dans le cache de prompt.
     pub cached: u64,
+    /// Session `claude` de l'appel, annoncée par le flux : relie le poste à sa consommation.
+    pub session_id: Option<String>,
     /// Suivi en temps réel : messages déjà soldés + message en cours (id, tokens, cache).
     pub live: (u64, u64),
     pub live_msg: (String, u64, u64),
@@ -453,7 +469,7 @@ pub struct NodeView {
 
 impl NodeView {
     pub fn new(id: &str, agent: &str) -> Self {
-        Self { id: id.into(), agent: agent.into(), label: id.into(), depth: 0, state: NodeState::Waiting, log: vec![], tokens: 0, cached: 0, live: (0, 0), live_msg: (String::new(), 0, 0) }
+        Self { id: id.into(), agent: agent.into(), label: id.into(), depth: 0, state: NodeState::Waiting, log: vec![], tokens: 0, volume: 0, cached: 0, session_id: None, live: (0, 0), live_msg: (String::new(), 0, 0) }
     }
 }
 
@@ -495,11 +511,22 @@ pub struct RunView {
     /// None = en cours ; Some(ok) = terminé.
     pub finished: Option<bool>,
     pub cancel: watch::Sender<bool>,
+    /// Pause du run, partagée avec l'orchestrateur : aucun appel ne part tant qu'elle dure.
+    pub pause: std::sync::Arc<Gate>,
+}
+
+impl RunView {
+    /// Pause en cours, s'il y en a une (lue à chaque affichage : la reprise automatique a lieu sans événement).
+    pub fn paused(&self) -> Option<pause::State> {
+        self.pause.state()
+    }
 }
 
 pub struct CompanyEntry {
     pub path: PathBuf,
     pub file: String,
+    /// Entreprise du dossier de l'utilisateur : disponible depuis tous les dossiers du système.
+    pub global: bool,
     pub parsed: Result<Company, String>,
     /// Problème de validation (agent inconnu, deux boss, cycle…), si le TOML est lisible.
     pub problem: Option<String>,
@@ -516,6 +543,8 @@ pub struct Quota {
 pub struct App {
     pub quota: Option<Quota>,
     pub root: PathBuf,
+    /// Où lire et écrire agents et entreprises : le projet, et le dossier de l'utilisateur (global).
+    pub dirs: ConfigDirs,
     pub tab: Tab,
     pub mode: Mode,
     pub agents: Vec<AgentDef>,
@@ -559,6 +588,10 @@ pub struct App {
     pub attach_request: Option<String>,
     /// Arguments d'une session d'assistant interactive (agent, mission ou entreprise) à lancer.
     pub assistant_request: Option<(AssistantKind, Vec<String>)>,
+    /// Suivi temps réel du run en cours, relu par le tableau de bord (.essaim/runs/<id>/live.json).
+    pub live_run: Option<crate::runtime::live::Tracker>,
+    /// URL du tableau de bord web, une fois servi (le serveur vit jusqu'à la fermeture d'essaim).
+    pub dash_url: Option<String>,
     /// Session Claude Code intégrée (assistant ou attache) et focus clavier.
     pub term: Option<TermSession>,
     pub term_focus: bool,
@@ -585,8 +618,14 @@ const MAX_LOG: usize = 2000;
 
 impl App {
     pub fn new(root: PathBuf, tx: mpsc::UnboundedSender<AppEvent>) -> Self {
+        Self::with_dirs(ConfigDirs::new(&root), root, tx)
+    }
+
+    /// Variante à dossiers explicites : les tests ne doivent pas dépendre du vrai `~/.claude`.
+    pub fn with_dirs(dirs: ConfigDirs, root: PathBuf, tx: mpsc::UnboundedSender<AppEvent>) -> Self {
         let mut app = Self {
             root,
+            dirs,
             tab: Tab::Agents,
             mode: Mode::Normal,
             agents: vec![],
@@ -620,6 +659,8 @@ impl App {
             editor_request: None,
             attach_request: None,
             assistant_request: None,
+            live_run: None,
+            dash_url: None,
             term: None,
             term_focus: false,
             term_seq: 0,
@@ -640,21 +681,36 @@ impl App {
         app
     }
 
-    pub fn companies_dir(&self) -> PathBuf {
-        self.root.join(".claude/companies")
+    /// Fichiers d'agent illisibles (projet et utilisateur), étiquetés pour l'affichage : nom du
+    /// fichier côté projet, chemin raccourci côté utilisateur (« ~/.claude/agents/x.md »).
+    fn invalid_agent_files(&self) -> Vec<(String, String)> {
+        agent::invalid_files(&self.dirs)
+            .into_iter()
+            .map(|(p, e)| {
+                let label = if self.dirs.is_global(&p) {
+                    crate::model::display_short(&p)
+                } else {
+                    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+                };
+                (label, e)
+            })
+            .collect()
     }
 
-    fn load_companies(root: &std::path::Path, agent_names: &[String]) -> Vec<CompanyEntry> {
-        let Ok(rd) = std::fs::read_dir(root.join(".claude/companies")) else { return vec![] };
-        let mut paths: Vec<_> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "toml")).collect();
-        paths.sort();
-        paths
+    /// Dossiers à donner à un assistant pour qu'il crée agents et entreprises au bon endroit.
+    pub fn assistant_dirs(&self) -> super::assistant::Dirs {
+        super::assistant::Dirs::of(&self.dirs)
+    }
+
+    fn load_companies(dirs: &ConfigDirs, agent_names: &[String]) -> Vec<CompanyEntry> {
+        company::files(dirs)
             .into_iter()
             .map(|path| {
                 let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let parsed = Company::load(&path).map_err(|e| format!("{e:#}"));
                 let problem = parsed.as_ref().ok().and_then(|c| c.validate(agent_names).err()).map(|e| format!("{e:#}"));
-                CompanyEntry { path, file, parsed, problem }
+                let global = dirs.is_global(&path);
+                CompanyEntry { path, file, global, parsed, problem }
             })
             .collect()
     }
@@ -693,9 +749,9 @@ impl App {
 
     /// Relit agents, entreprises et missions depuis le disque.
     pub fn reload(&mut self) {
-        self.agents = agent::load_all(&self.root);
+        self.agents = agent::load_all(&self.dirs);
         let names: Vec<String> = self.agents.iter().map(|a| a.name.clone()).collect();
-        self.companies = Self::load_companies(&self.root, &names);
+        self.companies = Self::load_companies(&self.dirs, &names);
         self.comp_sel = self.comp_sel.min(self.companies.len().saturating_sub(1));
         self.missions = missions::list(&self.root);
         self.mission_sel = self.mission_sel.min(self.missions.len().saturating_sub(1));
@@ -727,7 +783,7 @@ impl App {
         match kind {
             AssistantKind::Agent => {
                 let created: Vec<String> = self.agents.iter().filter(|a| !before.contains(&a.name)).map(|a| a.name.clone()).collect();
-                let invalid = agent::invalid_files(&self.root);
+                let invalid = self.invalid_agent_files();
                 self.status = if let Some(name) = created.first() {
                     if let Some(i) = self.agents.iter().position(|a| &a.name == name) {
                         self.agent_sel = i;
@@ -740,7 +796,7 @@ impl App {
                 };
             }
             AssistantKind::Company => {
-                let invalid = agent::invalid_files(&self.root);
+                let invalid = self.invalid_agent_files();
                 let created = self.companies.iter().position(|c| !before.contains(&c.file.trim_end_matches(".toml").to_string()));
                 self.status = match created {
                     Some(i) => {
@@ -768,7 +824,7 @@ impl App {
             AssistantKind::Plan => self.after_plan_revision(),
             AssistantKind::Escalation => self.after_escalation_chat(),
             AssistantKind::Edit => {
-                self.status = match agent::invalid_files(&self.root).first() {
+                self.status = match self.invalid_agent_files().first() {
                     Some((file, err)) => tf!("⚠ {file} est illisible : {err}", "⚠ {file} is unreadable: {err}"),
                     None => tr("modifications rechargées", "changes reloaded").into(),
                 };
@@ -850,7 +906,17 @@ impl App {
         let seat = &company.seats[boss];
         let prompt = self.agents.iter().find(|a| a.name == seat.agent).map(|a| a.prompt.clone()).unwrap_or_default();
         let rel = |name: &str| dir.strip_prefix(&self.root).unwrap_or(&dir).join(name).display().to_string();
-        let args = super::assistant::escalation_args(self.lang, &company.name, &seat.title, &prompt, &company.outline(), &rel("brief.md"), &rel(missions::RESOLUTION_FILE), &es.summary);
+        let args = super::assistant::escalation_args(
+            self.lang,
+            &company.name,
+            &seat.title,
+            &prompt,
+            &company.outline(),
+            &rel("brief.md"),
+            &rel(missions::RESOLUTION_FILE),
+            &es.summary,
+            &self.assistant_dirs(),
+        );
         self.assistant_request = Some((AssistantKind::Escalation, args));
     }
 
@@ -940,6 +1006,9 @@ impl App {
             AppEvent::Run(r) => self.on_run_event(r),
             AppEvent::Tick => {
                 self.tick = self.tick.wrapping_add(1);
+                if let Some(t) = &mut self.live_run {
+                    t.tick();
+                }
                 // Rafraîchissement automatique toutes les ~3 s sur l'onglet Sessions.
                 if self.tab == Tab::Sessions && self.tick % 15 == 0 {
                     self.refresh_sessions();
@@ -957,6 +1026,7 @@ impl App {
                 self.status = msg;
                 self.refresh_sessions();
             }
+            AppEvent::Dashboard(r) => self.on_dashboard(r),
         }
     }
 
@@ -1139,9 +1209,11 @@ impl App {
     }
 
     /// `q` / Ctrl+C : sortie directe, sauf si un run est en cours (confirmation, il serait annulé).
+    /// Un run en pause ne se perd pas : la mission garde sa marque et se reprend avec `r`.
     fn request_quit(&mut self) {
         if let Some(r) = self.run.as_ref().filter(|r| r.finished.is_none()) {
-            self.mode = Mode::ConfirmAction(PendingAction::QuitRun(r.name.clone()));
+            let name = r.name.clone();
+            self.mode = Mode::ConfirmAction(if r.paused().is_some() { PendingAction::QuitPaused(name) } else { PendingAction::QuitRun(name) });
             return;
         }
         self.quit_now();
@@ -1193,6 +1265,10 @@ impl App {
             self.help_open = true;
             self.help_full = false;
             self.help_scroll = 0;
+            return;
+        }
+        if k.code == KeyCode::F(9) && matches!(self.mode, Mode::Normal) {
+            self.open_dashboard();
             return;
         }
         if k.code == KeyCode::F(10) && matches!(self.mode, Mode::Normal) {
@@ -1340,12 +1416,14 @@ impl App {
                 match k.code {
                     KeyCode::Char('n') => {
                         let names: Vec<String> = self.agents.iter().map(|a| a.name.clone()).collect();
-                        self.assistant_request = Some((AssistantKind::Agent, super::assistant::agent_creation_args(self.lang, &names)));
+                        let dirs = self.assistant_dirs();
+                        self.assistant_request = Some((AssistantKind::Agent, super::assistant::agent_creation_args(self.lang, &names, &dirs)));
                     }
                     KeyCode::Char('N') => self.mode = Mode::EditAgent(AgentForm::new(None)),
                     KeyCode::Char('e') | KeyCode::Enter => {
                         if let Some(a) = self.agents.get(self.agent_sel) {
-                            let file = self.root.join(".claude/agents").join(format!("{}.md", a.name));
+                            // Le fichier d'où l'agent a été lu : celui du projet, ou celui de l'utilisateur.
+                            let file = a.path.clone().unwrap_or_else(|| self.dirs.agents_write().join(format!("{}.md", a.name)));
                             self.mode = Mode::ChooseEdit(EditChoice { what: EditWhat::Agent(a.name.clone()), file, label: tf!("l'agent « {} »", "the agent \"{}\"", a.name), sel: 0 });
                         }
                     }
@@ -1373,7 +1451,8 @@ impl App {
                     KeyCode::Char('n') => {
                         let agents: Vec<(String, String)> = self.agents.iter().map(|a| (a.name.clone(), a.description.clone())).collect();
                         let files = self.company_files();
-                        self.assistant_request = Some((AssistantKind::Company, super::assistant::company_creation_args(self.lang, &agents, &files)));
+                        let dirs = self.assistant_dirs();
+                        self.assistant_request = Some((AssistantKind::Company, super::assistant::company_creation_args(self.lang, &agents, &files, &dirs)));
                     }
                     // L'édition dépend de la zone où l'on est entré : poste (organigramme), entreprise ou mission.
                     KeyCode::Char('a') if self.zone_in && self.zone == CompZone::Graph => self.open_seat_form(false),
@@ -1423,6 +1502,10 @@ impl App {
             Tab::Run => {
                 if k.code == KeyCode::Char('h') {
                     self.show_history = !self.show_history;
+                    return;
+                }
+                if k.code == KeyCode::Char('p') && self.running() {
+                    self.toggle_pause();
                     return;
                 }
                 if self.show_history {
@@ -1557,7 +1640,7 @@ impl App {
         let followup = missions::new_id(store::now_ms() + 1);
         let agents: Vec<(String, String)> = self.agents.iter().map(|a| (a.name.clone(), a.description.clone())).collect();
         let companies: Vec<(String, Vec<String>)> = self.companies.iter().filter_map(|c| c.parsed.as_ref().ok().map(|p| (c.file.clone(), p.outline()))).collect();
-        let args = super::assistant::debrief_args(self.lang, &rel, &followup, &agents, &companies);
+        let args = super::assistant::debrief_args(self.lang, &rel, &followup, &agents, &companies, &self.assistant_dirs());
         self.assistant_request = Some((AssistantKind::Debrief, args));
     }
 
@@ -1665,10 +1748,10 @@ impl App {
         if def.description.is_empty() {
             anyhow::bail!("{}", tr("la description est obligatoire", "the description is required"));
         }
-        agent::save(&self.root, &def)?;
+        agent::save(&self.dirs, &def)?;
         if let Some(old) = &form.original {
             if old != &def.name {
-                agent::delete(&self.root, old)?;
+                agent::delete(&self.dirs, old)?;
             }
         }
         self.reload();
@@ -1881,12 +1964,17 @@ impl App {
     fn run_action(&mut self, a: PendingAction) {
         match a {
             PendingAction::DeleteAgent(name) => {
-                match agent::delete(&self.root, &name) {
-                    Ok(true) => self.status = tf!("agent « {name} » supprimé", "agent \"{name}\" deleted"),
-                    Ok(false) => self.status = tf!("« {name} » vient du dossier utilisateur (~/.claude/agents) : supprimez-le à la main", "\"{name}\" comes from the user folder (~/.claude/agents): delete it by hand"),
-                    Err(e) => self.status = erreur(&e),
-                }
+                let deleted = agent::delete(&self.dirs, &name);
                 self.reload();
+                self.status = match deleted {
+                    // Même nom des deux côtés : le fichier du projet part, celui de l'utilisateur reparaît.
+                    Ok(Some(_)) if self.agents.iter().any(|a| a.name == name) => {
+                        tf!("agent « {name} » supprimé du projet — la version globale reste", "agent \"{name}\" deleted from the project — the global one remains")
+                    }
+                    Ok(Some(p)) => tf!("agent « {name} » supprimé ({})", "agent \"{name}\" deleted ({})", crate::model::display_short(&p)),
+                    Ok(None) => tf!("agent « {name} » introuvable", "agent \"{name}\" not found"),
+                    Err(e) => erreur(&e),
+                };
             }
             PendingAction::DeleteSeat(path, id, title) => {
                 match self.delete_seat(&path, &id) {
@@ -1915,10 +2003,19 @@ impl App {
             PendingAction::CancelRun(_) => {
                 if let Some(r) = &self.run {
                     let _ = r.cancel.send(true);
+                    // Arrêt voulu : la pause est levée (les appels en attente voient l'annulation) et la
+                    // mission ne garde pas de marque de pause, elle n'est plus à reprendre.
+                    r.pause.resume();
+                    r.pause.take_resumed();
+                }
+                if let Some((_, dir)) = &self.run_ctx {
+                    missions::clear_pause(dir);
+                }
+                if self.run.is_some() {
                     self.status = tr("annulation demandée…", "cancellation requested…").into();
                 }
             }
-            PendingAction::QuitRun(_) => self.quit_now(),
+            PendingAction::QuitRun(_) | PendingAction::QuitPaused(_) => self.quit_now(),
             PendingAction::StartMission(_, resume) => self.launch_mission(resume),
             PendingAction::NextMission(id, _) => self.launch_next(&id),
             PendingAction::FinishTerm => self.finish_term(),
@@ -2068,7 +2165,8 @@ impl App {
             return;
         }
         if let Some(m) = selected {
-            if (m.has_conception || m.has_report) && !(resume && m.resumable) {
+            // Une mission en pause se reprend sans question : rien ne serait écrasé qui ne le soit déjà.
+            if (m.has_conception || m.has_report) && !(resume && m.resumable) && m.pause.is_none() {
                 self.mode = Mode::ConfirmAction(PendingAction::StartMission(m.title.clone(), resume));
                 return;
             }
@@ -2099,6 +2197,12 @@ impl App {
             self.missions = missions::list(&self.root);
         }
         let (cancel_tx, cancel_rx) = watch::channel(false);
+        // Mission laissée en pause par la limite de l'abonnement : la porte repart fermée et le run attend
+        // l'heure de reprise, au lieu de dépenser un appel pour se faire refuser.
+        let gate = match mission.pause {
+            Some(p) if p.resets_at.is_none_or(|t| t > pause::now_s()) => Gate::closed(pause::Why::Limit, p.resets_at),
+            _ => Gate::new(),
+        };
         self.run = Some(RunView {
             name: format!("{} · {}", company.name, mission.title),
             nodes: vec![],
@@ -2106,6 +2210,7 @@ impl App {
             tokens: 0,
             finished: None,
             cancel: cancel_tx,
+            pause: gate.clone(),
         });
         self.tab = Tab::Run;
         self.term_focus = false;
@@ -2113,6 +2218,8 @@ impl App {
         self.run_started_ms = store::now_ms();
         self.run_id = Some(store::new_id(self.run_started_ms));
         self.persist_run();
+        // Suivi temps réel : le tableau de bord montre l'organigramme et les jetons pendant la mission.
+        self.live_run = self.run_id.as_ref().map(|id| crate::runtime::live::Tracker::new(&self.root, id, &company, &mission.title, self.run_started_ms));
 
         let (rtx, mut rrx) = mpsc::unbounded_channel();
         let app_tx = self.tx.clone();
@@ -2123,15 +2230,23 @@ impl App {
         });
         self.run_ctx = Some((company.clone(), mission.dir.clone()));
         let agents = self.agents.clone();
-        let opts = CompanyOptions { base_dir: self.root.clone(), mission_dir: Some(mission.dir.clone()), lang: self.lang, resume: resume && mission.resumable };
-        if resume && mission.resumable {
+        let opts = CompanyOptions { base_dir: self.root.clone(), mission_dir: Some(mission.dir.clone()), lang: self.lang, resume: resume && mission.resumable, pause: gate.clone() };
+        if let Some(p) = mission.pause.filter(|_| gate.paused()) {
+            self.status = tf!(
+                "mission reprise, encore en pause (limite d'abonnement) : reprise {} · p reprend sans attendre",
+                "mission resumed, still paused (subscription limit): resuming {} · p resumes without waiting",
+                pause::reset_label(p.resets_at, self.lang == Lang::Fr)
+            );
+        } else if mission.pause.is_some() {
+            self.status = tr("reprise de la mission mise en pause", "resuming the paused mission").into();
+        } else if resume && mission.resumable {
             self.status = tr("reprise depuis le plan validé (R : tout recommencer)", "resuming from the validated plan (R: start over)").into();
         }
         let (fail_tx, notice_tx) = (rtx.clone(), self.tx.clone());
         let dir = mission.dir.display().to_string();
         let lang = self.lang;
         tokio::spawn(async move {
-            let result = run_mission(&company, &agents, &brief, &opts, claude_runner(), rtx, cancel_rx).await;
+            let result = run_mission(&company, &agents, &brief, &opts, claude_runner(std::time::Duration::from_secs(company.node_timeout_s)), rtx, cancel_rx).await;
             settings::set_current(lang);
             match result {
                 Ok(out) => {
@@ -2154,6 +2269,9 @@ impl App {
     }
 
     pub fn on_run_event(&mut self, ev: RunEvent) {
+        if let Some(t) = &mut self.live_run {
+            t.on_event(&ev);
+        }
         if let RunEvent::Checkpoint { plan, reply } = ev {
             self.checkpoint = Some(CheckpointState { plan, reply, scroll: 0 });
             self.status = tr("plan consolidé prêt : Entrée lance la réalisation, Échap l'arrête", "consolidated plan ready: Enter starts realisation, Esc stops it").into();
@@ -2164,6 +2282,23 @@ impl App {
             self.escalation = Some(EscalationState { summary, reply, scroll: 0 });
             self.status = tr("mission bloquée : e discute avec le CEO, Entrée relance la correction, Échap arrête", "mission blocked: e talks with the CEO, Enter retries the correction, Esc stops").into();
             self.set_tab(Tab::Run);
+            return;
+        }
+        if let RunEvent::Paused { why, resets_at } = &ev {
+            self.status = match why {
+                pause::Why::Limit => tf!(
+                    "⏸ limite d'abonnement atteinte : pause, reprise {} · p reprend · q quitte (reprise plus tard)",
+                    "⏸ subscription limit reached: paused, resuming {} · p resumes · q quits (resume later)",
+                    pause::reset_label(*resets_at, self.lang == Lang::Fr)
+                ),
+                pause::Why::User => tr("⏸ run en pause", "⏸ run paused").into(),
+            };
+            // Trace de ce qui est déjà fait : quitter pendant la pause laisse un historique utilisable.
+            self.persist_run();
+            return;
+        }
+        if matches!(ev, RunEvent::Resumed) {
+            self.status = tr("▶ reprise du run", "▶ run resumed").into();
             return;
         }
         if matches!(ev, RunEvent::RunFinished { .. }) {
@@ -2198,7 +2333,7 @@ impl App {
                     }
                 }
             }
-            RunEvent::Checkpoint { .. } | RunEvent::Escalation { .. } => {} // traités avant le match
+            RunEvent::Checkpoint { .. } | RunEvent::Escalation { .. } | RunEvent::Paused { .. } | RunEvent::Resumed => {} // traités avant le match
             RunEvent::NodeStarted { id } => {
                 if let Some(i) = node(run, &id) {
                     run.nodes[i].state = NodeState::Running;
@@ -2206,10 +2341,14 @@ impl App {
             }
             RunEvent::Node { id, event } => {
                 let Some(i) = node(run, &id) else { return };
-                if let ClaudeEvent::Result { cached, .. } = &event {
+                if let ClaudeEvent::Result { volume, cached, .. } = &event {
+                    run.nodes[i].volume = *volume;
                     run.nodes[i].cached = *cached;
                 }
-                if let ClaudeEvent::Usage { id, tokens, cached } = &event {
+                if let ClaudeEvent::Init { session_id, .. } = &event {
+                    run.nodes[i].session_id = Some(session_id.clone()).filter(|s| !s.is_empty());
+                }
+                if let ClaudeEvent::Usage { id, tokens, cached, .. } = &event {
                     let n = &mut run.nodes[i];
                     if n.live_msg.0 != *id {
                         n.live = (n.live.0 + n.live_msg.1, n.live.1 + n.live_msg.2);
@@ -2220,8 +2359,19 @@ impl App {
                 match event {
                     ClaudeEvent::Text(t) => log.extend(t.lines().map(String::from)),
                     ClaudeEvent::ToolUse { name, .. } => log.push(tf!("⚙ outil : {name}", "⚙ tool: {name}")),
-                    ClaudeEvent::ToolResult { is_error: true } => log.push(tr("  ↳ erreur de l'outil", "  ↳ tool error").into()),
-                    ClaudeEvent::Result { is_error: true, text, .. } => log.push(format!("✖ {text}")),
+                    // La cause est affichée : sans elle, une erreur répétée (schéma, chemin) n'est pas diagnosticable.
+                    ClaudeEvent::ToolResult { is_error: true, message } => log.push(if message.is_empty() {
+                        tr("  ↳ erreur de l'outil", "  ↳ tool error").into()
+                    } else {
+                        tf!("  ↳ erreur de l'outil : {message}", "  ↳ tool error: {message}")
+                    }),
+                    // La limite d'abonnement n'est pas un échec du poste : l'appel repart tel quel à la
+                    // reprise, le journal le dit sans marque d'erreur.
+                    ClaudeEvent::Result { is_error: true, text, .. } => log.push(match crate::runtime::claude_proc::usage_limit(&text) {
+                        // Pas d'heure dans le journal : elle serait périmée à la relecture (elle est dans l'en-tête).
+                        Some(_) => tr("⏸ limite d'abonnement atteinte — l'appel sera rejoué à la reprise", "⏸ subscription limit reached — the call will be replayed on resume").into(),
+                        None => format!("✖ {text}"),
+                    }),
                     _ => {}
                 }
                 if log.len() > MAX_LOG {
@@ -2246,6 +2396,32 @@ impl App {
         if self.run.as_ref().is_some_and(|r| r.finished.is_some()) {
             self.persist_run();
         }
+    }
+
+    /// `p` : met le run en pause ou le reprend. En pause, aucun nouvel appel `claude` ne part (ceux qui
+    /// tournent vont jusqu'au bout) ; la mission porte la marque sur disque, donc on peut quitter essaim et
+    /// la reprendre plus tard avec `r`.
+    fn toggle_pause(&mut self) {
+        let Some(run) = &self.run else { return };
+        let (gate, dir) = (run.pause.clone(), self.run_ctx.as_ref().map(|(_, d)| d.clone()));
+        if gate.resume() {
+            // Reprise à la main : c'est l'interface qui l'annonce, l'orchestrateur ne la redira pas.
+            gate.take_resumed();
+            if let Some(d) = &dir {
+                missions::clear_pause(d);
+            }
+            self.status = tr("run repris", "run resumed").into();
+            return;
+        }
+        gate.pause(pause::Why::User, None);
+        if let Some(d) = &dir {
+            missions::mark_paused(d, None);
+        }
+        self.status = tr(
+            "run en pause : arrêt demandé aux agents en cours, aucun nouvel appel ne part · p reprend · q quitte (reprise plus tard)",
+            "run paused: the agents in flight were asked to stop, no new call starts · p resumes · q quits (resume later)",
+        )
+        .into();
     }
 
     /// Écrit `compte-rendu.md` dans la mission quand son run se termine (rien à écrire pour un pipeline).
@@ -2284,10 +2460,57 @@ impl App {
         let title = run.name.split(" · ").nth(1).unwrap_or(&run.name).to_string();
         let date = RunRecord { id: String::new(), pipeline: String::new(), started_ms: self.run_started_ms, finished: None, tokens: 0, nodes: vec![] }.started_label();
         let md = missions::compte_rendu(
-            &missions::ReportData { title: &title, company: &company.name, date: &date, ok: *ok, blocked, realised, tokens: *tokens, cached: run.nodes.iter().map(|n| n.cached).sum(), steps, issues, final_report: &final_report },
+            &missions::ReportData { title: &title, company: &company.name, date: &date, ok: *ok, blocked, realised, tokens: *tokens, volume: run.nodes.iter().map(|n| n.volume).sum(), cached: run.nodes.iter().map(|n| n.cached).sum(), steps, issues, final_report: &final_report },
             self.lang == Lang::Fr,
         );
         let _ = missions::write_output(dir, "compte-rendu.md", &md);
+    }
+
+    /// `F9` : tableau de bord de consommation dans le navigateur. Le serveur est lancé une seule fois
+    /// par session d'essaim ; les appuis suivants rouvrent simplement l'onglet.
+    fn open_dashboard(&mut self) {
+        if let Some(url) = self.dash_url.clone() {
+            self.announce_dashboard(&url);
+            return;
+        }
+        // Hors boucle asynchrone (tests), il n'y a personne pour servir la page : on le dit au lieu de paniquer.
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            self.status = tr("tableau de bord indisponible ici", "dashboard unavailable here").into();
+            return;
+        };
+        self.status = tr("tableau de bord : démarrage…", "dashboard: starting…").into();
+        let (tx, root, lang) = (self.tx.clone(), self.root.clone(), self.lang);
+        rt.spawn(async move {
+            match crate::runtime::web::start(root, lang, 0).await {
+                Ok(dash) => {
+                    let _ = tx.send(AppEvent::Dashboard(Ok(dash.url.clone())));
+                    // La tâche garde le serveur en vie jusqu'à la fin du processus.
+                    std::future::pending::<()>().await;
+                    drop(dash);
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::Dashboard(Err(format!("{e:#}"))));
+                }
+            }
+        });
+    }
+
+    fn on_dashboard(&mut self, r: Result<String, String>) {
+        match r {
+            Ok(url) => {
+                self.dash_url = Some(url.clone());
+                self.announce_dashboard(&url);
+            }
+            Err(e) => self.status = tf!("tableau de bord non démarré : {e}", "dashboard not started: {e}"),
+        }
+    }
+
+    /// Ouvre l'URL dans le navigateur et l'affiche : si l'ouverture échoue, l'adresse reste copiable.
+    fn announce_dashboard(&mut self, url: &str) {
+        match crate::runtime::web::open_in_browser(url) {
+            Ok(()) => self.status = tf!("tableau de bord ouvert : {url}", "dashboard opened: {url}"),
+            Err(e) => self.status = tf!("navigateur non lancé ({e:#}) — ouvrez : {url}", "browser not started ({e:#}) — open: {url}"),
+        }
     }
 
     /// Enregistre l'état du run courant (au démarrage, puis à la fin).
@@ -2312,6 +2535,7 @@ impl App {
                         _ => None,
                     },
                     tokens: n.tokens,
+                    session_id: n.session_id.clone(),
                     log: n.log.clone(),
                 })
                 .collect(),
@@ -2345,7 +2569,10 @@ impl App {
                     state: NodeState::Done(n.status.clone().unwrap_or(NodeStatus::Cancelled)),
                     log: n.log.clone(),
                     tokens: n.tokens,
-                    cached: 0, // non conservé dans l'historique
+                    // Volume et cache ne sont pas conservés dans l'historique : seul le coût pondéré l'est.
+                    volume: 0,
+                    cached: 0,
+                    session_id: n.session_id.clone(),
                     live: (0, 0),
                     live_msg: (String::new(), 0, 0),
                 })
@@ -2354,6 +2581,7 @@ impl App {
             tokens: h.tokens,
             finished: Some(h.finished.unwrap_or(false)),
             cancel,
+            pause: Gate::new(),
         });
         self.run_id = None; // lecture seule : ne pas réécrire l'historique
         self.show_history = false;

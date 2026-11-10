@@ -54,10 +54,14 @@ impl Session {
     }
 }
 
+/// Toutes les sessions annoncées, y compris les terminaux interactifs (sans id ni état).
+pub fn parse_all(json: &str) -> Result<Vec<Session>> {
+    serde_json::from_str(json).context("sortie de `claude agents --json` illisible")
+}
+
 /// Ne garde que les sessions background (les interactives n'ont ni id ni état).
 pub fn parse_sessions(json: &str) -> Result<Vec<Session>> {
-    let all: Vec<Session> = serde_json::from_str(json).context("sortie de `claude agents --json` illisible")?;
-    Ok(all.into_iter().filter(|s| s.kind == "background" && s.id.is_some()).collect())
+    Ok(parse_all(json)?.into_iter().filter(|s| s.kind == "background" && s.id.is_some()).collect())
 }
 
 /// `cmd.output()` borné par `limit` : au dépassement, le future est abandonné et le processus tué (kill_on_drop).
@@ -91,6 +95,11 @@ pub fn is_valid_id(id: &str) -> bool {
 
 pub async fn list() -> Result<Vec<Session>> {
     parse_sessions(&run(&["agents", "--json", "--all"], None).await?)
+}
+
+/// Comme `list`, terminaux interactifs compris : ce que le tableau de bord appelle « terminaux ouverts ».
+pub async fn list_all() -> Result<Vec<Session>> {
+    parse_all(&run(&["agents", "--json", "--all"], None).await?)
 }
 
 /// Transcription d'une session : `~/.claude/projects/<dossier>/<sessionId>.jsonl`.
@@ -157,6 +166,16 @@ mod tests {
         assert_eq!(s[1].phase(), Phase::Working);
         assert!(!s[1].is_essaim());
         assert_eq!(s[1].label(), "autre");
+    }
+
+    #[test]
+    fn parse_all_garde_les_terminaux_interactifs() {
+        let all = parse_all(AGENTS_JSON).unwrap();
+        assert_eq!(all.len(), 3);
+        let inter: Vec<&Session> = all.iter().filter(|s| s.kind == "interactive").collect();
+        assert_eq!(inter.len(), 1);
+        assert_eq!((inter[0].pid, inter[0].status.as_deref()), (Some(26204), Some("busy")));
+        assert_eq!(inter[0].session_id.as_deref(), Some("aaa"));
     }
 
     #[test]

@@ -19,3 +19,7 @@ tokio = { version = "1.53.2", features = ["full"] }
 toml = "1.1.7"
 uuid = { version = "1.27.0", features = ["v4"] }
 vt100 = "0.16.2"
+
+# `test-util` : horloge virtuelle des tests (attentes de pause franchies sans dormir réellement).
+[dev-dependencies]
+tokio = { version = "1.53.2", features = ["full", "test-util"] }
