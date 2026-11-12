@@ -5,76 +5,80 @@
   "methode": "tests/mesure/README.md",
   "missions": {
     "M1": {
-      "appels": 6,
+      "appels": 7,
       "appels_par_modele": {
-        "defaut": 6
+        "defaut": 7
       },
       "appels_par_type": {
         "delegate": 2,
+        "plan": 1,
         "report": 2,
         "review": 1,
         "work": 1
       },
-      "description": "3 postes, brief court, conception seule",
-      "duree_ms": 400,
-      "jetons_cache": 1156,
-      "jetons_entree": 5522,
-      "jetons_sortie": 484,
-      "part_cache": 0.2093
+      "description": "3 postes, brief court",
+      "duree_ms": 501,
+      "jetons_cache": 2088,
+      "jetons_entree": 8259,
+      "jetons_sortie": 629,
+      "part_cache": 0.2528
     },
     "M2": {
-      "appels": 12,
+      "appels": 13,
       "appels_par_modele": {
-        "defaut": 12
+        "defaut": 13
       },
       "appels_par_type": {
         "delegate": 4,
+        "plan": 1,
         "report": 4,
         "review": 1,
         "work": 3
       },
-      "description": "7 postes, brief détaillé, conception seule",
-      "duree_ms": 708,
-      "jetons_cache": 2659,
-      "jetons_entree": 11718,
-      "jetons_sortie": 1193,
-      "part_cache": 0.2269
+      "description": "7 postes d'analyse, brief détaillé",
+      "duree_ms": 802,
+      "jetons_cache": 4825,
+      "jetons_entree": 16499,
+      "jetons_sortie": 1401,
+      "part_cache": 0.2924
     },
     "M3": {
-      "appels": 21,
+      "appels": 13,
       "appels_par_modele": {
-        "defaut": 21
+        "defaut": 13
       },
       "appels_par_type": {
-        "delegate": 7,
-        "report": 7,
-        "review": 2,
-        "work": 5
+        "delegate": 4,
+        "plan": 1,
+        "report": 4,
+        "review": 1,
+        "work": 3
       },
-      "description": "7 postes dont 2 de réalisation : conception + réalisation",
-      "duree_ms": 1326,
-      "jetons_cache": 4077,
-      "jetons_entree": 21070,
-      "jetons_sortie": 2060,
-      "part_cache": 0.1935
+      "description": "7 postes dont 2 de réalisation",
+      "duree_ms": 810,
+      "jetons_cache": 4825,
+      "jetons_entree": 16570,
+      "jetons_sortie": 1401,
+      "part_cache": 0.2912
     },
     "M4": {
-      "appels": 21,
+      "appels": 24,
       "appels_par_modele": {
-        "defaut": 21
+        "defaut": 24
       },
       "appels_par_type": {
-        "delegate": 7,
+        "delegate": 8,
+        "plan": 1,
         "report": 7,
-        "review": 1,
+        "review": 2,
         "work": 6
       },
-      "description": "7 postes, revue rejetée puis relance, sorties volumineuses (troncature)",
-      "duree_ms": 1524,
-      "jetons_cache": 4296,
-      "jetons_entree": 38425,
-      "jetons_sortie": 66620,
-      "part_cache": 0.1118
+      "description": "7 postes, revue rejetée, relance demandée par l'humain, sorties volumineuses (troncature)",
+      "duree_ms": 1831,
+      "jetons_cache": 9650,
+      "jetons_entree": 53249,
+      "jetons_sortie": 66929,
+      "part_cache": 0.1812
     }
   }
 }

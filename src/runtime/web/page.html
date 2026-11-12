@@ -263,7 +263,7 @@ const T = {
     tRun: "Mission en cours", tRunFini: "Dernière mission",
     sRun: "organigramme de l'entreprise : jetons et état de chaque poste, mis à jour pendant le run",
     vRun: "voir les appels", runTotal: "jetons de la mission", runDuree: "durée", runAppels: "appels",
-    etEnCours: "en cours", etAttente: "en attente", etOk: "terminé", etEchec: "échec",
+    etEnCours: "en cours", etHumain: "attend l'humain", etAttente: "en attente", etOk: "terminé", etEchec: "échec",
     etBloque: "bloqué", etIgnore: "ignoré", etAnnule: "annulé",
     runPause: "en pause", runPauseLimite: "en pause (limite d'abonnement)", runFini: "mission terminée",
     runEchec: "mission en échec", runPerdu: "run interrompu (plus de nouvelles)",
@@ -299,7 +299,7 @@ const T = {
     tRun: "Mission in progress", tRunFini: "Last mission",
     sRun: "company org chart: tokens and state of every seat, updated as the run goes",
     vRun: "show the calls", runTotal: "mission tokens", runDuree: "elapsed", runAppels: "calls",
-    etEnCours: "running", etAttente: "waiting", etOk: "done", etEchec: "failed",
+    etEnCours: "running", etHumain: "waiting for the human", etAttente: "waiting", etOk: "done", etEchec: "failed",
     etBloque: "blocked", etIgnore: "skipped", etAnnule: "cancelled",
     runPause: "paused", runPauseLimite: "paused (subscription limit)", runFini: "mission completed",
     runEchec: "mission failed", runPerdu: "run interrupted (no news)",
@@ -614,6 +614,7 @@ function barres(hote, lignes, opts) {
 
 /* ——— organigramme du run (une boîte par poste, reliée à son supérieur) ——————— */
 const ETATS = {
+  asking: { cle: "etHumain", couleur: "var(--warn)" },
   running: { cle: "etEnCours", couleur: "var(--s1)" },
   ok: { cle: "etOk", couleur: "var(--good)" },
   failed: { cle: "etEchec", couleur: "var(--crit)" },
@@ -623,7 +624,7 @@ const ETATS = {
   waiting: { cle: "etAttente", couleur: "var(--axis)" },
 };
 /* Un poste porte l'état le plus parlant de ses appels. */
-const RANG = ["running", "failed", "blocked", "ok", "skipped", "cancelled", "waiting"];
+const RANG = ["asking", "running", "failed", "blocked", "ok", "skipped", "cancelled", "waiting"];
 
 function parPoste(run) {
   const m = new Map(run.seats.map((s) => [s.id, { seat: s, tokens: 0, appels: 0, etats: new Set(), nodes: [] }]));
@@ -802,7 +803,7 @@ function rendreRun(d) {
   bloc(t("runDuree"), duree((vivant ? Date.now() : run.updated_ms) - run.started_ms));
 
   const leg = vide(document.getElementById("l-run"));
-  ["running", "ok", "blocked", "failed", "waiting"].forEach((k) => {
+  ["running", "asking", "ok", "blocked", "failed", "waiting"].forEach((k) => {
     const sp = el("span");
     const i = el("i");
     i.style.background = ETATS[k].couleur;

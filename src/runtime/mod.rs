@@ -1,9 +1,10 @@
-pub mod bashrisk;
+pub mod bus;
 pub mod claude_proc;
 pub mod company_exec;
 pub mod executor;
 pub mod fsutil;
 pub mod live;
+pub mod mcp;
 pub mod missions;
 pub mod pause;
 pub mod scope;

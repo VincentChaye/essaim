@@ -1,5 +1,7 @@
-//! Périmètres de fichiers (globs relatifs au projet) : inclusion, chevauchement, lots sans conflit,
-//! et traduction en règles de permission `Edit(...)` / `Write(...)` de Claude Code.
+//! Périmètres de fichiers (globs relatifs au projet) : inclusion, chevauchement, lots sans conflit.
+//!
+//! Un périmètre ne donne aucun droit (tous les postes ont tous les outils) : il dit quels fichiers un poste
+//! va modifier, pour que deux postes ne travaillent pas sur les mêmes en même temps.
 //!
 //! Les comparaisons sont volontairement **conservatrices** : en cas de doute, deux périmètres sont
 //! considérés comme se chevauchant (on sérialise) et un périmètre n'est pas considéré comme inclus.
@@ -17,39 +19,13 @@ pub fn normalize(p: &str) -> String {
     if joined.is_empty() { "**".into() } else { joined }
 }
 
-pub fn is_everything(p: &str) -> bool {
-    normalize(p) == "**"
-}
-
-/// Motif utilisable dans une règle de permission : non vide, sans remontée (`..`),
-/// sans `~` (domaine de l'utilisateur) ni `\`, sans `,` `(` `)` (qui sépareraient ou fermeraient la règle
-/// `Edit(...)` jointe par virgules à l'envoi) ni caractère de contrôle. Un motif non sûr n'est jamais inclus,
-/// ni n'obtient de règle.
+/// Motif exploitable : non vide, sans remontée (`..`), sans `~` (domaine de l'utilisateur) ni `\`, sans
+/// `,` `(` `)` ni caractère de contrôle. Un motif qui ne l'est pas n'est jamais tenu pour inclus dans un
+/// autre, et il est supposé chevaucher tout le reste.
 pub fn is_safe(p: &str) -> bool {
     // Contrôle sur le texte brut : un retour à la ligne final ne doit pas être effacé par `trim` avant le test.
     let t = p.trim();
     !t.is_empty() && !t.contains("..") && !t.contains(['~', '\\', ',', '(', ')']) && !p.chars().any(char::is_control)
-}
-
-/// Dossiers réservés à essaim, à git et à Claude Code : réservés à **toute profondeur** (`**/.claude`, `src/.git/hooks`).
-/// Comparaison insensible à la casse (macOS : `.CLAUDE` désigne `.claude`).
-const RESERVED_DIRS: &[&str] = &[".claude", ".git", ".essaim"];
-
-/// Chemins réservés à essaim, à git et à Claude Code (`.claude/settings*`, `.git/hooks`, `.essaim/`…) :
-/// un poste ⚒ qui y écrirait pourrait élargir ses propres permissions ou préparer du code exécuté plus tard.
-/// Le prédicat examine **tous** les segments du chemin (E1) : un segment est réservé si
-/// - il est `{`, `[` ou `?` (motif de classe, qui peut désigner un segment caché) à n'importe quelle profondeur ;
-/// - il appartient à `RESERVED_DIRS` à n'importe quelle profondeur ;
-/// - il est caché (`.xxx`) et soit premier segment, soit à motif (`*`, `?`, `[`, `{`) : `.g*`, `.cl*`.
-/// Un fichier caché ordinaire plus profond (`src/.env.example`) n'est pas réservé.
-pub fn is_sensitive(p: &str) -> bool {
-    let n = normalize(p);
-    n.split('/').enumerate().any(|(i, seg)| {
-        let lower = seg.to_ascii_lowercase();
-        seg.contains(['{', '[', '?'])
-            || RESERVED_DIRS.contains(&lower.as_str())
-            || (seg.starts_with('.') && (i == 0 || seg.contains('*')))
-    })
 }
 
 /// Dossier (ou fichier exact) auquel se rattache le motif : sa partie littérale.
@@ -124,21 +100,6 @@ pub fn batches(scopes: &[Vec<String>]) -> Vec<Vec<usize>> {
     out
 }
 
-/// Règles `--allowedTools` d'écriture pour un périmètre. `**` → l'outil sans restriction.
-/// Les motifs non sûrs (`..`, `~`, `\`, `,`, `()`) et réservés (`.claude`, `.git`…) ne donnent aucune règle : échec fermé.
-pub fn write_rules(scope: &[String]) -> Vec<String> {
-    let safe: Vec<&String> = scope.iter().filter(|s| is_safe(s) && !is_sensitive(s)).collect();
-    let mut rules = vec![];
-    for tool in ["Edit", "Write"] {
-        if safe.iter().any(|s| is_everything(s)) {
-            rules.push(tool.to_string());
-        } else {
-            rules.extend(safe.iter().map(|s| format!("{tool}({})", normalize(s))));
-        }
-    }
-    rules
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,8 +113,8 @@ mod tests {
         assert_eq!(normalize("./src//api/"), "src/api");
         assert_eq!(normalize("/src/a.rs"), "src/a.rs");
         assert_eq!(normalize("  "), "**");
-        assert!(is_everything("**") && is_everything("./"));
-        assert!(!is_everything("*"), "`*` seul ne couvre que la racine");
+        assert_eq!(normalize("./"), "**");
+        assert_eq!(normalize("*"), "*", "`*` seul ne couvre que la racine");
     }
 
     #[test]
@@ -164,14 +125,11 @@ mod tests {
         assert!(!covers("**", "../secret/**"), "`..` ne sort jamais du projet");
         assert!(!covers("src/**", "src/../../secret/**"));
         assert!(overlaps("../secret/**", "src/a.rs"), "motif non sûr : sérialisé avec tout");
-        assert_eq!(write_rules(&v(&["../secret/**", "src/a/**"])), vec!["Edit(src/a/**)", "Write(src/a/**)"]);
-        assert!(write_rules(&v(&["../x"])).is_empty(), "échec fermé : aucune règle d'écriture");
     }
 
     #[test]
     fn etoile_seule_reste_la_racine() {
         assert_eq!(normalize("*"), "*");
-        assert_eq!(write_rules(&v(&["*"])), vec!["Edit(*)", "Write(*)"]);
         assert!(!covers("src/**", "*"));
         assert!(overlaps("*", "src/a.rs"));
     }
@@ -223,29 +181,12 @@ mod tests {
     }
 
     #[test]
-    fn regles_de_permission() {
-        assert_eq!(write_rules(&v(&["src/a/**", "./docs/x.md"])), vec!["Edit(src/a/**)", "Edit(docs/x.md)", "Write(src/a/**)", "Write(docs/x.md)"]);
-        assert_eq!(write_rules(&v(&["**"])), vec!["Edit", "Write"]);
-    }
-
-    #[test]
     fn caracteres_de_regle_refuses() {
-        // Une virgule ou une parenthèse dans un motif permettrait d'injecter une autre règle (ex. Bash).
         for bad in ["src/a,Bash(rm", "src/a)", "src/(a", "src/a\n", "src/a\0"] {
             assert!(!is_safe(bad), "{bad:?} doit être refusé");
         }
-        assert!(write_rules(&v(&["src/a/**),Bash(rm -rf :*"])).is_empty(), "aucune règle injectée");
-        assert_eq!(write_rules(&v(&["src/a/**", "src/x,y"])), vec!["Edit(src/a/**)", "Write(src/a/**)"]);
-    }
-
-    #[test]
-    fn chemins_reserves_jamais_ecrits() {
-        // `.claude/settings*` élargirait les permissions ; `.git/hooks` préparerait du code exécuté plus tard.
-        for bad in [".claude/settings.json", ".git/hooks/pre-commit", ".essaim/missions/x", ".g*/**", "{.claude}/**", ".gitignore"] {
-            assert!(is_sensitive(bad), "{bad} doit être réservé");
-        }
-        assert!(!is_sensitive("src/.env.example") && !is_sensitive("src/a/**"));
-        assert_eq!(write_rules(&v(&["src/a/**", ".claude/**", ".git/hooks/**"])), vec!["Edit(src/a/**)", "Write(src/a/**)"]);
-        assert!(write_rules(&v(&[".claude/**"])).is_empty(), "échec fermé");
+        assert!(!all_covered(&v(&["**"]), &v(&["src/a/**),Bash(rm -rf :*"])), "un motif douteux n'est jamais tenu pour inclus");
+        // Un périmètre vide (poste d'analyse) ne chevauche rien : il va dans le premier lot.
+        assert_eq!(batches(&[v(&["src/**"]), vec![], vec![]]), vec![vec![0, 1, 2]]);
     }
 }

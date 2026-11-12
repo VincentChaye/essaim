@@ -1,19 +1,21 @@
-//! Pilotage d'une mission : phase de conception, point de contrôle, phase de réalisation, clôture du run.
+//! Pilotage d'une mission : plan du boss, point de contrôle, descente de réalisation, clôture du run.
 
+use super::prompt::plan_prompt;
 use super::seat::run_seat;
 use super::shared::{Shared, cost_guard, emit};
-use super::{CompanyOptions, MissionOutcome, Phase, PhaseOutcome};
+use super::{CompanyOptions, MissionOutcome, Phase, PhaseOutcome, SeatOut};
 use crate::model::agent::AgentDef;
 use crate::model::company::Company;
 use crate::runtime::executor::{RunEvent, Runner, cancelled};
 use crate::runtime::missions;
 use crate::tf;
 use anyhow::{Result, bail};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Semaphore, mpsc, watch};
 
-/// Lance une phase complète depuis le boss. `calls` est le compteur d'appels de toute la mission.
+/// Lance une phase depuis le boss. Plan : le boss seul, en un appel. Réalisation : la descente de
+/// l'organigramme. `calls` est le compteur d'appels de toute la mission.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_phase(
     company: &Company,
@@ -43,20 +45,26 @@ pub(super) async fn run_phase(
         calls,
         cost: Mutex::new(0),
         hints: Mutex::new(Default::default()),
-        grants: Mutex::new(Default::default()),
+        halted: AtomicBool::new(false),
     });
-    let root_scope = if phase == Phase::Realisation { vec!["**".to_string()] } else { vec![] };
-    let out = run_seat(sh.clone(), root, phase, vec![root_task.to_string()], root_scope, vec![]).await;
+    let out: SeatOut = match phase {
+        // Le plan est l'affaire du boss seul : il lit, il questionne l'humain, il écrit. Faire « concevoir »
+        // toute la hiérarchie doublait les appels pour un plan que le boss devait de toute façon resynthétiser.
+        Phase::Conception => {
+            let kids = sh.kids(root);
+            let (o, waived) = sh.work(root, phase, plan_prompt(&company.outline()), &kids, &[], &[], None).await;
+            SeatOut { waived, ..o.into() }
+        }
+        Phase::Realisation => run_seat(sh.clone(), root, phase, vec![root_task.to_string()], vec!["**".to_string()], vec![]).await,
+    };
     let cost = *cost_guard(&sh.cost);
     let used = sh.calls.load(Ordering::SeqCst).min(company.max_calls).saturating_sub(before);
     let ok = out.ok();
     Ok(PhaseOutcome { ok, report: out.text, blockers: if ok { vec![] } else { out.blockers }, tokens: cost, calls: used })
 }
 
-const CONCEPTION_TASK: &str = "Lead the design phase of the mission described in the brief: have each domain framed by the right lead.";
-
 fn realisation_task(plan: &str) -> String {
-    format!("Here is the consolidated plan, approved at the end of design:\n{plan}\n\nLead its setup in the project: split the work across your realisation branch.")
+    format!("Here is the plan of the mission, written by you and approved by the human:\n{plan}\n\nLead its realisation: split the work across your company.")
 }
 
 /// Note affichée quand la réalisation est refusée au point de contrôle : le run est « terminé » (code 0)
@@ -88,6 +96,14 @@ pub async fn run_mission(
         if !opts.pause.paused() {
             missions::clear_pause(d);
         }
+        // Notes partagées de la mission : livrables longs des postes et décisions de l'humain. Le journal
+        // des décisions existe dès le départ (vide) : les postes le lisent avant de questionner.
+        let notes = d.join(missions::NOTES_DIR);
+        let _ = std::fs::create_dir_all(&notes);
+        let decisions = notes.join(crate::runtime::bus::DECISIONS_FILE);
+        if !decisions.exists() {
+            let _ = std::fs::write(&decisions, crate::runtime::bus::DECISIONS_HEADER);
+        }
     }
     let save = |name: &str, text: &str| -> Result<()> {
         match &opts.mission_dir {
@@ -108,7 +124,7 @@ pub async fn run_mission(
         if let Some(d) = &opts.mission_dir {
             missions::clear_conception_mark(d); // un run neuf invalide l'ancien plan
         }
-        let c = match run_phase(company, agents, brief, Phase::Conception, CONCEPTION_TASK, opts, runner.clone(), tx.clone(), cancel.clone(), calls.clone()).await {
+        let c = match run_phase(company, agents, brief, Phase::Conception, "", opts, runner.clone(), tx.clone(), cancel.clone(), calls.clone()).await {
             Ok(c) => c,
             Err(e) => {
                 emit(&tx, RunEvent::RunFinished { ok: false, tokens: 0 });
@@ -135,10 +151,9 @@ pub async fn run_mission(
         approved: None,
     };
 
-    let has_builders = company.seats.iter().any(|s| s.builds);
     let cancelled_now = *cancel.borrow();
-    // Conception non réussie : on ne construit jamais sur une base bloquée (l'utilisateur a déjà pu intervenir).
-    if has_builders && !cancelled_now && conception.ok {
+    // Plan non abouti : on ne réalise jamais sur une base bloquée (l'humain a déjà pu intervenir).
+    if !cancelled_now && conception.ok {
         // Point de contrôle : le plan est validé avant de toucher au projet.
         let approved = if company.checkpoint {
             let (rtx, mut rrx) = mpsc::unbounded_channel::<bool>();
@@ -180,9 +195,9 @@ pub async fn run_mission(
             outcome.ok = conception.ok;
         }
     }
-    // Réussie = menée à terme : conception ok, et réalisation faite si l'entreprise en a une (un plan refusé n'est pas un succès).
+    // Réussie = menée à terme : plan abouti et réalisation faite (un plan refusé n'est pas un succès).
     if let Some(d) = &opts.mission_dir {
-        missions::mark_done(d, outcome.ok && (!has_builders || outcome.realisation.is_some()));
+        missions::mark_done(d, outcome.ok && outcome.realisation.is_some());
         // Mission allée au bout : elle n'est plus en pause. Après une annulation, la marque est laissée en
         // place : c'est ce qui permet de quitter essaim pendant une pause et de reprendre plus tard.
         if !*cancel.borrow() {

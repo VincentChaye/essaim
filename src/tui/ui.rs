@@ -26,7 +26,10 @@ pub fn draw(f: &mut Frame, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            let label = if *t == Tab::Run && app.run.as_ref().is_some_and(|r| r.finished.is_none() && r.paused().is_some()) {
+            let label = if *t == Tab::Run && !app.requests.is_empty() {
+                // Une demande attend l'humain : visible depuis n'importe quel onglet, un agent est à l'arrêt.
+                format!("{} {} ✋{}", i + 1, t.title(app.lang), app.requests.len())
+            } else if *t == Tab::Run && app.run.as_ref().is_some_and(|r| r.finished.is_none() && r.paused().is_some()) {
                 // Pause visible depuis n'importe quel onglet : le run n'avance plus, il n'est pas perdu.
                 format!("{} {} ⏸", i + 1, t.title(app.lang))
             } else if *t == Tab::Run && app.running() {
@@ -94,20 +97,14 @@ pub fn draw(f: &mut Frame, app: &App) {
         let area = centered(f.area(), 88, (f.area().height * 8 / 10).max(10));
         f.render_widget(Clear, area);
         let block = Block::bordered()
-            .title(tr(" Plan consolidé — lancer la réalisation ? ", " Consolidated plan — start realisation? "))
-            .title_bottom(tr(" Entrée : lancer (les postes ⚒ modifient le projet) · c : copier · e : modifier le plan avec le boss · Échap : arrêter ici · ↑↓ défiler ", " Enter: start (⚒ seats modify the project) · c: copy · e: revise the plan with the boss · Esc: stop here · ↑↓ scroll "))
+            .title(tr(" Plan de la mission — lancer la réalisation ? ", " Mission plan — start realisation? "))
+            .title_bottom(tr(" Entrée : lancer (les postes modifient le projet) · c : copier · e : modifier le plan avec le boss · Échap : arrêter ici · ↑↓ défiler ", " Enter: start (seats modify the project) · c: copy · e: revise the plan with the boss · Esc: stop here · ↑↓ scroll "))
             .border_style(Style::new().fg(Color::Yellow));
         f.render_widget(Paragraph::new(cp.plan.clone()).wrap(Wrap { trim: false }).scroll((cp.scroll, 0)).block(block), area);
     }
 
-    if let Some(es) = app.escalation.as_ref().filter(|_| app.tab == Tab::Run) {
-        let area = centered(f.area(), 88, (f.area().height * 8 / 10).max(10));
-        f.render_widget(Clear, area);
-        let block = Block::bordered()
-            .title(tr(" Mission bloquée — le CEO n'a pas pu la débloquer ", " Mission blocked — the CEO could not clear it "))
-            .title_bottom(tr(" c : copier · e : discuter avec le CEO · Entrée : relancer la correction · Échap : arrêter la mission · ↑↓ défiler ", " c: copy · e: talk with the CEO · Enter: retry the correction · Esc: stop the mission · ↑↓ scroll "))
-            .border_style(Style::new().fg(Color::Red));
-        f.render_widget(Paragraph::new(es.summary.clone()).wrap(Wrap { trim: false }).scroll((es.scroll, 0)).block(block), area);
+    if let Some(r) = app.requests.first().filter(|_| app.request_shown()) {
+        draw_request(f, app, r);
     }
 
     if app.settings_menu.is_some() {
@@ -184,18 +181,68 @@ pub fn draw(f: &mut Frame, app: &App) {
     f.render_widget(Paragraph::new(text).style(style), help);
 }
 
-fn draw_settings(f: &mut Frame, app: &App) {
-    let Some(m) = &app.settings_menu else { return };
-    let area = centered(f.area(), 50, 9);
+/// Panneau d'une demande à l'humain : la question, ses options, et la réponse libre en dernière entrée.
+fn draw_request(f: &mut Frame, app: &App, r: &super::app::RequestState) {
+    use crate::runtime::executor::AskKind;
+    let Some(q) = r.question() else { return };
+    let area = centered(f.area(), 92, (f.area().height * 8 / 10).max(12));
     f.render_widget(Clear, area);
-    let mut lines = vec![Line::raw(if m.first_run { "Choisis ta langue · Choose your language" } else { "Langue · Language" }), Line::raw("")];
-    for (i, l) in Lang::ALL.iter().enumerate() {
-        let style = if i == m.sel { Style::new().add_modifier(Modifier::BOLD).bg(Color::DarkGray) } else { Style::new() };
-        lines.push(Line::styled(format!(" {} {}. {} ", if i == m.sel { "▸" } else { " " }, i + 1, l.name()), style));
+    let (what, color) = match r.req.kind {
+        AskKind::Question => (tr("Question de", "Question from"), Color::Cyan),
+        AskKind::Action => (tr("Action demandée par", "Action requested by"), Color::Yellow),
+        AskKind::Blocked => (tr("Poste bloqué :", "Seat blocked:"), Color::Red),
+        AskKind::Permission => (tr("Autorisation demandée par", "Permission requested by"), Color::Magenta),
+        AskKind::Review => (tr("Revue de", "Review by"), Color::Yellow),
+    };
+    let step = if r.req.questions.len() > 1 { format!(" · {}/{}", r.answers.len() + 1, r.req.questions.len()) } else { String::new() };
+    let queue = if app.requests.len() > 1 { tf!(" · {} en attente", " · {} waiting", app.requests.len() - 1) } else { String::new() };
+    let mut lines: Vec<Line> = q.text.lines().map(|l| Line::raw(l.to_string())).collect();
+    lines.push(Line::raw(""));
+    let pick = |on: bool| if on { Style::new().add_modifier(Modifier::BOLD).bg(Color::DarkGray) } else { Style::new() };
+    for (i, o) in q.options.iter().enumerate() {
+        let rec = if q.recommended == Some(i) { tr("  (recommandé)", "  (recommended)") } else { "" };
+        lines.push(Line::styled(format!(" {} {}. {o}{rec} ", if r.sel == i { "▸" } else { " " }, i + 1), pick(r.sel == i)));
     }
+    let free = r.on_free_text();
+    let cursor = if free { "▏" } else { "" };
+    lines.push(Line::styled(format!(" {} ✎ {} : {}{cursor} ", if free { "▸" } else { " " }, tr("Réponse libre", "Free answer"), r.input), pick(free)));
+    let block = Block::bordered()
+        .title(format!(" ✋ {what} {}{step}{queue} ", r.req.seat))
+        .title_bottom(tr(" ↑↓ ou chiffre : choisir · écrire : réponse libre · Entrée : répondre · Échap : mettre de côté (l'agent attend) ", " ↑↓ or digit: pick · type: free answer · Enter: answer · Esc: set aside (the agent waits) "))
+        .border_style(Style::new().fg(color));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((r.scroll, 0)).block(block), area);
+}
+
+fn draw_settings(f: &mut Frame, app: &App) {
+    use super::app::SettingsPage;
+    use super::settings::Profile;
+    let Some(m) = &app.settings_menu else { return };
+    let pick = |on: bool| if on { Style::new().add_modifier(Modifier::BOLD).bg(Color::DarkGray) } else { Style::new() };
     let hint = if m.first_run { " ↑↓ · Entrée / Enter " } else { " ↑↓ · Entrée / Enter · Échap / Esc " };
+    let (area, lines) = match m.page {
+        SettingsPage::Lang => {
+            let mut lines = vec![Line::raw(if m.first_run { "Choisis ta langue · Choose your language" } else { "Langue · Language" }), Line::raw("")];
+            for (i, l) in Lang::ALL.iter().enumerate() {
+                lines.push(Line::styled(format!(" {} {}. {} ", if i == m.sel { "▸" } else { " " }, i + 1, l.name()), pick(i == m.sel)));
+            }
+            (centered(f.area(), 50, 9), lines)
+        }
+        // Le profil s'accompagne de son explication : c'est un choix de sécurité, pas une préférence.
+        SettingsPage::Profile => {
+            let mut lines = vec![Line::raw(tr("Profil de sécurité : ce que les agents ont le droit de faire sur cette machine.", "Security profile: what agents may do on this machine.")), Line::raw("")];
+            for (i, p) in Profile::ALL.iter().enumerate() {
+                lines.push(Line::styled(format!(" {} {}. {} ", if i == m.sel { "▸" } else { " " }, i + 1, p.name(app.lang)), pick(i == m.sel)));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::raw(Profile::ALL[m.sel.min(Profile::ALL.len() - 1)].explain(app.lang)));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(tr("Modifiable à tout moment : F10, ou `essaim profile`.", "Changeable at any time: F10, or `essaim profile`."), Style::new().fg(Color::DarkGray)));
+            (centered(f.area(), 84, 20), lines)
+        }
+    };
+    f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(" Réglages · Settings ").title_bottom(hint).border_style(Style::new().fg(Color::Cyan))),
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::bordered().title(" Réglages · Settings ").title_bottom(hint).border_style(Style::new().fg(Color::Cyan))),
         area,
     );
 }

@@ -1,4 +1,4 @@
-.TH ESSAIM 1 "2026-10-10" "essaim" "Manuel d'utilisation"
+.TH ESSAIM 1 "2026-11-10" "essaim" "Manuel d'utilisation"
 .SH NOM
 essaim \- concevoir et exécuter des équipes d'agents Claude Code, organisées en entreprise
 .SH SYNOPSIS
@@ -22,21 +22,29 @@ essaim \- concevoir et exécuter des équipes d'agents Claude Code, organisées 
 (\fB\-\-brief\fR \fItexte\fR | \fB\-\-brief\fR \fB@\fR\fIfichier\fR | \fB\-\-mission\fR \fIid\fR [\fB\-\-resume\fR])
 [\fB\-\-yes\fR] [\fB\-\-root\fR \fIdossier\fR]
 .br
+.B essaim profile
+[\fBdedicated\fR | \fBprotected\fR]
+.br
 .B essaim conso
 [\fB\-\-port\fR \fIport\fR] [\fB\-\-no\-open\fR] [\fB\-\-root\fR \fIdossier\fR]
 .SH DESCRIPTION
 Un agent est un fichier
 .IR <nom>.md .
 On les assemble en entreprise : un organigramme (boss, VP, managers, workers) qui exécute des missions.
-Une mission se déroule en trois temps : conception en cascade (chaque niveau découpe et délègue à ses subordonnés directs,
-puis les rapports remontent), plan consolidé à valider, réalisation (les postes marqués ⚒ modifient le projet, chacun dans son périmètre).
+Une mission se déroule en trois temps : le boss écrit le plan seul, en un appel, après avoir posé ses questions ;
+tu valides le plan ; puis une seule descente de l'organigramme le réalise (chaque supérieur découpe et délègue à ses
+subordonnés directs, les feuilles travaillent, les rapports remontent). Les postes marqués ⚒ modifient le projet.
+.PP
+Tous les agents ont tous les outils, commandes shell comprises. Ce qu'ils peuvent atteindre dépend du profil de
+sécurité choisi à l'installation (voir \fBPROFILS\fR). Tout agent peut s'adresser à toi à tout moment (voir
+\fBDEMANDES\fR) ; essaim ne relance jamais un poste de lui\-même.
 .PP
 Tout passe par le CLI
 .BR claude (1)
 et ton abonnement : les clés API sont ignorées (retirées de chaque processus lancé) et les coûts affichés sont notionnels.
 .PP
 Sans argument, essaim ouvre l'interface en onglets dans le dossier courant, qui sert de racine du projet.
-Au premier lancement, il demande la langue (français ou English), puis la mémorise.
+Au premier lancement, il demande la langue (français ou English) et, s'il n'a pas été choisi à l'installation, le profil de sécurité, puis les mémorise.
 .PP
 Agents et entreprises sont à toi, pas au projet : ils sont rangés dans \fI~/.claude/agents\fR et
 \fI~/.claude/companies\fR, donc disponibles depuis n'importe quel dossier du système de fichiers, et toute
@@ -61,27 +69,31 @@ Valide l'organigramme.
 .B company run
 Exécute une mission. L'entreprise se désigne par son nom (\fIacme\-studio\fR, cherché dans le projet puis
 chez l'utilisateur) ou par un chemin de fichier. \fB\-\-brief\fR \fI@fichier\fR lit le brief dans un fichier ; \fB\-\-mission\fR \fIid\fR \fB\-\-resume\fR
-reprend une mission interrompue (une conception menée à terme n'est pas rejouée). \fB\-\-yes\fR valide sans demander.
+reprend une mission interrompue (un plan déjà écrit n'est pas réécrit). \fB\-\-yes\fR valide sans demander.
 La limite d'abonnement met le run en pause et il reprend seul à l'heure annoncée ; \fBCtrl+C\fR pendant la pause
 laisse la mission reprenable.
-Sans \fB\-\-yes\fR, un plan consolidé demande \fB[o/N/e]\fR : \fBo\fR lance la réalisation, \fBe\fR modifie le plan avec le boss,
+Sans \fB\-\-yes\fR, le plan du boss demande \fB[o/N/e]\fR : \fBo\fR lance la réalisation, \fBe\fR modifie le plan avec le boss,
 toute autre réponse arrête.
-Si le point de contrôle est désactivé (\fBcheckpoint = false\fR dans le TOML), il n'y a ni invite ni pause : la réalisation démarre après la conception.
+Si le point de contrôle est désactivé (\fBcheckpoint = false\fR dans le TOML), il n'y a ni invite ni pause : la réalisation démarre dès que le plan est écrit.
+Les demandes des agents s'affichent sur la sortie d'erreur ; la réponse (numéro d'option ou texte libre) se lit sur l'entrée standard.
 .PP
 Missions liées : une mission peut exiger la réussite d'autres missions (fichier \fBafter\fR du dossier de la mission, touche \fBa\fR dans la TUI), quelle que soit leur entreprise. Tant qu'un prérequis n'est pas réussi, elle est grisée et \fBcompany run --mission\fR la refuse.
 .PP
-Blocages : un poste bloqué (tests rouges, permission refusée, prérequis absent) n'est jamais compté comme réussi. Son supérieur lance jusqu'à \fBmax_fix_rounds\fR tours de correction (défaut 2), puis remonte le blocage de niveau en niveau jusqu'au CEO ; si le CEO échoue, le run attend une décision (relancer, discuter avec le CEO, arrêter). Avec \fB--yes\fR, la mission s'arrête.
-Revue : les supérieurs ne codent pas mais lisent et vérifient (commandes de lecture, tests déjà permis à leurs subordonnés). Après les rapports, le CEO relit le résultat contre l'objectif et peut relancer une redescente de tâches complémentaires, jusqu'à \fBmax_review_rounds\fR fois (défaut 1, 0 = aucune revue).
-Modèles : sonnet par défaut pour les postes qui produisent le travail et ceux qui arbitrent. \fBhelpers\fR = \(dqhaiku\(dq sur un poste lui donne des assistants légers (sous-agent en lecture seule) pour les tâches mécaniques, sans décision.
-Choix du modèle : à chaque délégation, le CEO ou un manager peut fixer \fBmodel\fR (haiku, sonnet, opus) pour le poste mobilisé selon la difficulté réelle de la tâche (pour une feuille : son modèle ; pour un manager : le défaut de sa branche). Un \fBmodel\fR écrit dans le .toml d'un poste est épinglé.
-Avertissement d'exécution dans ce cas : \fB[À CONFIRMER]\fR (texte et canal à fixer).
+Blocages : un poste bloqué (tests rouges, prérequis absent, délai dépassé) n'est jamais compté comme réussi et n'est jamais relancé automatiquement. Tu reçois une demande « poste bloqué » : relancer ce poste (une réponse libre le relance avec ton texte, dans sa session), continuer sans lui, ou arrêter la mission. Avec \fB\-\-yes\fR, personne ne répond : le poste reste bloqué et la mission sort en \fB1\fR.
+Revue : après les rapports, le boss relit le résultat contre l'objectif. La revue constate et ne relance rien : si elle n'est pas acceptée, les écarts te sont présentés (relancer une descente corrective, accepter le résultat, arrêter). \fBreview = false\fR dans le TOML la supprime.
+Modèles : sonnet par défaut pour les postes qui produisent le travail et ceux qui arbitrent. \fBhelpers\fR = \(dqhaiku\(dq sur un poste lui donne des assistants légers (sous\-agent sans outil d'écriture de fichiers) pour les tâches mécaniques, sans décision.
+Choix du modèle : à chaque délégation, le boss ou un manager peut fixer \fBmodel\fR (haiku, sonnet, opus) pour le poste mobilisé selon la difficulté réelle de la tâche (pour une feuille : son modèle ; pour un manager : le défaut de sa branche). Un \fBmodel\fR écrit dans le .toml d'un poste est épinglé.
+Les anciens champs \fBallow_bash\fR, \fBmax_fix_rounds\fR et \fBmax_review_rounds\fR sont encore lus ; les deux premiers sont ignorés, le troisième vaut \fBreview = false\fR quand il est à 0.
+.TP
+.B profile
+Affiche ou change le profil de sécurité. Sans argument : explique les deux profils et pose la question. Avec \fBdedicated\fR ou \fBprotected\fR : l'enregistre sans rien demander.
 .TP
 .B conso
 Sert le tableau de bord de consommation sur la boucle locale et l'ouvre dans le navigateur (alias : \fBusage\fR).
 Plusieurs affectations au même subordonné sont des \fBétapes successives\fR, pas une tâche fusionnée : le poste
 les exécute l'une après l'autre, chacune dans un appel \fBclaude\fR neuf, donc avec un contexte qui ne porte que
-l'étape en cours. Une étape non aboutie arrête les suivantes. En réalisation, un poste qui a \fBgit\fR clôt chaque
-étape par un commit. Conséquence : une feuille qui découpe son travail en trois étapes consomme trois appels de
+l'étape en cours. Une étape non aboutie arrête les suivantes, sauf si tu réponds de continuer. Avec \fBcommit_steps = true\fR
+dans le TOML, un poste ⚒ clôt chaque étape par un commit. Conséquence : une feuille qui découpe son travail en trois étapes consomme trois appels de
 \fBmax_calls\fR, que l'estimation affichée avant lancement ne compte pas.
 .PP
 Les jetons sont comptés en \fBcoût pondéré\fR (entrée ×1, sortie ×5, cache lu ×0,1, cache écrit ×1,25),
@@ -122,7 +134,7 @@ Tableau de bord de consommation dans le navigateur (voir \fBconso\fR). Le serveu
 et vit jusqu'à la fermeture d'essaim.
 .TP
 .B F10
-Réglages (langue).
+Réglages : langue, puis profil de sécurité.
 .TP
 .BR q ", " Ctrl+C
 Quitte. Si un run est en cours, demande confirmation (\fBo\fR ou \fBy\fR) : le run est alors annulé.
@@ -140,7 +152,7 @@ Trois zones : Entreprises, Missions, organigramme. \fB\(<- \(->\fR passent de l'
 Dans l'organigramme : \fBa\fR ajoute un poste, \fBe\fR l'édite, \fBx\fR le retire (confirmation).
 Dans la zone Missions : \fBEntrée\fR ou \fBo\fR ouvre la mission choisie (brief, plan, rapport) ; \fBEspace\fR déplie son résumé.
 Hors zone : \fBn\fR crée une entreprise avec l'assistant ; \fBm\fR cadre une mission avec le boss ;
-\fBr\fR la lance (reprend à la réalisation si la conception est menée à terme, et reprend sans confirmation une mission en pause) ; \fBR\fR la relance depuis le début ;
+\fBr\fR la lance (reprend à la réalisation si le plan est déjà écrit, et reprend sans confirmation une mission en pause) ; \fBR\fR la relance depuis le début ;
 \fBt\fR/\fBT\fR choisissent la mission ; \fBc\fR/\fBC\fR changent d'entreprise.
 .TP
 .B 3 Run
@@ -153,7 +165,8 @@ Limite d'abonnement atteinte : le run se met en pause au lieu d'échouer (\fB⏸
 l'onglet, avec l'heure de reprise), repart seul à cette heure et rejoue l'appel refusé ;
 aucun poste n'est en échec et le refus ne compte pas dans le plafond d'appels. Contrairement à la pause
 à la main, elle laisse les appels déjà partis aller au bout.
-Au plan consolidé : \fBEntrée\fR lance la réalisation, \fBÉchap\fR arrête, \fBe\fR ouvre une conversation avec le boss pour modifier le plan.
+Demandes des agents : l'onglet s'ouvre sur la demande et la barre d'onglets affiche \fB✋\fR avec le nombre en attente. \fB\(ua \(da\fR ou un chiffre choisissent une option, taper écrit une réponse libre, \fBEntrée\fR envoie ; \fBÉchap\fR met la demande de côté (l'agent attend), \fBd\fR la rouvre.
+Au plan du boss : \fBEntrée\fR lance la réalisation, \fBÉchap\fR arrête, \fBe\fR ouvre une conversation avec le boss pour modifier le plan.
 .TP
 .B 4 Sessions
 Sessions background de Claude Code : \fBa\fR ou \fBEntrée\fR attache, \fBs\fR arrête, \fBx\fR supprime (confirmation), \fBr\fR rafraîchit.
@@ -161,6 +174,33 @@ Sessions background de Claude Code : \fBa\fR ou \fBEntrée\fR attache, \fBs\fR a
 .B 5 Claude
 Un vrai Claude Code dans un terminal intégré. \fBCtrl+\e\fR rend les touches de navigation à essaim.
 \fBEntrée\fR ou \fBi\fR reprend la session, \fBx\fR la termine (confirmation).
+.SH PROFILS
+Le profil de sécurité fixe les droits de tous les agents. L'installeur pose la question (\fB\-\-profile\fR y répond d'avance) ;
+\fBessaim profile\fR ou \fBF10\fR le changent. Tant qu'aucun profil n'est choisi, \fBprotected\fR s'applique.
+.TP
+.B dedicated
+Appareil dédié, sans données personnelles (machine virtuelle, poste réservé aux agents). Les agents ont tous les droits :
+toute commande, tout fichier, le réseau, sans jamais demander. Rien n'empêche matériellement un agent d'agir hors du dossier du projet.
+.TP
+.B protected
+Machine personnelle. Les commandes des agents tournent dans le bac à sable de Claude Code, tenu par le système
+(Seatbelt sous macOS ; bubblewrap sous Linux, avec \fBsocat\fR) : écriture limitée au dossier du projet, pas de lecture du
+dossier personnel, réseau limité aux registres de paquets. Dans le projet, les agents travaillent librement. Une commande
+à relancer hors du bac à sable, un autre domaine réseau, une page web à lire ou un fichier hors du projet deviennent une
+demande : autoriser une fois, autoriser pour la mission, ou refuser. Si le bac à sable ne peut pas démarrer, aucune commande
+n'est lancée. Limite : le bac à sable couvre les commandes shell ; les outils de fichier et le web passent par tes réponses.
+.SH DEMANDES
+Chaque agent dispose de l'outil \fBask_human\fR, fourni par un serveur MCP intégré à essaim, utilisable à tout moment de son
+appel. L'appel bloque jusqu'à ta réponse, puis l'agent continue dans la même session ; les autres postes continuent
+pendant ce temps, et le délai du nœud ne court pas. Une demande est une \fBquestion\fR (affiner la tâche), une \fBaction\fR
+(ce que toi seul peux faire) ou un blocage ; elle porte 1 à 4 questions avec des options et, parfois, une option recommandée.
+Règle donnée aux postes : un fait se cherche soi\-même dans le projet ou sur le web ; une intention (ambiguïté, choix,
+priorité, critère de réussite) se demande à l'humain avant de construire dessus ; on ne demande rien à son supérieur.
+Questions et réponses sont consignées dans \fInotes/decisions.md\fR.
+.PP
+Avec \fB\-\-yes\fR, personne ne répond : une question reçoit l'option recommandée par l'agent (hypothèse notée dans
+\fIdecisions.md\fR) ; une action, un blocage ou une revue non acceptée laissent le poste bloqué et la mission sort en \fB1\fR ;
+une demande d'autorisation est refusée.
 .SH FICHIERS
 .TP
 .I ~/.claude/agents/
@@ -168,13 +208,13 @@ Tes agents, un fichier .md chacun (format standard de Claude Code) : disponibles
 Les créations vont ici.
 .TP
 .I ~/.claude/companies/
-Tes entreprises (TOML : postes, hiérarchie, périmètres) : disponibles depuis tous tes dossiers.
+Tes entreprises (TOML : postes, hiérarchie) : disponibles depuis tous tes dossiers.
 .TP
 .I .claude/agents/, .claude/companies/
 Agents et entreprises propres au projet ; à nom de fichier égal, ils masquent les tiens.
 .TP
 .I .essaim/missions/
-Brief, conception.md et rapport.md de chaque mission. Le fichier \fIpause\fR marque un run interrompu par la
+Brief, conception.md (le plan) et rapport.md de chaque mission, et le dossier \fInotes/\fR : livrables longs des postes et \fIdecisions.md\fR, le journal de tes réponses, que les postes lisent avant de poser une question. Le fichier \fIpause\fR marque un run interrompu par la
 limite d'abonnement (il contient l'heure de reprise) : la mission est reprenable telle quelle.
 .TP
 .I .essaim/runs/
@@ -186,7 +226,7 @@ Transcriptions de Claude Code (une par session), lues \fBen lecture seule\fR par
 compter les jetons.
 .TP
 .I ~/.config/essaim/settings.toml
-Réglages mémorisés (langue). Emplacement propre à la plateforme ; \fBESSAIM_CONFIG_DIR\fR le remplace.
+Réglages mémorisés : \fBlang\fR, \fBprofile\fR et, pour le profil protégé, \fBsandbox_read\fR, \fBsandbox_write\fR, \fBsandbox_domains\fR (dossiers hors projet lisibles ou inscriptibles par les commandes, domaines joignables sans demande). Emplacement propre à la plateforme ; \fBESSAIM_CONFIG_DIR\fR le remplace.
 .SH ENVIRONNEMENT
 .TP
 .BR VISUAL ", " EDITOR
@@ -209,7 +249,7 @@ Toute variable dont le nom commence par \fBCLAUDE_CODE_USE_\fR (préfixe exact, 
 Succès. Une réalisation refusée au point de contrôle sort aussi en \fB0\fR.
 .TP
 .B 1
-Un nœud ou un poste a échoué, ou la validation a échoué, ou \fB\-\-yes\fR manque pour une mission de plus de 30 appels.
+Un poste a échoué ou reste bloqué, ou la validation a échoué, ou \fB\-\-yes\fR manque pour une mission de plus de 30 appels.
 .SH EXEMPLES
 .nf
 essaim init && essaim

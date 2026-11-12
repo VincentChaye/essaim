@@ -25,10 +25,15 @@ Méthode unique, figée avant toute modification du contenu envoyé au modèle. 
 ## Missions types
 | id | entreprise | brief | mode du faux |
 |----|------------|-------|--------------|
-| M1 | 3 postes, conception seule | court | nominal |
-| M2 | 7 postes, conception seule | détaillé (critères) | nominal |
+| M1 | 3 postes | court | nominal |
+| M2 | 7 postes | détaillé (critères) | nominal |
 | M3 | 7 postes dont 2 de réalisation | détaillé | nominal |
-| M4 | 7 postes, revue rejetée puis relance, sorties volumineuses | détaillé | review_redo,big |
+| M4 | 7 postes, revue rejetée, relance demandée par l'humain, sorties volumineuses | détaillé | review_redo,big |
+
+`avant.json` a été mesuré sur l'ancien moteur (conception par toute la hiérarchie, puis réalisation des seuls postes ⚒ :
+M1 et M2, sans poste ⚒, s'arrêtaient au plan). `apres.json` est mesuré sur le moteur actuel : un appel du boss pour le
+plan, puis une descente pour toute entreprise. Seule M3 compare donc le même travail (21 → 13 appels).
+M4 n'utilise pas `--yes` : le harnais répond `1` (« relancer une descente corrective ») à la revue rejetée.
 
 ## Relance
 ```

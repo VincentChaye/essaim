@@ -42,10 +42,12 @@ pub struct Seat {
     /// Domaine de compétence, vu par le supérieur pour déléguer (absent : seul l'intitulé est présenté).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expertise: Option<String>,
-    /// Feuille de réalisation : seul type de poste autorisé à modifier le projet.
+    /// Feuille de réalisation : ce poste réalise dans le projet (les autres feuilles analysent et conseillent).
+    /// C'est un rôle, annoncé dans la fiche de poste, et non un droit : tous les postes ont tous les outils.
     #[serde(default, skip_serializing_if = "is_false")]
     pub builds: bool,
-    /// Commandes shell autorisées pour ce poste (ex. « cargo test »).
+    /// Obsolète : tous les postes peuvent lancer toutes les commandes. Lu pour ne pas casser les anciens
+    /// fichiers, conservé à l'écriture, ignoré à l'exécution.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_bash: Vec<String>,
     /// Modèle des assistants légers (ex. « haiku ») : le poste leur confie des tâches mécaniques et entièrement
@@ -59,28 +61,6 @@ pub struct Seat {
 
 fn is_false(b: &bool) -> bool {
     !*b
-}
-
-/// Commande autorisée (`allow_bash`) : elle devient la règle `Bash(<commande>:*)`. Refusé : `, ( ) * :`
-/// (séparateurs, jokers et délimiteur de la règle) et caractères de contrôle. Vide = refusé.
-pub fn is_safe_command(c: &str) -> bool {
-    let c = c.trim();
-    !c.is_empty() && !c.contains([',', '(', ')', '*', ':']) && !c.chars().any(char::is_control)
-}
-
-/// Commandes de vérification accessibles à tout supérieur (lecture seule).
-const READ_ONLY_COMMANDS: [&str; 8] = ["git status", "git diff", "git log", "git show", "wc", "grep", "diff", "ls"];
-
-/// Préfixes des commandes d'un poste ⚒ qui ne font que vérifier (tests, compilation, lecture) : un supérieur peut les rejouer.
-const VERIFY_PREFIXES: [&str; 14] = [
-    "cargo test", "cargo build", "cargo check", "cargo clippy", "cargo bench", "go test", "go build", "go vet", "npm test", "npm run test", "pytest", "make test",
-    "git status", "git diff",
-];
-
-fn is_verification(cmd: &str) -> bool {
-    let c = cmd.trim();
-    let matches = |p: &str| c == p || c.strip_prefix(p).is_some_and(|r| r.starts_with(' '));
-    READ_ONLY_COMMANDS.iter().chain(VERIFY_PREFIXES.iter()).chain(["git log", "git show"].iter()).any(|p| matches(p))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -102,13 +82,19 @@ pub struct Company {
     /// Absent = pas de plafond : la bonne valeur dépend du modèle du poste.
     #[serde(default)]
     pub max_budget_usd: Option<f64>,
-    /// Tours de correction qu'un poste peut lancer dans sa branche avant de remonter le blocage à son supérieur.
+    /// Obsolète : il n'y a plus de tours de correction, un poste bloqué s'adresse à l'humain. Lu, ignoré.
     #[serde(default = "default_max_fix_rounds")]
     pub max_fix_rounds: u32,
-    /// Revues du CEO : après les rapports, il vérifie le résultat contre l'objectif et peut relancer une redescente
-    /// (tâches complémentaires non prévues au départ). 0 = pas de revue.
+    /// Ancien réglage de la revue du boss : 0 = pas de revue. Remplacé par `review`, qui prime s'il est présent.
     #[serde(default = "default_max_review_rounds")]
     pub max_review_rounds: u32,
+    /// Revue finale du boss : il vérifie le résultat contre l'objectif ; un écart est présenté à l'humain,
+    /// qui décide. Absent = `max_review_rounds > 0` (donc oui par défaut).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<bool>,
+    /// Demande aux postes qui réalisent de clore chaque étape par un commit qui ne couvre qu'elle.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub commit_steps: bool,
     #[serde(default, rename = "seat")]
     pub seats: Vec<Seat>,
 }
@@ -374,68 +360,17 @@ impl Company {
             .collect()
     }
 
-    /// Commandes de vérification d'un supérieur : lecture seule, plus les tests / compilations / lectures déjà permis à ses
-    /// subordonnés (jamais d'écriture : un supérieur coordonne et contrôle, il ne code pas).
-    /// Ce poste peut-il déplacer des fichiers et committer lui-même (`git` dans ses commandes
-    /// autorisées) ? Sert à n'exiger un commit par étape que des postes qui en ont le droit : dans une
-    /// entreprise avec une équipe release, seul ce poste a `git`.
-    pub fn allows_git(&self, i: usize) -> bool {
-        self.seats.get(i).is_some_and(|s| {
-            s.allow_bash.iter().any(|c| {
-                let c = c.trim();
-                c == "git" || c.strip_prefix("git ").is_some_and(|r| r.starts_with("mv") || r.starts_with("commit") || r.starts_with("add"))
-            })
-        })
+    /// La revue finale du boss a-t-elle lieu ?
+    pub fn reviews(&self) -> bool {
+        self.review.unwrap_or(self.max_review_rounds > 0)
     }
 
-    pub fn verify_commands(&self, i: usize) -> Vec<String> {
-        let mut out: Vec<String> = READ_ONLY_COMMANDS.iter().map(|c| c.to_string()).collect();
-        let mut stack = self.children(i);
-        let mut seen = vec![false; self.seats.len()];
-        while let Some(d) = stack.pop() {
-            if std::mem::replace(&mut seen[d], true) {
-                continue;
-            }
-            stack.extend(self.children(d));
-            for cmd in &self.seats[d].allow_bash {
-                let cmd = cmd.trim().to_string();
-                if is_verification(&cmd) && !out.contains(&cmd) {
-                    out.push(cmd);
-                }
-            }
-        }
-        out
-    }
-
-    /// Postes mobilisés en phase de réalisation : les `builds` et tous leurs supérieurs.
-    pub fn build_branch(&self) -> Vec<bool> {
-        let mut flags = vec![false; self.seats.len()];
-        for i in 0..self.seats.len() {
-            if self.seats[i].builds {
-                flags[i] = true;
-                for p in self.chain_of_command(i) {
-                    flags[p] = true;
-                }
-            }
-        }
-        flags
-    }
-
+    /// Majorant du flux de base : le plan (un appel du boss), puis la descente — délégation et rapport pour
+    /// chaque poste interne, un appel de travail par feuille — et la revue du boss s'il a des subordonnés.
     pub fn estimate_calls(&self) -> CallEstimate {
-        let cost = |in_scope: &dyn Fn(usize) -> bool| -> u32 {
-            (0..self.seats.len())
-                .filter(|&i| in_scope(i))
-                .map(|i| {
-                    // Poste interne : délégation + rapport ; feuille : un seul appel de travail.
-                    if self.children(i).iter().any(|&c| in_scope(c)) { 2 } else { 1 }
-                })
-                .sum()
-        };
-        let branch = self.build_branch();
-        let realisation = if branch.iter().any(|b| *b) { cost(&|i| branch[i]) } else { 0 };
-        // + la revue du CEO (un appel par phase, si activée et si le CEO a des subordonnés).
-        let review = u32::from(self.max_review_rounds > 0);
-        CallEstimate { conception: cost(&|_| true) + review, realisation: if realisation > 0 { realisation + review } else { 0 } }
+        let descent: u32 = (0..self.seats.len()).map(|i| if self.is_leaf(i) { 1 } else { 2 }).sum();
+        let review = u32::from(self.reviews() && self.root().is_some_and(|r| !self.is_leaf(r)));
+        CallEstimate { conception: 1, realisation: descent + review }
     }
 
     /// Validation complète : ids, hiérarchie, agents, postes de réalisation.
@@ -487,14 +422,6 @@ impl Company {
             if let Some(m) = &s.helpers {
                 if m.is_empty() || !m.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')) {
                     bail!("{}", tf!("poste {} : « helpers » attend un nom de modèle (ex. haiku)", "seat {}: \"helpers\" expects a model name (e.g. haiku)", s.id));
-                }
-            }
-            if !s.allow_bash.is_empty() && !s.builds {
-                bail!("{}", tf!("poste {} : « allow_bash » n'a de sens que pour un poste « builds »", "seat {}: \"allow_bash\" only makes sense for a \"builds\" seat", s.id));
-            }
-            for cmd in &s.allow_bash {
-                if !is_safe_command(cmd) {
-                    bail!("{}", tf!("poste {} : commande autorisée invalide {:?} (ni , ( ) * : ni retour à la ligne)", "seat {}: invalid allowed command {:?} (no , ( ) * : or line break)", s.id, cmd));
                 }
             }
         }
@@ -646,28 +573,34 @@ reports_to = "ciso"
     }
 
     #[test]
-    fn branche_de_realisation_et_estimation() {
+    fn estimation_un_plan_puis_une_descente() {
         let c = company();
-        let b = c.build_branch();
-        let ids: Vec<&str> = (0..7).filter(|&i| b[i]).map(|i| c.seats[i].id.as_str()).collect();
-        assert_eq!(ids, vec!["ceo", "cto", "mgr", "dev1", "dev2"], "ciso et sec ne participent pas à la réalisation");
         let e = c.estimate_calls();
-        // Conception : ceo, cto, ciso, mgr = 2 chacun ; dev1, dev2, sec = 1 chacun.
-        // + 1 revue du CEO.
-        assert_eq!(e.conception, 4 * 2 + 3 + 1);
-        // Réalisation : ceo, cto, mgr = 2 chacun ; dev1, dev2 = 1 chacun.
-        assert_eq!(e.realisation, 3 * 2 + 2 + 1);
-        assert_eq!(e.total(), 12 + 9);
+        assert_eq!(e.conception, 1, "le plan : un appel du boss");
+        // Descente : ceo, cto, ciso, mgr = 2 chacun ; dev1, dev2, sec = 1 chacun ; + 1 revue du boss.
+        assert_eq!(e.realisation, 4 * 2 + 3 + 1);
+        assert_eq!(e.total(), 13);
     }
 
     #[test]
-    fn sans_builder_pas_de_realisation() {
+    fn revue_reglable_par_le_nouveau_champ_ou_l_ancien() {
         let mut c = company();
-        for s in &mut c.seats {
-            s.builds = false;
-            s.allow_bash.clear();
-        }
-        assert_eq!(c.estimate_calls().realisation, 0);
+        assert!(c.reviews(), "revue par défaut");
+        c.max_review_rounds = 0;
+        assert!(!c.reviews(), "ancien réglage : 0 = pas de revue");
+        assert_eq!(c.estimate_calls().realisation, 4 * 2 + 3);
+        c.review = Some(true);
+        assert!(c.reviews(), "le nouveau champ prime");
+        // Les anciens fichiers restent lisibles : champs obsolètes lus, ignorés à l'exécution.
+        let ancien = Company::parse("name = \"a\"\nmax_fix_rounds = 5\ncommit_steps = true\n[[seat]]\nid = \"ceo\"\ntitle = \"CEO\"\nagent = \"boss\"\n[[seat]]\nid = \"dev\"\ntitle = \"Dev\"\nagent = \"dev\"\nreports_to = \"ceo\"\nallow_bash = [\"cargo test),Bash(rm\"]\n").unwrap();
+        ancien.validate(&agents()).unwrap();
+        assert!(ancien.commit_steps);
+    }
+
+    #[test]
+    fn entreprise_d_un_seul_poste_sans_revue() {
+        let c = Company::parse("name = \"solo\"\n[[seat]]\nid = \"ceo\"\ntitle = \"CEO\"\nagent = \"boss\"\n").unwrap();
+        assert_eq!(c.estimate_calls().total(), 2, "le plan, puis le travail du boss lui-même");
     }
 
     fn err(c: &Company) -> String {
@@ -722,26 +655,6 @@ reports_to = "ciso"
         let mut c = company();
         c.seats[0].builds = true; // le boss
         assert!(err(&c).contains("feuille") || err(&c).contains("boss"));
-
-        let mut c = company();
-        let sec = c.index_of("sec").unwrap();
-        c.seats[sec].allow_bash = vec!["ls".into()];
-        assert!(err(&c).contains("allow_bash"));
-    }
-
-    #[test]
-    fn commandes_autorisees_sans_injection_de_regle() {
-        // Une commande ne peut pas fermer la règle `Bash(...)` ni ajouter une autre règle, ni être un joker.
-        for bad in ["cargo test),Bash(rm -rf", "*", "git:*", "ls\nrm", "   "] {
-            let mut c = company();
-            let dev1 = c.index_of("dev1").unwrap();
-            c.seats[dev1].allow_bash = vec![bad.into()];
-            assert!(err(&c).contains("commande autorisée invalide"), "{bad:?} doit être refusé");
-        }
-        let mut c = company();
-        let dev1 = c.index_of("dev1").unwrap();
-        c.seats[dev1].allow_bash = vec!["cargo test".into(), "cargo clippy --all-targets".into()];
-        c.validate(&agents()).unwrap();
     }
 
     #[test]

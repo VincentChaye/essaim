@@ -43,6 +43,7 @@ fn essaim(b: &Bac, args: &[&str]) -> std::process::Output {
         .env("FAKE_MODE", "nominal")
         .env("FAKE_TARGET", "dev")
         .env("HOME", b.racine.parent().unwrap().join("home"))
+        .env("ESSAIM_CONFIG_DIR", config_dir(b))
         .stdin(Stdio::null())
         .output()
         .unwrap()
@@ -124,7 +125,8 @@ fn une_execution_n_ajoute_que_des_fichiers_de_mission_connus() {
     let ent = ecrire_entreprise(&b, "acme", &entreprise_sept(true));
     let l = lancer(&b, &ent, BRIEF_LONG, "nominal", "dev1");
     assert!(l.ok(), "{}", l.stderr);
-    let connus = ["brief.md", "conception.md", "conception.ok", "rapport.md", "reussie", "company", "after", "resolution.md", "compte-rendu.md"];
+    // `notes` : dossier des notes partagées (livrables longs des postes, décisions de l'humain), ajouté avec la descente unique.
+    let connus = ["brief.md", "conception.md", "conception.ok", "rapport.md", "reussie", "company", "after", "resolution.md", "compte-rendu.md", "notes"];
     let racine = b.racine.join(".essaim/missions");
     let mut vus = 0;
     for m in std::fs::read_dir(&racine).unwrap().flatten() {

@@ -1,10 +1,12 @@
-//! Exécution d'un poste : délégation, lots de travail, correction des échecs, rapport de synthèse.
+//! Exécution d'un poste : délégation, lots de travail, rapport de synthèse, revue du boss.
+//!
+//! Aucune boucle de correction : un poste qui n'aboutit pas s'adresse à l'humain, et chaque nouvel essai
+//! est une décision de l'humain (voir `Shared::work`).
 
-use super::prompt::{escalation_summary, report_prompt, work_prompt};
-use super::schema::{FixPlan, ReviewPlan};
-use super::shared::Shared;
+use super::prompt::{corrective_task, report_prompt, work_prompt};
+use super::schema::Review;
+use super::shared::{Shared, Verdict};
 use super::{Assignment, Blocker, Kind, Phase, SeatOut, Section, Status, join_steps};
-use crate::runtime::executor::EscalationReply;
 use crate::runtime::scope;
 use crate::runtime::textutil::truncate_middle;
 use std::future::Future;
@@ -15,18 +17,16 @@ use tokio::task::JoinSet;
 /// Taille conservée (début+fin) du texte d'un résultat d'un tour précédent dans l'historique du poste.
 const OLD_ROUND_CHARS: usize = 2000;
 
-/// Exécute des affectations : en conception tout en parallèle ; en réalisation par lots sans chevauchement de
-/// fichiers, l'un après l'autre. Un lot qui échoue arrête les suivants (on ne construit pas sur une base cassée).
+/// Exécute des affectations par lots sans chevauchement de fichiers, l'un après l'autre (les affectations
+/// sans périmètre — de l'analyse — vont toutes dans le premier lot). Un lot qui n'aboutit pas arrête les
+/// suivants : on ne construit pas sur une base cassée, sauf si l'humain a dit de continuer sans ce poste.
 /// Renvoie les affectations menées (avec leur résultat) et celles jamais démarrées.
 async fn run_batch(sh: &Arc<Shared>, from: usize, phase: Phase, todo: Vec<Assignment>) -> (Vec<(Assignment, SeatOut)>, Vec<Assignment>) {
-    let lots: Vec<Vec<usize>> = match phase {
-        Phase::Conception => vec![(0..todo.len()).collect()],
-        Phase::Realisation => scope::batches(&todo.iter().map(|a| a.scope.clone()).collect::<Vec<_>>()),
-    };
+    let lots = scope::batches(&todo.iter().map(|a| a.scope.clone()).collect::<Vec<_>>());
     let mut outs: Vec<Option<SeatOut>> = (0..todo.len()).map(|_| None).collect();
     let mut started = vec![false; todo.len()];
     for lot in lots {
-        if sh.cancelled() {
+        if sh.stopped() {
             break;
         }
         let mut set: JoinSet<(usize, SeatOut)> = JoinSet::new();
@@ -42,7 +42,7 @@ async fn run_batch(sh: &Arc<Shared>, from: usize, phase: Phase, todo: Vec<Assign
                 outs[n] = Some(out);
             }
         }
-        if lot.iter().any(|&n| outs[n].as_ref().is_none_or(|o| !o.ok())) {
+        if lot.iter().any(|&n| outs[n].as_ref().is_none_or(|o| !o.ok() && !o.waived)) {
             break;
         }
     }
@@ -66,27 +66,27 @@ fn result_row(sh: &Shared, a: &Assignment, out: &SeatOut) -> (String, String, St
 /// `steps` : les étapes confiées au poste, dans l'ordre (au moins une).
 pub(super) fn run_seat(sh: Arc<Shared>, i: usize, phase: Phase, steps: Vec<String>, sc: Vec<String>, sections: Vec<Section>) -> Pin<Box<dyn Future<Output = SeatOut> + Send>> {
     Box::pin(async move {
-        let kids = sh.kids(i, phase);
+        let kids = sh.kids(i);
         // Un poste interne raisonne sur l'ensemble de ce qu'on lui confie : il le redécoupe lui-même.
         let task = steps.join("\n\n");
 
         // Feuille : travail direct, une étape après l'autre. Chaque étape est un appel `claude` neuf,
         // donc un contexte qui ne porte que cette étape — c'est tout l'intérêt du découpage. Une étape
-        // qui n'aboutit pas arrête les suivantes : on ne construit pas sur une base cassée.
+        // qui n'aboutit pas arrête les suivantes, sauf si l'humain a dit de continuer.
         if kids.is_empty() {
+            let builds = sh.company.seats[i].builds || sh.company.seats.len() == 1;
             let mut done: Vec<(usize, SeatOut)> = vec![];
             for (n, step) in steps.iter().enumerate() {
-                if sh.cancelled() {
+                if sh.stopped() {
                     break;
                 }
                 let only = steps.len() == 1;
-                let out: SeatOut = sh
-                    .act(i, phase, Kind::Work, work_prompt(step, phase, &sections, (!only).then_some((n + 1, steps.len())), sh.company.allows_git(i)), &kids, &sc, &sections, (!only).then_some(n as u32))
-                    .await
-                    .into();
-                let ok = out.ok();
+                let prompt = work_prompt(step, &sections, (!only).then_some((n + 1, steps.len())), builds, sh.company.commit_steps);
+                let (o, waived) = sh.work(i, phase, prompt, &kids, &sc, &sections, (!only).then_some(n as u32)).await;
+                let out = SeatOut { waived, ..o.into() };
+                let go_on = out.ok() || out.waived;
                 done.push((n + 1, out));
-                if !ok {
+                if !go_on {
                     break;
                 }
             }
@@ -96,110 +96,98 @@ pub(super) fn run_seat(sh: Arc<Shared>, i: usize, phase: Phase, steps: Vec<Strin
             return join_steps(done);
         }
 
-        // Poste interne : délégation → travail des subordonnés → (correction des échecs) → rapport de synthèse.
-        let assignments = match sh.delegate(i, phase, &task, &kids, &sc).await {
-            Ok(a) => a,
-            Err(e) => return SeatOut::failed(format!("delegation impossible: {e}")),
-        };
+        // Poste interne : délégation → travail des subordonnés → rapport de synthèse.
+        // Le boss ajoute une revue du résultat ; un écart va à l'humain, qui peut demander une descente corrective.
         let is_root = sh.company.root() == Some(i);
+        let mut to_split = task.clone();
         let mut history: Vec<(String, String, String, bool, String)> = vec![];
-        let mut todo = assignments;
-        let mut rounds_left = sh.company.max_fix_rounds;
-        // Seul le CEO relit le résultat contre l'objectif et peut relancer une redescente.
-        let mut reviews_left = if is_root { sh.company.max_review_rounds } else { 0 };
-        let mut decision: Option<String> = None;
-        let mut reason: Option<String> = None;
         // Problèmes non résolus à la fin : (titre, texte avec blocages, blocages).
         let mut unresolved: Vec<(String, String, Vec<Blocker>)> = vec![];
-        // Rangées de `history` déjà réduites (tours précédents) : une seule réduction, jamais deux.
+        // Rangées de `history` déjà réduites (descentes précédentes) : une seule réduction, jamais deux.
         let mut compacted = 0;
+        // L'humain a dit de continuer malgré tout ce qui reste non résolu.
+        let mut waived;
         loop {
+            // Une délégation qui échoue (sortie illisible deux fois, appel en erreur) : l'humain décide.
+            let todo = loop {
+                match sh.delegate(i, phase, &to_split, &kids, &sc).await {
+                    Ok(a) => break Some(a),
+                    Err(_) if sh.stopped() => break None,
+                    Err(e) => {
+                        let b = vec![Blocker { kind: "other".into(), detail: format!("delegation impossible: {e}"), needs: String::new() }];
+                        match sh.ask_blocked(i, "", &b).await {
+                            Verdict::Retry(note) if !note.trim().is_empty() => to_split = format!("{to_split}\n\nInstruction from the human:\n{}", note.trim()),
+                            Verdict::Retry(_) => {}
+                            Verdict::Stop => {
+                                sh.halted.store(true, std::sync::atomic::Ordering::SeqCst);
+                                return SeatOut::failed(format!("delegation impossible: {e}"));
+                            }
+                            v => return SeatOut { waived: v == Verdict::Waive, ..SeatOut::failed(format!("delegation impossible: {e}")) },
+                        }
+                    }
+                }
+            };
+            let Some(todo) = todo else { return SeatOut::failed("cancelled") };
             let (ran, pending) = run_batch(&sh, i, phase, todo).await;
-            // Les résultats des tours précédents ne servent plus qu'en rappel : début+fin, le tour courant reste entier.
+            // Les résultats des descentes précédentes ne servent plus qu'en rappel : début+fin, la descente courante reste entière.
             for row in &mut history[compacted..] {
                 row.4 = truncate_middle(&row.4, OLD_ROUND_CHARS);
             }
             compacted = history.len();
-            let mut failed_rows = vec![];
             unresolved.clear();
+            waived = true;
             for (a, out) in &ran {
                 let row = result_row(&sh, a, out);
                 if !out.ok() {
                     let title = row.0.clone();
                     unresolved.push((title.clone(), row.4.clone(), out.blockers.iter().map(|b| Blocker { detail: format!("{title}: {}", b.detail), ..b.clone() }).collect()));
-                    failed_rows.push(row.clone());
+                    waived &= out.waived;
                 }
                 history.push(row);
             }
             for a in &pending {
                 let title = sh.company.seats[a.to].title.clone();
-                let msg = "not started: a previous batch is blocked".to_string();
+                let msg = "not started: a previous batch did not complete".to_string();
                 unresolved.push((title.clone(), msg.clone(), vec![Blocker { kind: "prerequisite".into(), detail: format!("{title}: {msg}"), needs: String::new() }]));
+                waived = false;
             }
-            // Résolution : correctifs dans la branche, puis remontée ; le CEO en dernier recours s'adresse à l'utilisateur.
-            let next = loop {
-                if sh.cancelled() {
-                    break None;
-                }
-                if unresolved.is_empty() {
-                    if reviews_left == 0 {
-                        break None;
-                    }
-                    reviews_left -= 1;
-                    match sh.review(i, phase, &task, &history, &kids, &sc, reviews_left + 1).await {
-                        ReviewPlan::Accepted => break None,
-                        ReviewPlan::Redo { assignments, .. } => break Some(assignments),
-                        ReviewPlan::Unmet(findings) => {
-                            let title = sh.company.seats[i].title.clone();
-                            let msg = format!("review: goal not reached: {findings}");
-                            unresolved.push((title.clone(), msg.clone(), vec![Blocker { kind: "other".into(), detail: format!("{title}: {msg}"), needs: String::new() }]));
-                            failed_rows.push((title, sh.company.seats[i].id.clone(), task.clone(), false, msg));
-                            reason = Some(findings);
-                            rounds_left = 0;
-                            continue;
+            // La revue ne porte que sur un résultat que la branche tient pour complet : sinon ce qui manque est déjà connu.
+            if !is_root || !sh.company.reviews() || !unresolved.is_empty() || sh.stopped() {
+                break;
+            }
+            match sh.review(i, phase, &task, &history, &kids, &sc).await {
+                Review::Accepted => break,
+                Review::Unmet(findings) => {
+                    let title = sh.company.seats[i].title.clone();
+                    let gap = (title.clone(), format!("review: goal not reached: {findings}"), vec![Blocker { kind: "other".into(), detail: format!("{title}: review: goal not reached: {findings}"), needs: String::new() }]);
+                    match sh.ask_review(i, &findings).await {
+                        // Descente corrective demandée par l'humain : une nouvelle délégation, limitée aux écarts.
+                        Verdict::Retry(note) => to_split = corrective_task(&task, &findings, &note),
+                        Verdict::Waive => break,
+                        Verdict::Stop => {
+                            sh.halted.store(true, std::sync::atomic::Ordering::SeqCst);
+                            unresolved.push(gap);
+                            waived = false;
+                            break;
+                        }
+                        Verdict::Nobody => {
+                            unresolved.push(gap);
+                            waived = false;
+                            break;
                         }
                     }
                 }
-                if rounds_left > 0 {
-                    rounds_left -= 1;
-                    match sh.fix(i, phase, &task, &failed_rows, &kids, &sc, decision.as_deref()).await {
-                        FixPlan::Assign { assignments, .. } => {
-                            let mut next = assignments;
-                            next.extend(pending.iter().cloned());
-                            break Some(next);
-                        }
-                        FixPlan::Escalate(r) => {
-                            reason = Some(r);
-                            rounds_left = 0;
-                        }
-                    }
-                } else if is_root {
-                    let shown: Vec<(String, String)> = unresolved.iter().map(|(t, x, _)| (t.clone(), x.clone())).collect();
-                    match sh.ask_user(escalation_summary(&shown, reason.as_deref())).await {
-                        EscalationReply::Retry => {
-                            rounds_left = sh.company.max_fix_rounds.max(1);
-                            reviews_left = reviews_left.max(1);
-                            decision = sh.resolution();
-                        }
-                        EscalationReply::Stop => break None,
-                    }
-                } else {
-                    break None;
-                }
-            };
-            match next {
-                Some(n) => todo = n,
-                None => break,
             }
         }
 
-        let rep = sh.act(i, phase, Kind::Report, report_prompt(&task, &history, &sections), &kids, &sc, &sections, None).await;
+        let rep = sh.act(i, phase, Kind::Report, report_prompt(&task, &history, &sections), &kids, &sc, &sections, None, None).await;
         let mut blockers: Vec<Blocker> = unresolved.iter().flat_map(|(_, _, b)| b.clone()).collect();
         if unresolved.is_empty() && rep.status == Status::Done {
-            return SeatOut { status: Status::Done, text: rep.report, blockers: vec![] };
+            return SeatOut { status: Status::Done, text: rep.report, blockers: vec![], waived: false };
         }
         blockers.extend(rep.blockers);
         let status = if unresolved.is_empty() && rep.status == Status::Failed { Status::Failed } else { Status::Blocked };
-        SeatOut { status, text: rep.report, blockers }
+        // Tout ce qui reste non résolu a été écarté par l'humain : la branche n'arrête pas ses voisines.
+        SeatOut { status, text: rep.report, blockers, waived: waived && !unresolved.is_empty() }
     })
 }

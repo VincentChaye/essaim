@@ -31,10 +31,32 @@ curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/VincentC
 ```
 
 Depuis un clone du dépôt, `./install.sh` compile avec cargo à la place. Options : `--prefix /usr/local` (sudo si
-besoin), `--version vX.Y.Z`, `--from-source`, `--no-modify-path`, `--uninstall`.
+besoin), `--version vX.Y.Z`, `--from-source`, `--no-modify-path`, `--profile dedicated|protected`, `--uninstall`.
 
 Ensuite `essaim` se lance depuis n'importe quel dossier (c'est la racine du projet) et `man essaim` ouvre le manuel.
 Sous Windows : utilisez WSL.
+
+### Profil de sécurité (question posée à l'installation)
+
+Une fois le binaire en place, l'installeur demande sur quelle machine essaim tourne. La réponse fixe les droits de
+**tous** les agents de **toutes** les entreprises :
+
+| Profil | Pour quelle machine | Droits des agents | Demandes à l'humain |
+|---|---|---|---|
+| `dedicated` (appareil dédié) | sans données personnelles : machine virtuelle, poste réservé aux agents | tous : toute commande, tout fichier, le réseau, sans jamais demander (`--permission-mode bypassPermissions`). Rien n'empêche matériellement un agent d'agir hors du dossier du projet. | questions et actions seulement |
+| `protected` (protégé) | votre machine personnelle | les commandes tournent dans le **bac à sable de Claude Code**, tenu par le système (Seatbelt sous macOS, bubblewrap sous Linux) : écriture limitée au dossier du projet, pas de lecture de votre dossier personnel, réseau limité aux registres de paquets | en plus : tout ce qui sort du cadre (commande hors bac à sable, autre site web, fichier hors du projet) |
+
+- `./install.sh --profile dedicated` (ou `protected`) répond d'avance. Sans terminal (installation automatisée), la
+  question est posée au premier lancement de la TUI.
+- Le choix se change à tout moment : `essaim profile` (explication et question), `essaim profile dedicated`, ou `F10`
+  dans la TUI. Il est écrit dans `settings.toml` (voir [Formats](#formats)).
+- Tant qu'aucun profil n'est choisi, c'est `protected` qui s'applique.
+- Profil protégé sous Linux : `bubblewrap` et `socat` doivent être installés (l'installeur le vérifie). Si le bac à
+  sable ne peut pas démarrer, l'agent ne lance aucune commande : il n'y a jamais de repli silencieux hors bac à sable.
+- Limite du profil protégé : le bac à sable couvre les commandes shell et leurs processus enfants. Les outils de
+  fichier et le web passent par les permissions de Claude Code, donc par vos réponses.
+- Coût du profil protégé : Claude Code décrit le bac à sable dans le prompt système de chaque appel, soit environ
+  2 000 jetons de plus par appel.
 
 ### Publier une release (mainteneur)
 
@@ -48,15 +70,16 @@ git tag v0.1.0 && git push origin v0.1.0
 
 ## Reprendre une mission interrompue
 
-Quand la conception d'une mission est menée à terme (sans échec ni annulation), son plan est marqué validé
+Quand le boss a fini d'écrire le plan d'une mission (sans échec ni annulation), ce plan est marqué validé
 (`.essaim/missions/<id>/conception.ok`, avec un `conception.md` non vide). Si le run est ensuite annulé ou la réalisation refusée, la reprise repart de ce
-plan : la conception n'est pas rejouée (aucun appel reconsommé), le point de contrôle puis la réalisation se relancent.
+plan : il n'est pas réécrit (aucun appel reconsommé), le point de contrôle puis la réalisation se relancent.
 
 - TUI, onglet Entreprise : `r` reprend automatiquement une mission « plan validé · reprenable » ; `R` recommence à zéro.
 - CLI : `essaim company run <e.toml> --mission <id> --resume` (erreur claire si rien n'est reprenable).
 
-Limite : la reprise a lieu au niveau des phases. Une conception annulée en cours est rejouée en entier, et une
+Limite : la reprise a lieu au niveau des phases. Un plan annulé en cours d'écriture est réécrit en entier, et une
 réalisation annulée repart du début du plan (les fichiers déjà modifiés restent en place : relisez-les).
+Quitter essaim alors qu'un agent attend votre réponse annule le run de la même façon.
 
 ## Mettre un run en pause (et la limite d'abonnement)
 
@@ -89,7 +112,7 @@ rejoue la phase en cours (voir la limite ci-dessus).
 ## Modifier le plan avant la réalisation
 
 Au point de contrôle (onglet Run), `e` ouvre une conversation avec le boss de l'entreprise (session Claude Code en mode
-plan, dans l'onglet 5). Il lit le brief et le plan consolidé, discute des changements avec vous, puis réécrit
+plan, dans l'onglet 5). Il lit le brief et le plan, discute des changements avec vous, puis réécrit
 `.essaim/missions/<id>/conception.md`. En quittant (`/exit`), le plan relu s'affiche : `Entrée` lance la réalisation avec
 la version révisée, `Échap` arrête, `e` rouvre la conversation. Le run reste en attente pendant la conversation.
 La réalisation lit toujours `conception.md` au moment de la validation : une retouche manuelle du fichier est donc
@@ -135,7 +158,8 @@ Dans la TUI : `2` (Entreprise) → `m` pour cadrer une mission avec le boss → 
 | `essaim agents` | liste les agents (`~` = agent personnel, disponible partout) |
 | `essaim company show <entreprise>` | affiche l'organigramme (niveaux N, N-1…) et l'estimation d'appels |
 | `essaim company check <entreprise>` | valide l'organigramme |
-| `essaim company run <entreprise> (--brief "…" \| --brief @fichier \| --mission <id> [--resume]) [--yes]` | exécute une mission (conception → plan → réalisation) ; `--resume` reprend une mission interrompue |
+| `essaim company run <entreprise> (--brief "…" \| --brief @fichier \| --mission <id> [--resume]) [--yes]` | exécute une mission (plan du boss → validation → réalisation) ; `--resume` reprend une mission interrompue |
+| `essaim profile [dedicated\|protected]` | affiche ou change le [profil de sécurité](#profil-de-sécurité-question-posée-à-linstallation) ; sans argument, explique les deux profils et pose la question |
 | `essaim conso` (alias `essaim usage`) | ouvre le [tableau de bord de consommation](#tableau-de-bord-de-consommation) dans le navigateur |
 
 - `<entreprise>` est un **nom** (`acme-studio`, avec ou sans `.toml`) cherché dans le projet puis dans
@@ -146,8 +170,11 @@ Dans la TUI : `2` (Entreprise) → `m` pour cadrer une mission avec le boss → 
 - `--brief @fichier` lit le brief dans un fichier. `--brief "…"` crée un nouveau dossier
   `.essaim/missions/<id>/` ; `--mission <id>` reprend un brief existant (`brief.md`). `--brief` et `--mission` ne se combinent pas ; `--resume` exige `--mission`.
 - `--yes` est requis si l'estimation dépasse **30 appels** (seuil fixe). Il valide aussi le point de contrôle :
-  la réalisation démarre sans invite. Sans `--yes`, essaim demande « Lancer la réalisation (les postes ⚒ vont modifier le projet) ? [o/N/e = modifier le plan avec le boss] » sur stdin.
-- Codes de sortie : `0` = succès ; `1` = erreur (lecture, validation, `--yes` manquant) ou nœud/poste en échec.
+  la réalisation démarre sans invite. Sans `--yes`, essaim demande « Lancer la réalisation (les postes vont modifier le projet) ? [o/N/e = modifier le plan avec le boss] » sur stdin.
+- Pendant le run, les **demandes des agents** (question, action, autorisation, poste bloqué, revue) s'affichent sur la
+  sortie d'erreur et la réponse se lit sur stdin : un numéro d'option ou un texte libre. Avec `--yes`, personne ne
+  répond : voir [Sans humain](#sans-humain---yes).
+- Codes de sortie : `0` = succès ; `1` = erreur (lecture, validation, `--yes` manquant) ou poste en échec ou bloqué.
   Une réalisation refusée sort aussi en `0` (voir [Limites connues](#limites-connues)).
 
 Exemples qui ne lancent pas `claude` (copiables tels quels, à la racine d'un projet) :
@@ -183,7 +210,7 @@ essaim company run acme-studio --mission <id> --resume
 - `Ctrl+PgUp` / `Ctrl+PgDn` : onglet précédent / suivant.
 - `Ctrl+K` : ouvre ou ferme l'aide de l'onglet courant. Dans l'aide, `m` bascule vers le manuel complet au format `man` (navigation façon `less` : `↑` `↓` ou `j` `k`, `Espace` / `b`, `g` / `G`).
 - `F9` : ouvre le [tableau de bord de consommation](#tableau-de-bord-de-consommation) dans le navigateur (page locale). Le serveur démarre au premier appui et vit jusqu'à la fermeture d'essaim ; les appuis suivants rouvrent l'onglet.
-- `F10` : réglages. Langue français/English, choisie au premier lancement ; l'interface suit ce choix. Les consignes envoyées aux modèles sont en anglais (moins de tokens), avec la langue choisie en rappel. Le choix est mémorisé dans `settings.toml` (voir [Formats](#formats)).
+- `F10` : réglages, en deux pages : la langue (français/English) puis le profil de sécurité, avec son explication. Les deux sont demandés au premier lancement s'ils n'ont jamais été choisis ; l'interface suit la langue choisie. Les consignes envoyées aux modèles sont en anglais (moins de tokens), avec la langue choisie en rappel. Le choix est mémorisé dans `settings.toml` (voir [Formats](#formats)).
 - `q` ou `Ctrl+C` : quitte. Si un run est en cours, essaim demande confirmation (`o` ou `y`) ; le run est alors annulé. Si le run est en pause, rien n'est perdu : la mission reste en pause et se reprend plus tard.
 
 ### 1 · Agents
@@ -205,14 +232,15 @@ L'onglet a trois zones : **Entreprises**, **Missions** et **organigramme**.
 - `e` dans une zone entrée : édite le poste, l'entreprise ou le brief selon la zone. Une fenêtre propose l'édition simple (formulaire de poste, ou `$EDITOR` pour un fichier) ou l'édition avec le modèle. Les formulaires de poste réécrivent le TOML, qui perd alors ses commentaires.
 - Dans la liste, une entreprise suivie de `~` est la vôtre (`~/.claude/companies/`), donc disponible depuis tous vos dossiers ; sans `~`, elle est propre au projet. Le titre de l'organigramme le rappelle.
 - Hors zone : `n` créer une entreprise **avec l'assistant** · `m` cadrer une mission avec le boss · `c` / `C` entreprise suivante / précédente · `t` / `T` mission suivante / précédente.
-- `r` lance la mission choisie. Si sa conception est menée à terme, elle reprend à la réalisation sans rejouer la conception. Une mission « ⏸ en pause » se reprend sans confirmation. Sinon, ou si un plan ou un rapport existe déjà, une confirmation est demandée. `R` relance depuis le début, après confirmation si un plan ou un rapport existe.
+- `r` lance la mission choisie. Si son plan est déjà écrit, elle reprend à la réalisation sans le réécrire. Une mission « ⏸ en pause » se reprend sans confirmation. Sinon, ou si un plan ou un rapport existe déjà, une confirmation est demandée. `R` relance depuis le début, après confirmation si un plan ou un rapport existe.
 
 ### 3 · Run
 
 - `↑` `↓` choisissent un nœud (son journal s'affiche) · `p` met en pause ou reprend · `s` annule le run en cours (confirmation, si le run n'est pas terminé).
 - Pause (voulue ou due à la limite d'abonnement) : l'en-tête affiche `⏸` et l'heure de reprise. Voir [Mettre un run en pause](#mettre-un-run-en-pause-et-la-limite-dabonnement).
 - `h` bascule l'historique. Dans l'historique, `↑` `↓` choisissent, `Entrée` rouvre un run, `D` le supprime (confirmation).
-- Point de contrôle (plan consolidé, affiché à la fin de la conception quand `checkpoint = true`) : `Entrée` lance la réalisation · `Échap` arrête la mission sur le plan · `e` ouvre la conversation avec le boss (voir [Modifier le plan](#modifier-le-plan-avant-la-réalisation)) · `↑` `↓` ou `j` `k`, `PgUp` / `PgDn` font défiler le plan.
+- **Demandes des agents** : quand un agent s'adresse à vous, l'onglet s'ouvre sur sa demande et la barre d'onglets affiche `✋` avec le nombre de demandes en attente. `↑` `↓` ou un chiffre choisissent une option, taper du texte écrit une réponse libre, `Entrée` envoie. `Échap` met la demande de côté (l'agent attend, les autres postes continuent) et `d` la rouvre. Le délai `node_timeout_s` ne court pas pendant qu'un agent vous attend.
+- Point de contrôle (plan du boss, affiché avant la réalisation quand `checkpoint = true`) : `Entrée` lance la réalisation · `Échap` arrête la mission sur le plan · `e` ouvre la conversation avec le boss (voir [Modifier le plan](#modifier-le-plan-avant-la-réalisation)) · `↑` `↓` ou `j` `k`, `PgUp` / `PgDn` font défiler le plan.
 
 ### 4 · Sessions
 
@@ -259,21 +287,67 @@ sa validité est indiquée.
 Une **entreprise** (`~/.claude/companies/<nom>.toml`, ou `.claude/companies/` dans le projet) place des agents dans un organigramme libre : chaque
 *poste* a un intitulé réel (CEO, CTO, Engineering Manager, Backend Engineer…), un agent, et un supérieur
 (`reports_to`). Le niveau se déduit de la profondeur : `N` (le boss), `N-1` (VP), `N-2`… Un poste `builds = true`
-(⚒) est une feuille de réalisation : le seul type de poste qui modifie le projet. Il doit être une feuille
-(sans subordonnés) et ne peut pas être le boss.
+(⚒) est une feuille de réalisation : son rôle est de modifier le projet. Il doit être une feuille
+(sans subordonnés) et ne peut pas être le boss. Une feuille sans ⚒ analyse et conseille. Ce partage des rôles tient
+par la fiche de poste de chaque agent, pas par ses droits : tous les postes ont les mêmes outils (voir
+[Droits des agents](#droits-des-agents)).
 
 **Une mission** se déroule en trois temps :
 1. **Brief** (`m`) : tu cadres la mission en conversation avec le boss (mode plan) ; il écrit `brief.md`.
    En ligne de commande, `--brief` tient lieu de ce cadrage.
-2. **Conception** (`r`) : le boss découpe par domaine et délègue à ses subordonnés directs, qui spécialisent et
-   délèguent à leur tour jusqu'aux workers (texte, lecture seule) ; les rapports remontent et sont synthétisés à
-   chaque niveau. Le rapport du boss est le **plan consolidé**.
+2. **Plan** (`r`) : le boss écrit le plan **seul, en un appel**. Il lit le projet, cherche sur le web si besoin et
+   **vous pose ses questions avant de rédiger** (voir [Les agents vous parlent](#les-agents-vous-parlent)). Le plan
+   est enregistré dans `conception.md`.
 3. **Réalisation** : après validation du plan (Entrée / Échap dans la TUI ; invite `[o/N/e]` ou `--yes` en ligne de commande),
-   la branche des postes ⚒ met en place dans le projet. Chaque délégation porte un périmètre de fichiers inclus dans celui
-   du supérieur ; les périmètres qui se chevauchent sont exécutés l'un après l'autre. Un poste ⚒ peut lire
-   (`Read`, `Grep`, `Glob`) et écrire (`Edit`, `Write`) uniquement dans son périmètre, et lancer `Bash` seulement
-   pour les commandes de `allow_bash` (règles `Bash(<commande>:*)`) ; le reste est refusé (`--permission-mode dontAsk`).
-   La portée exacte de ces règles relève de Claude Code et n'est pas vérifiée ici.
+   **une seule descente** de l'organigramme. Chaque supérieur découpe sa tâche et la délègue à ses subordonnés directs,
+   les feuilles travaillent, puis chaque supérieur synthétise les résultats de sa branche. Le boss relit le résultat
+   contre l'objectif et rend le rapport (`rapport.md`).
+
+La réalisation a lieu pour toute entreprise, avec ou sans poste ⚒.
+
+### Droits des agents
+
+Tous les postes, pour tous leurs appels, ont les mêmes outils : `Read`, `Grep`, `Glob`, `Edit`, `Write`, `Bash`,
+`WebSearch`, `WebFetch` (plus `Agent` pour un poste qui a des `helpers`). La ligne `tools:` d'un fichier d'agent ne
+restreint rien quand l'agent travaille dans une entreprise. Ce que ces outils peuvent atteindre dépend du
+[profil de sécurité](#profil-de-sécurité-question-posée-à-linstallation) :
+
+- **Appareil dédié** : tout, sans demande.
+- **Protégé** : librement dans le dossier du projet (fichiers et commandes dans le bac à sable). Une commande à
+  relancer hors du bac à sable, un domaine réseau hors de la liste contacté par une commande, une page web à lire
+  (`WebFetch`) ou une écriture hors du projet deviennent une demande d'autorisation : *autoriser une fois*, *autoriser
+  pour la mission* (la même demande d'un autre poste est alors accordée sans vous déranger ; un site accordé l'est pour
+  les commandes comme pour la lecture de pages) ou *refuser*. Une commande qui reste dans le bac à sable n'est jamais
+  soumise, `WebSearch` et `ask_human` non plus. L'outil `Read` refuse les fichiers hors du projet.
+
+Dans les deux profils, la fiche de poste dit à chaque agent de rester dans le dossier du projet.
+
+### Les agents vous parlent
+
+Chaque agent dispose d'un outil `ask_human` (serveur MCP intégré à essaim), utilisable **à tout moment** de son appel :
+pendant le plan, une délégation, le travail, un rapport ou la revue. L'appel bloque jusqu'à votre réponse, puis
+l'agent continue **dans la même session** : aucun appel `claude` supplémentaire. Les autres postes continuent pendant ce temps.
+
+- Une demande est d'une de ces natures : `question` (affiner la tâche), `action` (quelque chose que vous seul pouvez
+  faire : fournir un secret, brancher un appareil, créer un compte) ou `blocked`. Elle porte 1 à 4 questions, chacune
+  avec des options proposées et, si l'agent en a une, l'option qu'il recommande. Vous choisissez une option ou
+  écrivez une réponse libre.
+- La règle donnée à chaque poste : un **fait** (ce que contient le projet, ce que dit une documentation) se cherche
+  soi-même, dans le projet ou sur le web, sans rien demander ; une **intention** (ambiguïté, choix entre plusieurs
+  options valables, priorité, critère de réussite) vous est demandée dès qu'elle apparaît, avant de construire dessus.
+  Un poste ne demande jamais rien à son supérieur en cours de tâche.
+- Chaque question et sa réponse sont ajoutées à `.essaim/missions/<id>/notes/decisions.md`. Les postes lisent ce
+  fichier avant de poser une question, pour ne pas reposer la même.
+
+### Information : des pointeurs, pas des copies
+
+Le supérieur distribue l'information : chaque affectation porte la tâche, un périmètre de fichiers (`scope`) et une
+liste `context` de **pointeurs** (fichiers ou dossiers du projet, notes de la mission, URL) plutôt que des copies. Le
+subordonné lit lui-même ce qu'on lui indique, et va chercher seul ce qui lui manque, dans le projet ou sur le web.
+
+Les livrables longs vont dans le dossier partagé `.essaim/missions/<id>/notes/` (`notes/<poste>.md`) : le poste ne
+remonte qu'un résumé court avec le chemin. Les périmètres ne sont plus des règles de permission : ils servent à
+l'ordonnancement, deux affectations dont les périmètres se chevauchent étant exécutées l'une après l'autre.
 
 ### Missions liées
 
@@ -290,44 +364,48 @@ refusés). Les liens sont stockés dans `.essaim/missions/<id>/after`.
   commande à lancer est affichée.
 - `v` marque ou démarque une mission comme réussie à la main (utile pour une mission terminée avant l'existence des liens).
 
-### Blocages : corriger, remonter, puis décider avec le CEO
+### Blocages : aucune boucle, c'est vous qui décidez
 
 Un poste n'est « fait » que s'il l'affirme **et** que rien ne l'a empêché de finir : chaque appel de travail ou de
 rapport rend un statut structuré (`done` / `blocked` / `failed`) avec ses blocages (`tests`, `permission`,
-`prerequisite`, `bug`, `scope`, `other`) et ce qu'il faudrait pour les lever. Un refus de permission (`Bash(git status)`
-refusé…) est toujours un blocage, même si l'agent se déclare « done ». Un poste bloqué n'est plus ✔ mais ⚠.
+`prerequisite`, `bug`, `scope`, `other`) et ce qu'il faudrait pour les lever. Un poste bloqué n'est plus ✔ mais ⚠.
 
-1. **Correction dans la branche** : le supérieur reçoit l'échec, écrit un plan de correction (cause, étapes) et réassigne
-   des tâches correctives, éventuellement à un autre subordonné (celui qui a l'outil manquant, l'équipe spécialisée).
-   Au plus `max_fix_rounds` tours (défaut 2), toujours bornés par `max_calls`.
-2. **Remontée** : s'il n'a personne de compétent, il remonte le blocage (`blocked`) à son propre supérieur, qui peut
-   rediriger vers une autre équipe de l'entreprise, et ainsi de suite jusqu'au CEO.
-3. **CEO → vous** : si le CEO n'y arrive pas non plus, le run se met en pause (« Mission bloquée ») :
-   `e` ouvre une session avec le CEO (il explique le blocage, propose un plan, peut créer ou ajuster un poste, un agent
-   ou une permission, et écrit votre décision dans `.essaim/missions/<id>/resolution.md`) · `Entrée` relance la correction
-   avec cette décision · `Échap` arrête la mission. En CLI : `[r / e / N]` ; avec `--yes`, la mission s'arrête
-   (jamais de poursuite automatique sur un blocage).
+essaim ne relance **jamais** un poste de lui-même : il n'y a plus de tours de correction ni de remontée d'échelon en
+échelon.
 
-Lots de réalisation : si un lot reste bloqué, les suivants ne démarrent pas. Une conception bloquée ne lance pas la
-réalisation. Le compte rendu affiche « ⚠ bloquée » et la liste des blocages.
+- La consigne d'une feuille : au plus deux tentatives sur la même erreur, puis `ask_human` avec le diagnostic. Jamais
+  de contournement.
+- Un poste dont le travail finit `blocked` ou `failed` (délai dépassé compris), ou dont la délégation échoue, produit une demande
+  « poste bloqué » avec trois réponses : **relancer ce poste** (une réponse libre le relance avec votre texte, dans sa
+  session, contexte conservé), **continuer sans lui**, ou **arrêter la mission**. Chaque nouvel essai est donc une
+  décision de votre part.
+- Lots de réalisation : si un lot n'aboutit pas, les suivants ne démarrent pas, sauf si vous avez répondu de
+  continuer sans le poste en cause. Un plan qui n'aboutit pas ne lance pas la réalisation.
 
-**Outillage selon la taille** : dans une petite entreprise sans équipe spécialisée, les postes ⚒ ont eux-mêmes `git`
-(lecture, `add`, `commit`), `wc`, `grep`, `diff` dans `allow_bash` ; avec une équipe spécialisée (release, ops), seul ce
-poste les a et les managers lui routent le besoin (la fiche de poste indique à chaque manager qui a quels outils).
+Le compte rendu affiche « ⚠ bloquée » et la liste des blocages.
+
+#### Sans humain (`--yes`)
+
+Avec `--yes`, ou quand l'entrée standard est fermée, personne ne répond :
+
+- une `question` reçoit l'option recommandée par l'agent ; l'hypothèse est notée dans `decisions.md` (« no human
+  available ») ;
+- une `action`, un blocage ou une revue non acceptée restent sans réponse : le poste finit `blocked`, la mission sort
+  en `1` avec la liste de ce qui est demandé ;
+- une demande d'autorisation (profil protégé) est refusée, et l'agent en est informé.
 
 
-**Point de contrôle** (`checkpoint`, défaut `true`). Quand il est actif, le plan consolidé est affiché avant toute
+**Point de contrôle** (`checkpoint`, défaut `true`). Quand il est actif, le plan du boss est affiché avant toute
 réalisation et demande validation. En ligne de commande, sans `--yes`, essaim pose la question
-« Lancer la réalisation (les postes ⚒ vont modifier le projet) ? [o/N/e = modifier le plan avec le boss] » ; `o`, `oui`, `y` ou `yes`
+« Lancer la réalisation (les postes vont modifier le projet) ? [o/N/e = modifier le plan avec le boss] » ; `o`, `oui`, `y` ou `yes`
 lance la réalisation, toute autre réponse arrête la mission sur le plan.
-Avec `checkpoint = false`, il n'y a ni plan à valider ni invite : la réalisation démarre dès la fin de la conception.
-Un avertissement d'exécution signalera ce cas : **À CONFIRMER** (texte exact et canal, stderr ou bandeau TUI, à reprendre de la décision CTO ; il n'est pas encore présent dans le code).
+Avec `checkpoint = false`, il n'y a ni plan à valider ni invite : la réalisation démarre dès que le plan est écrit.
 
 ### Modèles et assistants légers
 
 Le modèle d'un poste est celui de son agent, ou son champ `model` s'il est défini. Les postes qui **produisent le travail**
 (feuilles : développeurs, analystes) et ceux qui **arbitrent** (managers, CEO) sont en `sonnet` par défaut (`opus` pour
-l'architecture difficile) : un travail raté coûte plus cher en tours de correction que le surcoût du modèle.
+l'architecture difficile) : un travail raté vous coûte une demande et une relance, plus cher que le surcoût du modèle.
 
 **Le modèle se choisit selon la tâche.** À chaque délégation, le CEO (et chaque manager) peut fixer un `model`
 (`haiku` / `sonnet` / `opus`) pour le poste qu'il mobilise, selon ce que la tâche exige vraiment : `haiku` pour le
@@ -338,26 +416,31 @@ niveaux inférieurs peuvent affiner. Le choix s'affiche dans le journal (`Backen
 
 Pour économiser tokens et temps, un poste peut déclarer `helpers = "haiku"` : il dispose alors d'un sous-agent
 (`essaim-assistant`) au modèle moindre, pour les tâches **mécaniques et entièrement spécifiées** (lister ou compter des
-fichiers, lancer une commande et rendre sa sortie brute, extraire des lignes). L'assistant ne décide rien et n'écrit
-jamais (`Read`, `Grep`, `Glob`, et `Bash` seulement si le poste l'a) ; le poste reste responsable et vérifie ce qu'il reçoit.
+fichiers, lancer une commande et rendre sa sortie brute, extraire des lignes). L'assistant ne décide rien et n'a pas
+les outils d'écriture de fichiers (`Read`, `Grep`, `Glob`, `Bash`) ; le poste reste responsable et vérifie ce qu'il reçoit.
 Ses tokens comptent dans le coût, mais pas dans `max_calls`.
 
-### Un CEO qui coordonne, vérifie et relance
+### Un boss qui coordonne et vérifie, sans relancer de lui-même
 
-Les supérieurs (CEO, managers) ne codent jamais : ils n'ont ni `Edit` ni `Write`. En revanche, ils **lisent le projet et
-vérifient** avec des commandes de contrôle : lecture seule (`git status/diff/log/show`, `wc`, `grep`, `diff`, `ls`) plus
-les tests / compilations déjà permis à leurs subordonnés (`cargo test`, `cargo clippy`…, jamais `git add/commit`).
+Les supérieurs (boss, managers) coordonnent : leur fiche de poste leur dit de découper, déléguer et synthétiser, et de
+laisser la réalisation aux feuilles. Ils ont les mêmes outils que les autres et s'en servent pour **lire le projet et
+vérifier** (lancer les tests, relire un diff) plutôt que de croire les rapports.
 
-Après les rapports, le CEO fait une **revue** : le résultat atteint-il l'objectif et les critères du brief ? Il le
-vérifie lui-même plutôt que de croire les rapports. Sinon il lance une **redescente** : des tâches complémentaires ou
-correctives (même non prévues au départ) vers les subordonnés compétents, puis un nouveau rapport. Si personne ne peut
-combler l'écart, c'est une remontée à l'utilisateur (voir ci-dessus). `max_review_rounds` (défaut 1, `0` = pas de revue)
-borne les redescentes ; la revue coûte un appel par phase, déjà comptés dans l'estimation.
+Après les rapports de sa branche, le boss fait une **revue** : le résultat atteint-il l'objectif et les critères du
+brief ? La revue **constate** (`accepted`, ou la liste des écarts) et ne relance rien. Si elle n'est pas acceptée, les
+écarts vous sont présentés avec trois réponses : **relancer une descente corrective** limitée à ces écarts (votre texte
+libre s'y ajoute comme consigne), **accepter le résultat tel quel**, ou **arrêter**. La revue coûte un appel, déjà
+compté dans l'estimation ; `review = false` dans le TOML la supprime (`max_review_rounds = 0`, l'ancien champ, vaut
+la même chose).
 
-Livrables : `.essaim/missions/<id>/{brief,conception,rapport}.md`. `rapport.md` n'existe que si la réalisation
-a été lancée et s'est terminée. Garde-fous dans le TOML : `max_calls` (plafond d'appels `claude` par mission,
-partagé entre les phases, défaut 40), `max_parallel` (défaut 2), `checkpoint` (défaut `true`), `max_fix_rounds` (défaut 2), `max_review_rounds` (défaut 1). L'estimation
-d'appels est affichée avant le lancement.
+Livrables : `.essaim/missions/<id>/{brief,conception,rapport}.md` et le dossier `notes/`. `rapport.md` n'existe que si
+la réalisation a été lancée et s'est terminée. Garde-fous dans le TOML : `max_calls` (plafond d'appels `claude` par
+mission, défaut 40), `max_parallel` (défaut 2), `checkpoint` (défaut `true`), `review` (défaut `true`),
+`commit_steps` (défaut `false` : `true` demande aux feuilles de clore chaque étape par un commit). L'estimation
+d'appels est affichée avant le lancement : 1 pour le plan, 2 par poste interne, 1 par feuille, 1 pour la revue.
+
+Les anciens champs `allow_bash` (poste) et `max_fix_rounds` (entreprise) sont encore lus, pour ne pas casser vos
+fichiers, et ignorés.
 
 ```toml
 name = "acme-studio"
@@ -375,7 +458,6 @@ title = "Backend Engineer"
 agent = "developer"
 reports_to = "ceo"
 builds = true
-allow_bash = ["cargo test"]   # règles Bash(cargo test:*) pour ce poste
 helpers = "haiku"             # assistants légers (modèle moindre) pour les tâches mécaniques de ce poste
 ```
 
@@ -434,7 +516,8 @@ Son contexte ne porte donc que l'étape en cours, au lieu d'accumuler tout le tr
 - Chaque étape sait où elle en est (« Step 2 of 3 ») et reçoit la consigne de **ne pas refaire ni auditer** les
   précédentes, ni commencer les suivantes — sans quoi une session neuve relit le projet pour « vérifier ».
 - Une étape qui n'aboutit pas **arrête les suivantes** : on ne construit pas sur une base cassée.
-- En réalisation, un poste qui a `git` dans ses commandes autorisées doit **clore chaque étape par un commit** qui
+- Une étape qui n'aboutit pas vous est soumise (relancer, continuer sans elle, arrêter).
+- Avec `commit_steps = true` dans le TOML de l'entreprise, un poste ⚒ doit **clore chaque étape par un commit** qui
   ne couvre qu'elle.
 
 Le prompt de délégation le dit au supérieur : « one assignment = ONE step, small enough to end in a single coherent
@@ -458,16 +541,19 @@ subordonné aura, et qu'une tâche courte et complète est ce qui garde le trava
 Deux effets : le contexte d'un poste reste petit (le brief était relu à **chaque tour d'outil**, pas une seule
 fois), et un poste ne peut plus élargir son périmètre en s'autorisant lui-même au nom de l'objectif général.
 
-Mesure sur le harnais de coût (jetons d'entrée composés par essaim, appels inchangés) :
+Mesure de la refonte « plan du boss, puis une seule descente » sur le harnais de coût (`tests/mesure/`, faux `claude`,
+jetons d'entrée composés par essaim ; `avant.json` → `apres.json`) :
 
-| mission | avant | après | |
+| mission | appels avant → après | jetons d'entrée avant → après | |
 |---|---|---|---|
-| M1 — 3 postes, brief de 167 o | 5 540 | 5 522 | −0,3 % |
-| M2 — 7 postes, brief de 829 o | 13 277 | 11 718 | **−11,7 %** |
-| M3 — 7 postes, + réalisation | 23 329 | 20 729 | **−11,1 %** |
-| M4 — 7 postes, revue rejetée | 43 617 | 38 425 | **−11,9 %** |
+| M3 — 7 postes, plan + réalisation | 21 → **13** | 23 329 → **16 570** | même travail, −38 % d'appels |
+| M1 — 3 postes | 6 → 7 | 5 540 → 8 259 | avant : conception seule ; après : plan **et** réalisation |
+| M2 — 7 postes | 12 → 13 | 13 277 → 16 499 | idem |
+| M4 — 7 postes, revue rejetée | 21 → 24 | 43 617 → 53 249 | la relance demandée par l'humain refait une descente complète |
 
-Le gain suit la taille du brief et le nombre de postes : avec un brief minuscule (M1) il n'y a rien à économiser.
+Seule M3 compare le même travail des deux côtés. M1 et M2 n'avaient pas de poste ⚒ : l'ancien moteur s'arrêtait au
+plan, le nouveau fait aussi la réalisation. Le prix à payer est une fiche de poste plus longue (règles de demande à
+l'humain, notes partagées) : 150 à 250 jetons d'entrée de plus par appel sur ce harnais.
 
 ### Garde-fous contre un poste qui s'emballe
 
@@ -478,7 +564,7 @@ chaque lecture de fichier. Trois garde-fous :
 - **`max_budget_usd`** (entreprise, surchargeable par poste ; absent par défaut) : plafond de dépense estimée par
   appel. La dépense des assistants légers y compte. C'est une estimation côté client : laissez de la marge.
 - **Environnement isolé** : chaque appel part avec `--strict-mcp-config` et `--setting-sources project,local`, donc
-  sans serveur MCP ni réglages utilisateur. Sans cela, chaque poste héritait des plugins, skills et du `model` de la
+  sans réglages utilisateur et avec un seul serveur MCP, celui d'essaim (`ask_human`, et `permission` en profil protégé). Sans cela, chaque poste héritait des plugins, skills et du `model` de la
   machine — prompt système mesuré à 9,3 k là où essaim n'en produit que ~1,5 k, **relu à chaque tour**. Vos agents
   ne sont pas concernés : essaim lit lui-même leurs `.md` et les injecte par `--agents`.
 
@@ -539,12 +625,26 @@ pas est ignoré en silence par `agents` et `company run` ; la TUI le signale apr
 
 **Entreprise** : `<nom>.toml`, dans `~/.claude/companies/` ou `<projet>/.claude/companies/` (mêmes règles). Champs du poste : `id` (lettres, chiffres, `-`, `_`), `title`,
 `agent` (obligatoires), `reports_to` (absent = le boss, un seul par entreprise), `expertise` (facultatif : domaine
-présenté au supérieur pour déléguer ; absent, seul l'intitulé est présenté), `builds`, `allow_bash`.
+présenté au supérieur pour déléguer ; absent, seul l'intitulé est présenté), `builds`, `model`, `helpers`, `max_budget_usd`.
 
 Les runs lancés depuis la TUI sont enregistrés dans `.essaim/runs/<id>/run.json` (ajoutez `.essaim/` à `.gitignore`).
 
-**Réglages** : `settings.toml` (langue) est stocké dans le dossier de configuration de la plateforme (par exemple `~/.config/essaim/` sous Linux).
+**Réglages** : `settings.toml` est stocké dans le dossier de configuration de la plateforme (par exemple `~/.config/essaim/` sous Linux).
 La variable `ESSAIM_CONFIG_DIR` remplace ce dossier.
+
+```toml
+lang = "fr"
+profile = "protected"            # ou "dedicated"
+# Profil protégé seulement ; absents = les listes par défaut ci-dessous.
+sandbox_read = ["~/.cargo", "~/.rustup"]          # dossiers hors projet lisibles par les commandes
+sandbox_write = ["~/.cargo/registry"]             # dossiers hors projet inscriptibles
+sandbox_domains = ["crates.io", "*.crates.io"]    # domaines joignables sans demande
+```
+
+Listes par défaut du profil protégé : lecture de `~/.cargo`, `~/.rustup`, `~/.nvm`, `~/.npm`, `~/.volta`, `~/.bun`,
+`~/.deno`, `~/.pyenv`, `~/.local/bin`, `~/.local/share/uv`, `~/go` (sans eux, `cargo`, `node` ou `python` installés
+dans le dossier personnel ne démarrent pas) ; écriture dans `~/.cargo/registry`, `~/.cargo/git`, `~/.npm/_cacache` ;
+domaines `crates.io`, `*.crates.io`, `registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org`.
 
 ## Limites connues
 
@@ -554,7 +654,8 @@ La variable `ESSAIM_CONFIG_DIR` remplace ce dossier.
   réponse autre que `o`/`oui`/`y`/`yes`, ou stdin fermé sans `--yes`) sort donc en `0`.
 - **Pas de `--version`** : la structure `Cli` (module `main`) ne déclare pas de `version`.
 - **Pas de version minimale de `claude`** : aucune vérification de version. Les options utilisées
-  (`--bg`, `--agents`, `--json-schema`, `--permission-mode`, `agents --json --all`) doivent exister dans votre version.
+  (`--bg`, `--agents`, `--json-schema`, `--permission-mode`, `--mcp-config`, `--permission-prompt-tool`, `--settings`,
+  `agents --json --all`) doivent exister dans votre version. Le comportement décrit ici a été mesuré sur `claude` 2.1.322.
 - **Unix uniquement** : `kill` est lancé par son nom (fonction `spawn_with`, module `runtime::claude_proc`), le terminal intégré utilise
   un pseudo-terminal (`portable-pty`, module `tui::term`), et le code ne contient aucune branche Windows.
 - **Vérification d'authentification** : une seule vérification réelle, sur le flux `-p` (fonction `spawn_with`,
@@ -569,7 +670,10 @@ La variable `ESSAIM_CONFIG_DIR` remplace ce dossier.
   `claude` (fonction `claude_command`, et lancement de la session intégrée dans le module `tui::app`). `VISUAL` ou `EDITOR` désigne l'éditeur, lancé sans shell
   (fonction `open_in_editor`, module `tui`). Essaim ne retire pas les réglages d'API placés dans les fichiers de configuration de
   `claude` : cela n'est pas vérifié ici, et seul le contrôle `apiKeySource` (flux `-p`) le détecterait.
-- **Bash des postes ⚒** : la portée des règles `Bash(<commande>:*)` relève de Claude Code, non vérifiée ici.
+- **Profil appareil dédié** : rien n'empêche matériellement un agent d'agir hors du dossier du projet. essaim ne
+  protège plus lui-même `.claude/` et `.git/hooks` en écriture (les périmètres ne sont plus des règles de permission).
+- **Profil protégé** : l'isolation est celle du bac à sable de Claude Code et ne couvre que les commandes shell.
+- **Demandes en attente** : un poste qui vous attend garde sa place dans `max_parallel`, et quitter essaim annule le run.
 - Les entreprises se modifient dans un éditeur externe (`e` dans une zone entrée, option « simple ») ; l'onglet Entreprise propose aussi un formulaire de poste (`a` / `e` / `x`, dans l'organigramme), qui réécrit le TOML et en supprime donc les commentaires.
-- La délégation dynamique coûte jusqu'à ~2 appels par poste interne et par phase : surveille `max_calls` et ton quota.
+- La délégation coûte 2 appels par poste interne (délégation puis rapport) : surveille `max_calls` et ton quota.
 - Les « coûts » affichés sont notionnels (calculés par `claude`), non facturés avec l'abonnement.

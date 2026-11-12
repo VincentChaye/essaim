@@ -16,7 +16,10 @@ use std::collections::BTreeMap;
 fn executer(s: &Scenario, tag: &str) -> (Mesure, BTreeMap<String, u64>, u64) {
     let b = bac(&format!("mesure-{}-{tag}", s.id.to_lowercase()));
     let ent = ecrire_entreprise(&b, "mesure", &s.entreprise);
-    let l = lancer(&b, &ent, s.brief, s.mode, "dev1");
+    let l = match s.reponses {
+        Some(r) => lancer_dialogue(&b, &ent, s.brief, s.mode, "dev1", r),
+        None => lancer(&b, &ent, s.brief, s.mode, "dev1"),
+    };
     assert!(l.ok(), "{} : code {:?}\n{}", s.id, l.code, l.stderr);
     let ap = appels(&b);
     let mut par_type = BTreeMap::new();

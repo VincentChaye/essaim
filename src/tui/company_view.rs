@@ -177,7 +177,7 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::styled(format!("⚠ {p}"), Style::new().fg(Color::Red)));
     }
     let e = company.estimate_calls();
-    lines.push(kv(tr("Appels (max)", "Calls (max)"), &tf!("conception {} + réalisation {} = {}", "design {} + realisation {} = {}", e.conception, e.realisation, e.total())));
+    lines.push(kv(tr("Appels (max)", "Calls (max)"), &tf!("plan {} + réalisation {} = {}", "plan {} + realisation {} = {}", e.conception, e.realisation, e.total())));
     lines.push(kv(
         tr("Garde-fous", "Safeguards"),
         &tf!("{} appels · {} parallèles · contrôle {}", "{} calls · {} in parallel · checkpoint {}", company.max_calls, company.max_parallel, if company.checkpoint { tr("oui", "yes") } else { tr("non", "no") }),
@@ -226,10 +226,7 @@ fn seat_lines(company: &Company, i: usize, app: &App) -> Vec<Line<'static>> {
     ));
     let expertise = s.expertise.clone().or_else(|| agent.map(|a| a.description.clone())).unwrap_or_default();
     v.push(kv("Expertise", &expertise));
-    v.push(kv(tr("Réalisation", "Realisation"), if s.builds { tr("⚒ oui — modifie le projet", "⚒ yes — modifies the project") } else { tr("non — texte uniquement", "no — text only") }));
-    if !s.allow_bash.is_empty() {
-        v.push(kv(tr("Commandes", "Commands"), &s.allow_bash.join(", ")));
-    }
+    v.push(kv(tr("Réalisation", "Realisation"), if s.builds { tr("⚒ oui — modifie le projet", "⚒ yes — modifies the project") } else { tr("non — analyse et conseille", "no — analyses and advises") }));
     v
 }
 

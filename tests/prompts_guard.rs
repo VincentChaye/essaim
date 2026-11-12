@@ -30,7 +30,7 @@ fn contient(a: &Appel, mot: &str) -> bool {
 #[test]
 fn le_corpus_a_la_forme_attendue() {
     let c = corpus();
-    assert_eq!(c.len(), 21);
+    assert_eq!(c.len(), 13, "le plan du boss, puis une seule descente");
     assert!(c.iter().all(|a| !a.sys.is_empty() && !a.prompt.is_empty()));
 }
 
@@ -85,10 +85,8 @@ fn le_role_est_present_dans_chaque_appel() {
 #[test]
 fn la_phase_est_dite_dans_chaque_appel() {
     let c = corpus();
-    for a in &c[..12] {
-        assert!(contient(a, "design phase") && contient(a, "nothing"), "appel {} : phase de conception", a.n);
-    }
-    for a in &c[12..] {
+    assert!(contient(&c[0], "plan phase") && contient(&c[0], "nothing is built yet"), "appel 1 : phase de plan");
+    for a in &c[1..] {
         assert!(contient(a, "realisation phase"), "appel {} : phase de réalisation", a.n);
     }
 }
@@ -125,35 +123,57 @@ fn la_consigne_deleguee_arrive_au_poste() {
 }
 
 #[test]
-fn le_perimetre_de_fichiers_est_donne_en_realisation() {
+fn le_perimetre_de_fichiers_est_donne_aux_postes_qui_realisent() {
     let c = corpus();
-    let travaux: Vec<&Appel> = c[12..].iter().filter(|a| a.kind == "work").collect();
+    let travaux: Vec<&Appel> = c.iter().filter(|a| a.kind == "work" && a.prompt.contains("Carry it out in the project")).collect();
     assert_eq!(travaux.len(), 2, "deux postes de réalisation");
     for a in travaux {
         assert!(contient(a, "file scope"), "appel {} : périmètre absent", a.n);
         assert!(a.sys.contains("**"), "appel {} : motif de périmètre absent", a.n);
-        assert!(contient(a, "only") && contient(a, "scope"), "appel {} : limite d'écriture absente", a.n);
+        assert!(contient(a, "only within it"), "appel {} : limite de modification absente", a.n);
     }
-    // Le poste de réalisation avec commande autorisée la voit ; pas le poste sans.
-    let dev1 = c[12..].iter().find(|a| a.kind == "work" && a.sys.contains("\"Backend Engineer\"")).unwrap();
-    assert!(contient(dev1, "cargo test"), "commande autorisée absente");
-    let dev2 = c[12..].iter().find(|a| a.kind == "work" && a.sys.contains("\"Frontend Engineer\"")).unwrap();
-    assert!(!dev2.sys.contains("cargo test"));
 }
 
 #[test]
-fn en_conception_pas_de_perimetre_de_fichiers() {
-    for a in &corpus()[..12] {
-        assert!(!a.sys.contains("File scope assigned to you"), "appel {} : périmètre inattendu en conception", a.n);
+fn le_plan_n_a_pas_de_perimetre_de_fichiers() {
+    assert!(!corpus()[0].sys.contains("File scope assigned to you"), "le plan ne modifie rien");
+}
+
+/// Ce qui remplace les permissions et les boucles de correction : chaque poste sait quoi chercher seul,
+/// quoi demander à l'humain, et quand s'arrêter d'insister.
+#[test]
+fn chaque_poste_sait_chercher_seul_et_demander_a_l_humain() {
+    for a in corpus() {
+        assert!(contient(a, "look up yourself"), "appel {} : « chercher soi-même » absent", a.n);
+        assert!(contient(a, "mcp__essaim__ask_human"), "appel {} : outil de demande à l'humain absent", a.n);
+        assert!(contient(a, "never ask your supervisor"), "appel {} : interdiction de questionner le supérieur absente", a.n);
+        assert!(contient(a, "at most two attempts"), "appel {} : borne des tentatives absente", a.n);
+        assert!(contient(a, "notes/decisions.md"), "appel {} : journal des décisions de l'humain absent", a.n);
+        assert!(contient(a, "never modify anything outside"), "appel {} : limite au dossier du projet absente", a.n);
+    }
+    // Le boss pose ses questions avant d'écrire le plan.
+    assert!(contient(&corpus()[0], "before writing, ask the human"));
+}
+
+/// La délégation distribue l'information : des pointeurs vers le contexte, pas des copies.
+#[test]
+fn la_delegation_donne_des_pointeurs_de_contexte() {
+    for a in corpus().iter().filter(|a| a.kind == "delegate") {
+        assert!(contient(a, "`context`") && contient(a, "instead of copying"), "délégation {} : pointeurs de contexte absents", a.n);
+    }
+    for a in corpus().iter().filter(|a| a.kind == "work") {
+        assert!(contient(a, "context pointers from your supervisor"), "appel {} : les pointeurs du supérieur ne sont pas arrivés", a.n);
     }
 }
 
 #[test]
 fn la_revue_porte_sur_les_criteres_du_brief() {
     let revues: Vec<&Appel> = corpus().iter().filter(|a| a.kind == "review").collect();
-    assert_eq!(revues.len(), 2);
+    assert_eq!(revues.len(), 1);
     for a in revues {
-        for mot in ["success criteria", "accepted", "findings", "assignments"] {
+        assert!(!contient(a, "assignments"), "revue {} : elle constate, elle ne relance rien", a.n);
+        assert!(contient(a, "the human reads it and decides"), "revue {} : la décision revient à l'humain", a.n);
+        for mot in ["success criteria", "accepted", "findings"] {
             assert!(contient(a, mot), "revue {} : « {mot} » absent", a.n);
         }
         assert!(contient(a, "UTF-8"), "revue {} : critères du brief absents", a.n);
@@ -167,7 +187,7 @@ fn le_rapport_reprend_la_tache_et_les_resultats() {
     for a in corpus().iter().filter(|a| a.kind == "report") {
         assert!(a.prompt.starts_with("Original task"), "rapport {} : tâche d'origine absente", a.n);
         assert!(contient(a, "rapport de"), "rapport {} : résultats des subordonnés absents", a.n);
-        assert!(contient(a, "failure") || contient(a, "failed"), "rapport {} : consigne d'échec absente", a.n);
+        assert!(contient(a, "not completed"), "rapport {} : consigne sur ce qui n'a pas abouti absente", a.n);
     }
 }
 

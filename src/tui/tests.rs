@@ -848,7 +848,7 @@ fn onglet_entreprise_arbre_niveaux_et_validation() {
     assert!(s.contains("└─ N-2") || s.contains("N-2"), "{s}");
     assert!(s.contains("CEO") && s.contains("CTO") && s.contains("Backend Engineer"));
     assert!(s.contains("⚒"), "marqueur des postes de réalisation");
-    assert!(s.contains("conception 6") && s.contains("réalisation 6") && s.contains("= 12") && s.contains("14 appels"), "estimation affichée : {s}");
+    assert!(s.contains("plan 1 + réalisation") && s.contains("14 appels"), "estimation affichée : {s}");
 }
 
 #[test]
@@ -867,7 +867,7 @@ fn detail_du_poste_selectionne() {
     press(&mut app, KeyCode::Char('j'));
     let s = screen(&app);
     assert!(s.contains("Poste : Backend Engineer (N-2)") && s.contains("modifie le projet"), "{s}");
-    assert!(s.contains("cargo test"), "{s}");
+    assert!(!s.contains("cargo test"), "les commandes autorisées n'ont plus cours : tous les postes ont le shell\n{s}");
 }
 
 #[test]
@@ -1272,51 +1272,111 @@ fn r_refuse_pendant_un_run_et_sans_entreprise_valide() {
     assert!(app.run.is_none() && app.status.contains("invalide"));
 }
 
-// ---------- mission bloquée (escalade vers l'utilisateur) ----------
+// ---------- demandes à l'humain ----------
 
-fn escalation_app() -> (App, mpsc::UnboundedReceiver<crate::runtime::executor::EscalationReply>) {
+use crate::runtime::executor::{AskKind, HumanAnswer, HumanQuestion, HumanRequest};
+
+fn question(text: &str, options: &[&str], recommended: Option<usize>) -> HumanQuestion {
+    HumanQuestion { text: text.into(), options: options.iter().map(|o| o.to_string()).collect(), recommended }
+}
+
+/// App avec un run en cours et une demande reçue ; rend aussi le canal où arrive la réponse.
+fn request_app(kind: AskKind, questions: Vec<HumanQuestion>) -> (App, mpsc::UnboundedReceiver<Vec<HumanAnswer>>) {
     let root = tmp_root();
     let mut app = new_app(&root);
     app.run = Some(run_view(&[]));
     let (reply, rx) = mpsc::unbounded_channel();
-    app.on_run_event(RunEvent::Escalation { summary: "BLOCAGE: tests rouges chez dev1".into(), reply });
+    app.on_run_event(RunEvent::HumanRequest(HumanRequest { node: "dev1/realisation/work".into(), seat: "Backend Engineer".into(), kind, questions, reply }));
     (app, rx)
 }
 
 #[test]
-fn escalade_affiche_le_blocage_et_donne_la_main() {
-    use crate::runtime::executor::EscalationReply;
-    let (mut app, mut rx) = escalation_app();
-    assert_eq!(app.tab, Tab::Run);
+fn une_question_s_affiche_avec_ses_options_et_entree_repond() {
+    let (mut app, mut rx) = request_app(AskKind::Question, vec![question("snake_case ou camelCase ?", &["snake_case", "camelCase"], Some(1))]);
+    assert_eq!(app.tab, Tab::Run, "la demande amène sur l'onglet Run");
     let s = screen(&app);
-    assert!(s.contains("Mission bloquée") && s.contains("tests rouges chez dev1") && s.contains("discuter avec le CEO"));
+    assert!(s.contains("Question de Backend Engineer") && s.contains("snake_case ou camelCase ?"), "{s}");
+    assert!(s.contains("1. snake_case") && s.contains("2. camelCase  (recommandé)") && s.contains("Réponse libre"), "{s}");
+    assert!(s.contains("Run ✋"), "pastille sur l'onglet Run : {s}");
+    // Les touches vont au panneau : `q` n'est pas « quitter », c'est le début d'une réponse libre.
     press(&mut app, KeyCode::Char('q'));
-    assert!(!app.quit && app.escalation.is_some(), "les autres touches ne font rien pendant l'attente");
+    assert!(!app.quit && app.requests[0].input == "q");
+    press(&mut app, KeyCode::Esc); // efface la saisie, ne ferme pas
+    assert!(app.requests[0].input.is_empty() && !app.requests_hidden);
+    // ↑ quitte la réponse libre pour revenir aux options ; un chiffre en choisit alors une directement.
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Char('1'));
     press(&mut app, KeyCode::Enter);
-    assert_eq!(rx.try_recv().ok(), Some(EscalationReply::Retry));
-    assert!(app.escalation.is_none());
-
-    let (mut app, mut rx) = escalation_app();
-    press(&mut app, KeyCode::Esc);
-    assert_eq!(rx.try_recv().ok(), Some(EscalationReply::Stop));
+    assert_eq!(rx.try_recv().ok(), Some(vec![HumanAnswer::Option(0)]));
+    assert!(app.requests.is_empty() && app.status.contains("réponse transmise"));
+    assert!(!screen(&app).contains("✋"), "plus de pastille une fois la réponse donnée");
 }
 
 #[test]
-fn e_ouvre_la_discussion_avec_le_ceo() {
-    let (mut app, _rx) = escalation_app();
-    let dir = app.root.join(".essaim/missions/43");
-    std::fs::create_dir_all(&dir).unwrap();
-    let company = crate::model::company::Company::parse("name = \"acme\"\n[[seat]]\nid = \"ceo\"\ntitle = \"CEO\"\nagent = \"a\"\n").unwrap();
-    app.run_ctx = Some((company, dir.clone()));
-    press(&mut app, KeyCode::Char('e'));
-    let (kind, args) = app.assistant_request.take().expect("session CEO demandée");
-    assert_eq!(kind, AssistantKind::Escalation);
-    let sys = args.iter().find(|a| a.contains("BLOCKED")).unwrap();
-    assert!(sys.contains("tests rouges chez dev1") && sys.contains("resolution.md"));
-    // Au retour, la décision écrite est signalée ; le run reste en attente.
-    std::fs::write(dir.join("resolution.md"), "on autorise git").unwrap();
-    app.after_assistant(AssistantKind::Escalation, &[]);
-    assert!(app.status.contains("décision enregistrée") && app.escalation.is_some());
+fn entree_seule_retient_l_option_recommandee() {
+    let (mut app, mut rx) = request_app(AskKind::Question, vec![question("A ou B ?", &["A", "B"], Some(1))]);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(rx.try_recv().ok(), Some(vec![HumanAnswer::Option(1)]));
+}
+
+#[test]
+fn reponse_libre_et_questions_en_serie() {
+    let (mut app, mut rx) = request_app(AskKind::Question, vec![question("Quel port ?", &[], None), question("Base de test ?", &["sqlite", "postgres"], None)]);
+    assert!(screen(&app).contains("1/2"), "{}", screen(&app));
+    // Sans option, la frappe écrit directement la réponse (chiffres compris) ; une réponse vide n'est pas envoyée.
+    press(&mut app, KeyCode::Enter);
+    assert!(rx.try_recv().is_err() && app.status.contains("écrivez une réponse"));
+    for c in "8080".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(rx.try_recv().is_err(), "la réponse part quand toutes les questions sont traitées");
+    assert!(screen(&app).contains("2/2") && screen(&app).contains("Base de test ?"));
+    // Avec des options, écrire bascule sur la réponse libre.
+    for c in "mysql".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(rx.try_recv().ok(), Some(vec![HumanAnswer::Text("8080".into()), HumanAnswer::Text("mysql".into())]));
+}
+
+#[test]
+fn echap_met_la_demande_de_cote_et_d_la_rouvre() {
+    let (mut app, mut rx) = request_app(AskKind::Blocked, vec![question("Backend Engineer : ce poste n'a pas pu finir sa tâche.", &["Relancer ce poste", "Continuer sans lui", "Arrêter la mission"], None)]);
+    assert!(screen(&app).contains("Poste bloqué"));
+    press(&mut app, KeyCode::Esc);
+    assert!(app.requests_hidden && app.status.contains("mise de côté"));
+    let s = screen(&app);
+    assert!(!s.contains("Poste bloqué") && s.contains("Run ✋"), "le panneau est rangé, la pastille reste : {s}");
+    assert!(rx.try_recv().is_err(), "mettre de côté n'est pas répondre : l'agent attend toujours");
+    press(&mut app, KeyCode::Char('d'));
+    assert!(!app.requests_hidden && screen(&app).contains("Poste bloqué"));
+    press(&mut app, KeyCode::Char('3'));
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(rx.try_recv().ok(), Some(vec![HumanAnswer::Option(2)]));
+}
+
+#[test]
+fn les_demandes_s_enchainent_et_celles_sans_demandeur_disparaissent() {
+    let (mut app, mut rx1) = request_app(AskKind::Permission, vec![question("Commande (hors du bac à sable) :\ncurl https://exemple.fr", &["Autoriser une fois", "Autoriser pour la mission", "Refuser"], None)]);
+    let (reply2, rx2) = mpsc::unbounded_channel();
+    app.on_run_event(RunEvent::HumanRequest(HumanRequest { node: String::new(), seat: "CEO".into(), kind: AskKind::Review, questions: vec![question("La revue finale ne valide pas le résultat", &["Relancer"], None)], reply: reply2 }));
+    let s = screen(&app);
+    assert!(s.contains("Autorisation demandée par Backend Engineer") && s.contains("1 en attente") && s.contains("Run ✋"), "{s}");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(rx1.try_recv().ok(), Some(vec![HumanAnswer::Option(0)]));
+    assert!(screen(&app).contains("Revue de CEO"), "la demande suivante prend la place");
+    // Le demandeur disparaît (agent arrêté, run annulé) : sa demande est retirée au battement suivant.
+    drop(rx2);
+    app.on_event(AppEvent::Tick);
+    assert!(app.requests.is_empty() && !screen(&app).contains("✋"));
+}
+
+#[test]
+fn la_fin_du_run_vide_les_demandes() {
+    let (mut app, _rx) = request_app(AskKind::Question, vec![question("x ?", &[], None)]);
+    app.on_run_event(RunEvent::RunFinished { ok: false, tokens: 0 });
+    assert!(app.requests.is_empty());
 }
 
 // ---------- point de contrôle (interface) ----------
@@ -1336,7 +1396,7 @@ fn le_point_de_controle_affiche_le_plan_et_donne_la_main() {
     assert!(app.checkpoint.is_some());
     assert_eq!(app.tab, Tab::Run, "on bascule sur le run");
     let s = screen(&app);
-    assert!(s.contains("Plan consolidé") && s.contains("PLAN: créer src/a.txt"));
+    assert!(s.contains("Plan de la mission") && s.contains("PLAN: créer src/a.txt"));
     assert!(s.contains("Entrée") && s.contains("Échap"));
     // Les autres touches ne déclenchent rien pendant la validation.
     press(&mut app, KeyCode::Char('q'));
@@ -1681,11 +1741,11 @@ fn point_de_controle_ne_repond_que_sur_l_onglet_run() {
     assert_eq!(app.tab, Tab::Run);
     press(&mut app, KeyCode::F(2));
     assert_eq!(app.tab, Tab::Company);
-    assert!(!screen(&app).contains("Plan consolidé"), "le plan n'est affiché que sur l'onglet Run");
+    assert!(!screen(&app).contains("Plan de la mission"), "le plan n'est affiché que sur l'onglet Run");
     press(&mut app, KeyCode::Enter); // sur l'onglet Entreprise, Entrée n'arbitre pas le plan
     assert!(app.checkpoint.is_some() && rx.try_recv().is_err());
     press(&mut app, KeyCode::F(3));
-    assert!(screen(&app).contains("Plan consolidé"));
+    assert!(screen(&app).contains("Plan de la mission"));
 }
 
 #[test]
@@ -1778,14 +1838,43 @@ fn premier_lancement_choix_de_langue_avant_le_menu_et_memorise() {
     assert!(s.contains("Choose your language") && !s.contains("Entreprise"), "{s}");
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
-    assert!(app.settings_menu.is_none());
     assert_eq!(app.lang, crate::tui::settings::Lang::En);
+    // Deuxième choix imposé : le profil de sécurité, avec son explication. Le curseur part sur « protégé ».
+    let s = screen(&app);
+    assert!(s.contains("Security profile") && s.contains("1. Dedicated machine") && s.contains("2. Protected") && !s.contains("Company"), "{s}");
+    assert!(s.contains("sandbox"), "l'explication du profil sous le curseur est affichée : {s}");
+    press(&mut app, KeyCode::Esc);
+    assert!(app.settings_menu.is_some(), "choix imposé : Échap ne le saute pas");
+    press(&mut app, KeyCode::Enter);
+    assert!(app.settings_menu.is_none());
+    assert_eq!(app.settings.profile, Some(crate::tui::settings::Profile::Protected));
     let s = screen(&app);
     assert!(s.contains("Company") && s.contains("F10 settings"), "{s}");
-    // relancé : la langue est relue, pas de menu
+    // relancé : langue et profil sont relus, pas de menu
     let again = settings_app(&dir);
     assert!(again.settings_menu.is_none());
     assert_eq!(again.lang, crate::tui::settings::Lang::En);
+    assert_eq!(again.settings.access().profile, crate::tui::settings::Profile::Protected);
+}
+
+/// Réglages d'avant les profils (langue seule) : la question du profil est posée au lancement suivant.
+#[test]
+fn profil_jamais_choisi_la_question_est_posee_au_lancement() {
+    let dir = tmp_root();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("settings.toml"), "lang = \"fr\"\n").unwrap();
+    let mut app = settings_app(&dir);
+    let s = screen(&app);
+    assert!(s.contains("Profil de sécurité") && s.contains("Appareil dédié") && s.contains("Protégé") && !s.contains("Choose your language"), "{s}");
+    // Un chiffre déplace le curseur sans valider : l'explication doit pouvoir être lue.
+    press(&mut app, KeyCode::Char('1'));
+    assert!(app.settings_menu.is_some());
+    assert!(screen(&app).contains("SANS données personnelles"), "{}", screen(&app));
+    press(&mut app, KeyCode::Enter);
+    assert!(app.settings_menu.is_none());
+    let relu = crate::tui::settings::load(&dir.join("settings.toml"));
+    assert_eq!(relu.profile, Some(crate::tui::settings::Profile::Dedicated));
+    assert_eq!(relu.lang, Some(crate::tui::settings::Lang::Fr), "la langue n'est pas perdue");
 }
 
 #[test]
@@ -1793,6 +1882,7 @@ fn f10_rouvre_les_reglages_et_echap_annule() {
     let dir = tmp_root();
     let mut app = settings_app(&dir);
     press(&mut app, KeyCode::Enter); // français
+    press(&mut app, KeyCode::Enter); // profil protégé
     press(&mut app, KeyCode::F(10));
     assert!(app.settings_menu.is_some());
     press(&mut app, KeyCode::Down);
@@ -1802,6 +1892,12 @@ fn f10_rouvre_les_reglages_et_echap_annule() {
     press(&mut app, KeyCode::F(10));
     press(&mut app, KeyCode::Char('2'));
     assert_eq!(app.lang, crate::tui::settings::Lang::En);
+    // Après la langue, F10 propose le profil : ↑ puis Entrée passe en « appareil dédié », Échap aurait gardé l'actuel.
+    assert!(screen(&app).contains("Security profile"));
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Enter);
+    assert!(app.settings_menu.is_none());
+    assert_eq!(app.settings.profile, Some(crate::tui::settings::Profile::Dedicated));
     app.on_key(ctrl_k());
     assert!(screen(&app).contains("TAB 1: AGENTS"));
 }
@@ -1810,7 +1906,8 @@ fn f10_rouvre_les_reglages_et_echap_annule() {
 fn interface_en_anglais_apres_le_choix_de_langue() {
     let dir = tmp_root();
     let mut app = settings_app(&dir);
-    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Char('2')); // English
+    press(&mut app, KeyCode::Enter); // profil protégé
     press(&mut app, KeyCode::Char('2')); // onglet Company
     let s = screen(&app);
     assert!(s.contains("No company.") && s.contains("Missions (0)"), "{s}");
@@ -1923,19 +2020,19 @@ fn formulaire_de_poste_defile_dans_un_petit_terminal() {
     press(&mut app, KeyCode::Down); // cto
     press(&mut app, KeyCode::Char('e'));
     press(&mut app, KeyCode::Char('1')); // édition simple
-    // Terminal bas : 4 champs visibles au plus, le dernier (commandes) est hors écran au départ.
+    // Terminal bas : 4 champs visibles au plus, le dernier (poste de réalisation) est hors écran au départ.
     let s = screen_size(&app, 100, 16);
     assert!(s.contains("Éditer le poste") && s.contains("Id (lettres"), "{s}");
-    assert!(!s.contains("Commandes shell autorisées"), "{s}");
+    assert!(!s.contains("Poste de réalisation"), "{s}");
     // ↓ jusqu'au dernier champ : il devient visible, le premier disparaît, la barre est dessinée.
-    for _ in 0..7 {
+    for _ in 0..6 {
         press(&mut app, KeyCode::Down);
     }
     let Mode::EditSeat(form) = &app.mode else { panic!() };
-    assert_eq!(form.focus, 7);
+    assert_eq!(form.focus, 6);
     assert!(screen_size(&app, 100, 16).contains("Valider les changements"), "boutons toujours visibles");
     let s = screen_size(&app, 100, 16);
-    assert!(s.contains("Commandes shell autorisées"), "{s}");
+    assert!(s.contains("Poste de réalisation"), "{s}");
     assert!(!s.contains("Id (lettres"), "{s}");
     assert!(s.contains('█') || s.contains('║') || s.contains('▐'), "barre de défilement absente : {s}");
     // Les boutons sont les deux derniers arrêts : ↓ n'ira pas plus loin que Annuler.
@@ -1943,7 +2040,7 @@ fn formulaire_de_poste_defile_dans_un_petit_terminal() {
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Down);
     let Mode::EditSeat(form) = &app.mode else { panic!() };
-    assert_eq!(form.focus, 9);
+    assert_eq!(form.focus, 8);
     // Annuler sans changement : ferme sans demander.
     press(&mut app, KeyCode::Enter);
     assert!(matches!(app.mode, Mode::Normal), "{}", app.status);
@@ -1964,7 +2061,7 @@ fn formulaire_de_poste_boutons_valider_et_annuler_demandent_verification() {
         app
     };
     let to_buttons = |app: &mut App| {
-        for _ in 0..7 {
+        for _ in 0..6 {
             press(app, KeyCode::Down);
         }
     };
@@ -2039,18 +2136,6 @@ fn e_propose_edition_simple_ou_avec_le_modele() {
 // ─── Étape A : tests de caractérisation ───────────────────────────────────────
 // Un test `characterize_*` fige le comportement ACTUEL. Quand il documente un bug, il réussit tant que le bug existe ;
 // après correctif (étape B), son assertion est basculée vers le comportement attendu, indiqué en commentaire.
-
-/// E1 : la portée d'écriture exclut `.claude` et `.git/hooks` à n'importe quelle profondeur (corrigé).
-#[test]
-fn characterize_e1_portee_exclut_claude_et_git_hooks_profonds() {
-    use crate::runtime::scope::{is_sensitive, write_rules};
-    let motif = |s: &str| vec![s.to_string()];
-    // `**/.claude` est réservé à toute profondeur : aucune règle d'écriture.
-    assert!(write_rules(&motif("**/.claude/**")).is_empty());
-    // `src/.git/hooks/**` est réservé comme `.git/hooks/**`.
-    assert!(is_sensitive("src/.git/hooks/pre-commit"));
-    assert!(write_rules(&motif("src/.git/hooks/**")).is_empty());
-}
 
 /// R2 : un résultat `claude` dont `is_error` est absent du JSON n'est jamais un succès (corrigé).
 #[test]

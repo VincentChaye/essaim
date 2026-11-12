@@ -138,6 +138,13 @@ impl Tracker {
     /// par seconde (ils bougent à chaque message).
     pub fn on_event(&mut self, ev: &RunEvent) {
         let mut force = false;
+        // Toute activité d'un nœud qui attendait l'humain signifie que la réponse est arrivée.
+        if let RunEvent::Node { id, .. } = ev
+            && self.node(id).state == "asking"
+        {
+            self.node(id).state = "running".into();
+            force = true;
+        }
         match ev {
             RunEvent::Label { id, label, agent, depth } => {
                 let n = self.node(id);
@@ -179,6 +186,13 @@ impl Tracker {
                 self.run.resets_at = None;
                 force = true;
             }
+            // Le poste s'adresse à l'humain : il est à l'arrêt tant que la réponse n'est pas donnée.
+            RunEvent::HumanRequest(req) => {
+                if !req.node.is_empty() {
+                    self.node(&req.node).state = "asking".into();
+                }
+                force = true;
+            }
             RunEvent::Node { id, event } => match event {
                 ClaudeEvent::Init { session_id, .. } => {
                     let sid = (!session_id.is_empty()).then(|| session_id.clone());
@@ -198,7 +212,7 @@ impl Tracker {
                 }
                 _ => {}
             },
-            RunEvent::Checkpoint { .. } | RunEvent::Escalation { .. } => force = true,
+            RunEvent::Checkpoint { .. } => force = true,
         }
         self.dirty = true;
         if force {
@@ -344,6 +358,24 @@ mod tests {
         let r = relu(&root);
         assert_eq!(r.finished, Some(true));
         assert!(!r.running(now_ms()));
+    }
+
+    #[test]
+    fn un_poste_qui_attend_l_humain_est_visible_puis_repart() {
+        use crate::runtime::executor::{AskKind, HumanRequest};
+        let root = tmp();
+        let mut t = Tracker::new(&root, &new_id(4), &company(), "m", 1);
+        t.on_event(&RunEvent::NodeStarted { id: "dev/realisation/work".into() });
+        let (reply, _rx) = tokio::sync::mpsc::unbounded_channel();
+        t.on_event(&RunEvent::HumanRequest(HumanRequest { node: "dev/realisation/work".into(), seat: "Dev".into(), kind: AskKind::Question, questions: vec![], reply }));
+        assert_eq!(relu(&root).nodes[0].state, "asking", "écrit tout de suite : c'est l'humain qu'on attend");
+        // La réponse donnée, l'agent reprend : son premier message le remet « en cours ».
+        t.on_event(&RunEvent::Node { id: "dev/realisation/work".into(), event: ClaudeEvent::Usage { id: "m1".into(), tokens: 10, volume: 10, cached: 0 } });
+        assert_eq!(relu(&root).nodes[0].state, "running");
+        // Une demande d'essaim lui-même (poste bloqué, revue) ne vise aucun nœud en cours.
+        let (reply, _rx) = tokio::sync::mpsc::unbounded_channel();
+        t.on_event(&RunEvent::HumanRequest(HumanRequest { node: String::new(), seat: "CEO".into(), kind: AskKind::Review, questions: vec![], reply }));
+        assert_eq!(relu(&root).nodes.len(), 1);
     }
 
     #[test]

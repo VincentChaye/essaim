@@ -9,7 +9,7 @@ use runtime::claude_proc::ClaudeEvent;
 use runtime::company_exec::{CompanyOptions, note_refus, run_mission};
 use runtime::missions;
 use runtime::pause;
-use runtime::executor::{EscalationReply, NodeStatus, RunEvent, claude_runner};
+use runtime::executor::{AskKind, HumanAnswer, HumanRequest, NodeStatus, RunEvent, claude_runner};
 use std::path::PathBuf;
 use tokio::sync::{mpsc, watch};
 
@@ -51,6 +51,27 @@ enum Cmd {
         no_open: bool,
         #[arg(long)]
         root: Option<PathBuf>,
+    },
+    /// Choisit le profil de sécurité des agents : `dedicated` (appareil sans données personnelles : tous les
+    /// droits) ou `protected` (bac à sable, et demandes à l'humain pour tout ce qui en sort). Sans argument,
+    /// explique les deux profils et pose la question.
+    Profile {
+        /// `dedicated` ou `protected`.
+        choice: Option<String>,
+    },
+    /// Serveur MCP d'essaim pour un poste (lancé par `claude`, pas à la main) : relaie les demandes de
+    /// l'agent à l'humain.
+    #[command(hide = true)]
+    Mcp {
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long, default_value = "")]
+        node: String,
+        #[arg(long, default_value = "")]
+        seat: String,
+        /// Expose aussi l'outil de permission (profil protégé).
+        #[arg(long)]
+        permission: bool,
     },
 }
 
@@ -168,7 +189,7 @@ reports_to = "vp-design"
 enum CompanyCmd {
     /// Affiche l'organigramme (niveaux, postes, agents) et l'estimation d'appels.
     Show { file: PathBuf },
-    /// Exécute une mission : conception (délégation en cascade, rapports), point de contrôle, réalisation.
+    /// Exécute une mission : plan du boss, point de contrôle, puis réalisation (délégation en cascade, rapports).
     Run {
         file: PathBuf,
         /// Brief de la mission : texte, ou @fichier pour le lire dans un fichier.
@@ -177,10 +198,11 @@ enum CompanyCmd {
         /// Mission existante (.essaim/missions/<id>/brief.md).
         #[arg(long)]
         mission: Option<String>,
-        /// Confirme sans demander : mission de plus de 30 appels et point de contrôle.
+        /// Sans humain : confirme la mission de plus de 30 appels et le point de contrôle ; une question d'un
+        /// agent prend l'option qu'il recommande, une demande d'action ou de permission reste sans réponse.
         #[arg(long)]
         yes: bool,
-        /// Reprend une mission interrompue (avec --mission) : une conception terminée n'est pas rejouée, on repart de son plan.
+        /// Reprend une mission interrompue (avec --mission) : un plan déjà écrit n'est pas réécrit, on repart de lui.
         #[arg(long, requires = "mission")]
         resume: bool,
         #[arg(long)]
@@ -199,7 +221,6 @@ struct PlanEdit {
     company: Company,
     agents: Vec<agent::AgentDef>,
     root: PathBuf,
-    dirs: ConfigDirs,
     mission_dir: PathBuf,
     lang: tui::settings::Lang,
 }
@@ -225,31 +246,59 @@ impl PlanEdit {
     }
 }
 
-impl PlanEdit {
-    /// Session `claude` interactive avec le boss d'une mission bloquée : il écrit sa décision dans `resolution.md`.
-    async fn discuss(&self, blockage: &str) {
-        let Some(boss) = self.company.root() else { return };
-        let seat = &self.company.seats[boss];
-        let prompt = self.agents.iter().find(|a| a.name == seat.agent).map(|a| a.prompt.clone()).unwrap_or_default();
-        let rel = |name: &str| self.mission_dir.strip_prefix(&self.root).unwrap_or(&self.mission_dir).join(name).display().to_string();
-        let args = tui::assistant::escalation_args(
-            self.lang,
-            &self.company.name,
-            &seat.title,
-            &prompt,
-            &self.company.outline(),
-            &rel("brief.md"),
-            &rel(missions::RESOLUTION_FILE),
-            blockage,
-            &tui::assistant::Dirs::of(&self.dirs),
-        );
-        eprintln!("\n── discussion avec le boss : /exit pour revenir au blocage ──");
-        match runtime::claude_proc::claude_command().args(&args).current_dir(&self.root).status().await {
-            Ok(st) if st.success() => {}
-            Ok(st) => eprintln!("⚠ la session s'est terminée avec {st}"),
-            Err(e) => eprintln!("⚠ impossible de lancer claude : {e}"),
+/// Lit une ligne sur l'entrée standard, sans bloquer l'exécuteur. `None` : entrée fermée.
+async fn read_line() -> Option<String> {
+    tokio::task::spawn_blocking(|| {
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(n) if n > 0 => Some(line.trim().to_string()),
+            _ => None,
         }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Présente une demande à l'humain sur le terminal et lit ses réponses. Un numéro choisit une option,
+/// tout autre texte est une réponse libre, une ligne vide prend l'option recommandée s'il y en a une.
+/// Avec `--yes` ou une entrée fermée, personne ne répond : voir `HumanRequest::unattended`.
+async fn answer_on_terminal(req: &HumanRequest, auto_yes: bool) -> Vec<HumanAnswer> {
+    let qui = match req.kind {
+        AskKind::Question => "question de",
+        AskKind::Action => "action demandée par",
+        AskKind::Blocked => "poste bloqué :",
+        AskKind::Permission => "autorisation demandée par",
+        AskKind::Review => "revue de",
+    };
+    eprintln!("\n──────── {qui} {} ────────", req.seat);
+    let repli = req.unattended();
+    let mut out = vec![];
+    for (n, q) in req.questions.iter().enumerate() {
+        eprintln!("{}", q.text);
+        for (i, o) in q.options.iter().enumerate() {
+            eprintln!("  {}. {o}{}", i + 1, if q.recommended == Some(i) { "  (recommandé)" } else { "" });
+        }
+        if auto_yes {
+            match &repli[n] {
+                HumanAnswer::Option(i) => eprintln!("--yes : option recommandée retenue ({}).", q.options[*i]),
+                _ => eprintln!("--yes : personne pour répondre, la demande reste sans réponse."),
+            }
+            out.push(repli[n].clone());
+            continue;
+        }
+        eprint!("{} ", if q.options.is_empty() { "Votre réponse :" } else { "Numéro, ou réponse libre :" });
+        out.push(match read_line().await {
+            None => repli[n].clone(),
+            Some(l) if l.is_empty() => q.recommended.map(HumanAnswer::Option).unwrap_or(HumanAnswer::Unavailable),
+            Some(l) => match l.parse::<usize>() {
+                Ok(i) if i >= 1 && i <= q.options.len() => HumanAnswer::Option(i - 1),
+                _ => HumanAnswer::Text(l),
+            },
+        });
     }
+    eprintln!("────────────────────────────────────────────────────────");
+    out
 }
 
 /// Affiche l'avancement d'un run sur stderr (libellés hiérarchiques inclus). `live` suit le run pour le
@@ -272,12 +321,12 @@ fn spawn_printer(mut rx: mpsc::UnboundedReceiver<RunEvent>, auto_yes: bool, edit
                 }
                 RunEvent::Checkpoint { mut plan, reply } => {
                     let go = loop {
-                        eprintln!("\n──────── Plan consolidé (fin de la conception) ────────\n{plan}\n────────────────────────────────────────────────────────");
+                        eprintln!("\n──────── Plan de la mission (écrit par le boss) ────────\n{plan}\n────────────────────────────────────────────────────────");
                         if auto_yes {
                             eprintln!("--yes : la réalisation démarre.");
                             break true;
                         }
-                        eprint!("Lancer la réalisation (les postes ⚒ vont modifier le projet) ? [o/N/e = modifier le plan avec le boss] ");
+                        eprint!("Lancer la réalisation (les postes vont modifier le projet) ? [o/N/e = modifier le plan avec le boss] ");
                         let answer = tokio::task::spawn_blocking(|| {
                             let mut line = String::new();
                             let _ = std::io::stdin().read_line(&mut line);
@@ -299,28 +348,12 @@ fn spawn_printer(mut rx: mpsc::UnboundedReceiver<RunEvent>, auto_yes: bool, edit
                     };
                     let _ = reply.send(go);
                 }
-                RunEvent::Escalation { summary, reply } => {
-                    let go = loop {
-                        eprintln!("\n──────── Mission bloquée : le boss n'a pas pu la débloquer ────────\n{summary}\n────────────────────────────────────────────────────────");
-                        if auto_yes {
-                            eprintln!("--yes : jamais de poursuite automatique sur un blocage, la mission s'arrête.");
-                            break EscalationReply::Stop;
-                        }
-                        eprint!("[r = relancer la correction / e = en discuter avec le boss / N = arrêter] ");
-                        let answer = tokio::task::spawn_blocking(|| {
-                            let mut line = String::new();
-                            let _ = std::io::stdin().read_line(&mut line);
-                            line.trim().to_lowercase()
-                        })
-                        .await
-                        .unwrap_or_default();
-                        match (answer.as_str(), &edit) {
-                            ("e" | "discuter", Some(ed)) => ed.discuss(&summary).await,
-                            ("r" | "relancer", _) => break EscalationReply::Retry,
-                            _ => break EscalationReply::Stop,
-                        }
-                    };
-                    let _ = reply.send(go);
+                RunEvent::HumanRequest(req) => {
+                    // Demandeur déjà parti (agent arrêté pendant qu'une autre demande était à l'écran) : rien à demander.
+                    if req.pending() {
+                        let answers = answer_on_terminal(&req, auto_yes).await;
+                        let _ = req.reply.send(answers);
+                    }
                 }
                 RunEvent::NodeStarted { id } => eprintln!("▶ {}", name(&labels, &id)),
                 RunEvent::Node { id, event: ClaudeEvent::ToolUse { name: tool, .. } } => {
@@ -355,6 +388,64 @@ fn spawn_printer(mut rx: mpsc::UnboundedReceiver<RunEvent>, auto_yes: bool, edit
             }
         }
     })
+}
+
+/// `essaim profile` : explique les deux profils de sécurité, lit le choix (argument ou clavier) et l'enregistre.
+/// Appelé par l'installeur, qui lui passe le terminal : c'est la question posée à l'installation.
+async fn choose_profile(choice: Option<String>) -> Result<()> {
+    use tui::settings::{self, Profile};
+    let path = settings::path().context("dossier de configuration introuvable")?;
+    let mut reglages = settings::load(&path);
+    let lang = reglages.lang.unwrap_or_default();
+    let profile = match choice {
+        Some(c) => Profile::parse(&c).with_context(|| format!("profil inconnu : {c:?} (dedicated ou protected)"))?,
+        None => {
+            println!("{}\n", lang.t("Profil de sécurité d'essaim : ce que les agents ont le droit de faire sur cette machine.", "essaim security profile: what agents may do on this machine."));
+            for (i, p) in Profile::ALL.iter().enumerate() {
+                println!("{}. {} ({})\n   {}\n", i + 1, p.name(lang), p.key(), p.explain(lang));
+            }
+            let actuel = reglages.profile.unwrap_or_default();
+            loop {
+                print!("{} [1/2, {} = {}] ", lang.t("Votre choix", "Your choice"), lang.t("Entrée", "Enter"), actuel.name(lang));
+                std::io::Write::flush(&mut std::io::stdout()).ok();
+                match read_line().await {
+                    None => {
+                        println!();
+                        break actuel; // pas de clavier : on garde le profil courant (protégé par défaut)
+                    }
+                    Some(l) if l.is_empty() => break actuel,
+                    Some(l) => match Profile::parse(&l) {
+                        Some(p) => break p,
+                        None => println!("{}", lang.t("Répondez 1 ou 2.", "Answer 1 or 2.")),
+                    },
+                }
+            }
+        }
+    };
+    reglages.profile = Some(profile);
+    settings::save(&path, &reglages)?;
+    println!("{} : {} — {}", lang.t("Profil enregistré", "Profile saved"), profile.name(lang), path.display());
+    if profile == Profile::Protected && cfg!(target_os = "linux") {
+        let absent: Vec<&str> = [("bwrap", "bubblewrap"), ("socat", "socat")].iter().filter(|(bin, _)| !in_path(bin)).map(|(_, pkg)| *pkg).collect();
+        if !absent.is_empty() {
+            println!(
+                "⚠ {} : {}. {} sudo apt-get install {} ({} sudo dnf install {}).",
+                lang.t("Le bac à sable a besoin de", "The sandbox needs"),
+                absent.join(", "),
+                lang.t("Installez-les :", "Install them:"),
+                absent.join(" "),
+                lang.t("ou", "or"),
+                absent.join(" ")
+            );
+        }
+    }
+    println!("{}", lang.t("Vous pouvez en changer à tout moment : `essaim profile`, ou F10 dans essaim.", "You can change it at any time: `essaim profile`, or F10 inside essaim."));
+    Ok(())
+}
+
+/// Le programme `name` est-il dans le PATH ?
+fn in_path(name: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
 }
 
 #[tokio::main]
@@ -399,7 +490,7 @@ async fn main() -> Result<()> {
                     for l in c.outline() {
                         println!("{l}");
                     }
-                    println!("Appels estimés (majorant) : conception {} + réalisation {} = {}", e.conception, e.realisation, e.total());
+                    println!("Appels estimés (flux de base) : plan {} + réalisation {} = {}", e.conception, e.realisation, e.total());
                 }
                 CompanyCmd::Run { file, brief, mission, yes, resume, root } => {
                     let root = root.unwrap_or(std::env::current_dir()?).canonicalize().context("racine introuvable")?;
@@ -436,7 +527,7 @@ async fn main() -> Result<()> {
                     }
                     let e = company.estimate_calls();
                     eprintln!(
-                        "{} — mission {mission_id} : jusqu'à {} appel(s) (conception {} + réalisation {}), plafond {}, {} en parallèle",
+                        "{} — mission {mission_id} : environ {} appel(s) (plan {} + réalisation {}), plafond {}, {} en parallèle",
                         company.name, e.total(), e.conception, e.realisation, company.max_calls, company.max_parallel
                     );
                     if e.total() > 30 && !yes {
@@ -451,8 +542,14 @@ async fn main() -> Result<()> {
                         }
                     });
                     let mission_dir = missions::dir_of(&root, &mission_id);
-                    let lang = crate::tui::settings::path().map(|p| crate::tui::settings::load(&p)).and_then(|s| s.lang).unwrap_or_default();
-                    let edit = PlanEdit { company: company.clone(), agents: agents.clone(), root: root.clone(), dirs: dirs.clone(), mission_dir: mission_dir.clone(), lang };
+                    let reglages = tui::settings::load_default();
+                    let lang = reglages.lang.unwrap_or_default();
+                    if reglages.profile.is_none() {
+                        eprintln!("profil de sécurité jamais choisi : « protégé » s'applique (bac à sable, demandes à l'humain). `essaim profile` pour choisir.");
+                    }
+                    let access = reglages.access();
+                    eprintln!("profil : {}", access.profile.name(lang));
+                    let edit = PlanEdit { company: company.clone(), agents: agents.clone(), root: root.clone(), mission_dir: mission_dir.clone(), lang };
                     let run_id = runtime::store::new_id(runtime::store::now_ms());
                     let titre = missions::list(&root).into_iter().find(|m| m.id == mission_id).map(|m| m.title).unwrap_or_default();
                     let live = runtime::live::Tracker::new(&root, &run_id, &company, &titre, runtime::store::now_ms());
@@ -465,15 +562,21 @@ async fn main() -> Result<()> {
                         }
                         _ => pause::Gate::new(),
                     };
-                    let opts = CompanyOptions { base_dir: root, mission_dir: Some(mission_dir.clone()), lang, resume, pause: gate };
-                    let out = run_mission(&company, &agents, &brief_text, &opts, claude_runner(std::time::Duration::from_secs(company.node_timeout_s)), tx, cancel_rx).await?;
+                    // Bus des demandes à l'humain : les agents y arrivent par l'outil `ask_human` de leur serveur MCP.
+                    let bus = runtime::bus::Bus::start(tx.clone(), Some(mission_dir.join(missions::NOTES_DIR)), lang, gate.clone())?;
+                    bus.trust_sandbox(&root);
+                    let opts = CompanyOptions { base_dir: root, mission_dir: Some(mission_dir.clone()), lang, resume, pause: gate, access, bus: Some(bus.clone()) };
+                    let res = run_mission(&company, &agents, &brief_text, &opts, claude_runner(std::time::Duration::from_secs(company.node_timeout_s), Some(bus.clone())), tx, cancel_rx).await;
+                    // Le bus garde un émetteur d'événements : sans le lâcher, l'affichage attendrait indéfiniment.
+                    drop((opts, bus));
+                    let out = res?;
                     printer.await?;
                     if let Some(note) = note_refus(out.approved) {
                         eprintln!("{note}");
                     }
                     let blockers: Vec<_> = out.conception.blockers.iter().chain(out.realisation.iter().flat_map(|r| r.blockers.iter())).collect();
                     if !blockers.is_empty() {
-                        eprintln!("⚠ Mission bloquée, blocages non levés :");
+                        eprintln!("⚠ Mission non aboutie. Ce qui reste à lever (demandes restées sans réponse comprises) :");
                         for b in blockers {
                             eprintln!("  - {}", b.line());
                         }
@@ -519,6 +622,8 @@ async fn main() -> Result<()> {
             eprintln!("\ntableau de bord arrêté.");
             Ok(())
         }
+        Some(Cmd::Mcp { socket, node, seat, permission }) => runtime::mcp::run(socket, node, seat, permission),
+        Some(Cmd::Profile { choice }) => choose_profile(choice).await,
         Some(Cmd::Agents { root }) => {
             let dirs = ConfigDirs::new(root.unwrap_or(std::env::current_dir()?));
             for a in agent::load_all(&dirs) {
@@ -547,7 +652,7 @@ mod tests {
         std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         unsafe { std::env::set_var("ESSAIM_CLAUDE_BIN", &fake) };
         let company = Company::parse("name = \"acme\"\n[[seat]]\nid = \"ceo\"\ntitle = \"CEO\"\nagent = \"a\"\n").unwrap();
-        let edit = PlanEdit { company, agents: vec![], root: root.clone(), dirs: ConfigDirs::project_only(&root), mission_dir: dir, lang: tui::settings::Lang::Fr };
+        let edit = PlanEdit { company, agents: vec![], root: root.clone(), mission_dir: dir, lang: tui::settings::Lang::Fr };
         assert_eq!(edit.revise().await.as_deref(), Some("PLAN V2"));
         let args = std::fs::read_to_string(root.join("args.txt")).unwrap();
         assert!(args.contains("--permission-mode plan") && args.contains(".essaim/missions/42/conception.md"), "{args}");

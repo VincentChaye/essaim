@@ -288,8 +288,9 @@ pub fn summarize(dir: &Path) -> Summary {
 
 const COMPANY_FILE: &str = "company";
 
-/// Décisions prises avec le CEO quand une mission est bloquée : relues au tour de correction suivant.
-pub const RESOLUTION_FILE: &str = "resolution.md";
+/// Dossier des notes partagées d'une mission : livrables longs des postes, et `decisions.md` (questions
+/// posées à l'humain et ses réponses).
+pub const NOTES_DIR: &str = "notes";
 
 /// Rattache la mission à l'entreprise qui la réalise.
 pub fn set_company(dir: &Path, company_file: &str) -> Result<()> {
@@ -382,7 +383,7 @@ pub fn compte_rendu(d: &ReportData, fr: bool) -> String {
     let verdict = match (d.ok, d.realised) {
         (false, _) if d.blocked => t("⚠ bloquée : des blocages n'ont pas été levés (voir « Points d'attention »)", "⚠ blocked: some blockers were not cleared (see \"Points of attention\")"),
         (true, true) => t("✔ terminée", "✔ completed"),
-        (true, false) => t("✔ conception terminée, réalisation non lancée", "✔ design completed, realisation not started"),
+        (true, false) => t("✔ plan écrit, réalisation non lancée", "✔ plan written, realisation not started"),
         (false, _) => t("✖ terminée avec des échecs ou interrompue", "✖ finished with failures or interrupted"),
     };
     let mut s = format!("# {} — {}\n\n", t("Compte rendu", "Report"), d.title);

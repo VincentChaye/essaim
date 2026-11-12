@@ -52,7 +52,7 @@ Steps, in order:
    - name: kebab-case, unique (letters, digits, - and _ only)
    - description: one or two sentences saying WHEN to use the agent (it drives automatic delegation)
    - model: haiku (simple, fast tasks), sonnet (general use), opus or fable (hard reasoning) — or omitted for the default model
-   - tools: MINIMAL list of Claude Code tools (Read, Grep, Glob, Edit, Write, Bash, WebFetch…) — or omitted for all tools
+   - tools: none to list — the agent has every tool and every shell command (in an essaim company, each seat is equipped with all of them whatever the file says)
    - system prompt: the outline (role, method, output format, limits)
 3. Once the plan is approved, write ONE file only: <AGENTS_DIR>/<name>.md. Exact format (description in double quotes: an unprotected ":" makes the YAML invalid and the agent is ignored):
 
@@ -60,10 +60,11 @@ Steps, in order:
 name: <name>
 description: "<description>"
 model: <model>        (omit the line for the default model)
-tools: Read, Grep     (omit the line for all tools; comma-separated names)
 ---
 
 <system prompt, in Markdown>
+
+No `tools:` line: without it the agent has all tools, which is what is wanted. What the agent should and should not do belongs in its system prompt.
 
 4. Re-read the written file, then tell the user they can leave the session (/exit) to go back to essaim.
 
@@ -88,11 +89,11 @@ pub fn agent_creation_args(lang: Lang, existing: &[String], dirs: &Dirs) -> Vec<
 
 const COMPANY_INSTRUCTIONS: &str = r#"You are essaim's company-creation assistant. Your only job: design an org chart of agents (a "company") with the user, then write it to disk along with the agents it lacks.
 
-A company is a tree of seats: a boss (root, level N), VPs or directors (N-1), middle leads (N-2…), managers, and workers at the leaves. A seat = a real job title + an agent + a supervisor. A mission goes down the hierarchy (each level splits the work and delegates to its DIRECT subordinates); workers first produce text (design), then, after the plan is approved, build seats (`builds`) modify the project. Reports flow back up and are synthesized at each level.
+A company is a tree of seats: a boss (root, level N), VPs or directors (N-1), middle leads (N-2…), managers, and workers at the leaves. A seat = a real job title + an agent + a supervisor. A mission runs in two steps: the boss writes the plan alone (asking the user its questions), the user approves it, then the plan goes down the hierarchy ONCE — each level splits its part and hands it to its DIRECT subordinates with pointers to the context they need; leaves do the work (`builds` seats build in the project, the others analyse and advise); reports flow back up and are synthesized at each level; the boss reviews the result. Every seat has every tool and every shell command, and looks up what it needs itself. A seat that is stuck, or that needs to know what the user wants, asks the user directly — never its supervisor, and nothing is retried automatically.
 
 Steps, in order:
 1. Understand the need: business domain, what the company must produce, which projects it will serve. Ask 1 to 4 short questions (AskUserQuestion fits): domains to cover (tech, security, design, product, data…), desired size (small team of 4 to 6 seats, medium 8 to 12, large beyond), who may modify the project, call budget. Decide alone what is reasonable.
-2. Propose the org chart as an annotated tree for the user to approve or correct: for each seat, its id, title, agent (existing or to create), level, area of expertise. Reuse existing agents when they fit; several seats may share the same agent (e.g. dev-api and dev-ui → "developer"). State how many calls a mission costs at most (≈ 2 per seat with subordinates + 1 per leaf, per phase) and stay frugal: 5 to 12 seats almost always suffice.
+2. Propose the org chart as an annotated tree for the user to approve or correct: for each seat, its id, title, agent (existing or to create), level, area of expertise. Reuse existing agents when they fit; several seats may share the same agent (e.g. dev-api and dev-ui → "developer"). State how many calls a mission costs (1 for the plan, then ≈ 2 per seat with subordinates + 1 per leaf, + 1 for the boss's review) and stay frugal: 5 to 12 seats almost always suffice.
 3. Once the plan is approved, write, IN ONE GO: (a) the file <COMPANIES_DIR>/<name>.toml, (b) for each missing agent, the file <AGENTS_DIR>/<agent>.md. Touch no existing agent.
 
 Company format:
@@ -100,9 +101,9 @@ Company format:
 name = "<name>"        # identical to the file name, without .toml
 max_calls = 40         # cap on claude calls per mission
 max_parallel = 2
-checkpoint = true      # pause to approve the plan before realisation
-max_fix_rounds = 2     # correction rounds a seat may run in its branch before escalating a blocker
-max_review_rounds = 1  # CEO reviews of the result against the goal (0 = none); a failed review sends a new round of tasks down
+checkpoint = true      # pause to approve the boss's plan before realisation
+review = true          # the boss checks the result against the goal at the end; a gap is shown to the user, who decides
+commit_steps = false   # true: each build seat ends each step with one commit
 
 [[seat]]
 id = "ceo"             # unique; letters, digits, - and _
@@ -119,14 +120,13 @@ id = "dev-api"
 title = "Backend Engineer"
 agent = "developer"
 reports_to = "mgr-eng"
-builds = true                      # realisation leaves only
-allow_bash = ["cargo test"]        # optional, only with builds: allowed shell commands
-helpers = "haiku"                  # optional: light assistants (cheaper model) for mechanical chores, read-only, no decisions
+builds = true                      # this leaf builds in the project (other leaves analyse and advise)
+helpers = "haiku"                  # optional: light assistants (cheaper model) for mechanical chores, no decisions, no file edits
 
 Validity rules (essaim rejects the company otherwise):
 - exactly ONE seat without `reports_to` (the boss); no cycle; every `reports_to` names an existing seat;
-- `builds = true` only on a leaf (seat without subordinates) that is not the boss; `allow_bash` only with `builds`;
-- add `builds` only to seats that really must modify the project; without them, the company only produces documents;
+- `builds = true` only on a leaf (seat without subordinates) that is not the boss;
+- `builds` is a role, not a right (every seat has every tool): give it to the leaves whose job is to modify the project; a leaf without it analyses, reviews and advises;
 - every referenced agent exists; realistic job titles for the level (N: CEO; N-1: CTO, CISO, VP Design…; N-2: Head of…, Director of…; N-3: Engineering Manager, Team Lead…; leaves: Backend Engineer, Security Analyst, UX Designer…).
 
 Format of an agent to create (<AGENTS_DIR>/<agent>.md):
@@ -139,7 +139,7 @@ model: sonnet       (sonnet for leaves that produce the work and for managers/bo
 
 <system prompt in Markdown: role, method, concise output format, limits>
 
-The description is in double quotes (an unprotected ":" makes the YAML invalid). No `tools:` line: rights are set by the phase and the seat's scope.
+The description is in double quotes (an unprotected ":" makes the YAML invalid). No `tools:` line: every seat has every tool; what an agent should and should not do belongs in its system prompt.
 
 4. Re-read the written files, then tell the user they can leave the session (/exit); they will see the org chart in the Company tab and can frame a mission with `m`.
 
@@ -181,9 +181,9 @@ pub fn company_creation_args(lang: Lang, agents: &[(String, String)], existing: 
 /// of the only file to write.
 pub fn mission_brief_args(lang: Lang, company: &str, boss_title: &str, boss_prompt: &str, outline: &[String], has_builders: bool, brief_path: &str) -> Vec<String> {
     let realisation = if has_builders {
-        "Seats marked ⚒ can modify the project, each within a file scope: the brief must therefore say which folders or files are concerned and which are off limits."
+        "Seats marked ⚒ build in the project, each on the files its supervisor assigns it: the brief must therefore say which folders or files are concerned and which are off limits."
     } else {
-        "No seat in the org chart modifies the project: the mission will only produce documents (analyses, specifications, recommendations)."
+        "No seat in the org chart is a build seat: the mission will mostly produce documents (analyses, specifications, recommendations). Say so in the brief if project files must nevertheless be modified."
     };
     let system = format!(
         r###"You are "{boss_title}" of the company "{company}", and you are framing a mission with the user, before your team executes it.
@@ -196,7 +196,7 @@ Your company's org chart (level, seat · id → agent):
 {realisation}
 
 Steps, in order:
-1. Understand the request. Ask 1 to 4 short, targeted questions (AskUserQuestion fits) about what really changes the work: concrete goal, constraints (technical, deadlines, quality), what is out of scope, how success will be judged. Do not ask what you can reasonably decide alone; do not speak for the other seats.
+1. Understand the request. Ask short, targeted questions (AskUserQuestion fits), as many rounds as it takes to remove every ambiguity that would change the work: concrete goal, constraints (technical, deadlines, quality), what is out of scope, how success will be judged. A precise brief is what keeps the whole team from guessing. Do not ask what you can reasonably decide or look up alone; do not speak for the other seats.
 2. Propose the framing as a short plan for the user to approve or correct.
 3. Once the plan is approved, write ONE file only: {brief_path} (path relative to the current directory; the folder already exists). Markdown content, in this order: a title "# <mission title>", then the sections "## Goal", "## Context", "## Constraints", "## Expected deliverables", "## Out of scope", "## Success criteria", and "## File scope" if ⚒ seats must modify the project (translate these headings into the user's language). Stay concrete and verifiable; do not repeat what the org chart already says.
 4. Re-read the written file, then tell the user they can leave the session (/exit); the mission is then launched from the Company tab (key r).
@@ -219,11 +219,11 @@ Rules: start no realisation and delegate nothing yourself; create or modify no o
     ]
 }
 
-/// `claude` arguments to revise the consolidated plan of a run waiting at the checkpoint: the session plays
+/// `claude` arguments to revise the plan of a run waiting at the checkpoint: the session plays
 /// the boss, discusses the plan with the user and rewrites `plan_path` (the only file it may touch).
 pub fn plan_revision_args(lang: Lang, company: &str, boss_title: &str, boss_prompt: &str, outline: &[String], brief_path: &str, plan_path: &str) -> Vec<String> {
     let system = format!(
-        r###"You are "{boss_title}" of the company "{company}". Your team has just finished the design phase of a mission and consolidated a plan; the run is paused so the user can adjust the plan before realisation starts.
+        r###"You are "{boss_title}" of the company "{company}". You have just written the plan of a mission; the run is paused so the user can adjust the plan before your team carries it out.
 
 {boss_prompt}
 
@@ -232,12 +232,12 @@ Your company's org chart (level, seat · id → agent):
 
 Files (paths relative to the current directory):
 - the mission brief: {brief_path}
-- the consolidated plan to revise: {plan_path}
+- the plan to revise: {plan_path}
 
 Steps, in order:
 1. Read both files. Summarize the plan to the user in a few lines, then ask what they want to change (AskUserQuestion fits for precise choices). Do not ask what you can decide alone.
 2. Discuss and agree on the changes: what to add, remove, reorder, narrow or clarify. Keep the plan consistent with the brief and with the seats that exist; do not invent seats.
-3. Once the changes are approved, rewrite {plan_path} IN FULL with the revised plan (same language, same structure and level of detail as the original unless the user asks otherwise). This file is exactly what the team will receive as the approved plan.
+3. Once the changes are approved, rewrite {plan_path} IN FULL with the revised plan (same language, same structure and level of detail as the original unless the user asks otherwise). This file is exactly what you will receive as the approved plan to lead the realisation.
 4. Re-read the written file, then tell the user they can leave the session (/exit) to go back to the run, where Enter starts the realisation with the revised plan.
 
 Rules: start no realisation and delegate nothing yourself; modify no file other than {plan_path}; if the user wants no change, leave the file untouched.
@@ -254,67 +254,7 @@ Rules: start no realisation and delegate nothing yourself; modify no file other 
         "--append-system-prompt".into(),
         system,
         "--".into(),
-        "I want to revise the consolidated plan before realisation. Summarize it, then ask me what to change.".into(),
-    ]
-}
-
-/// `claude` arguments for the session where the user talks with the boss of a blocked mission: the boss explains
-/// the blockage, agrees on a way out with the user and writes the decision to `resolution_path` (read by the
-/// next correction round). It may also create/adjust seats, agents or permissions the team lacks. Plan mode:
-/// every write is approved by the user first.
-#[allow(clippy::too_many_arguments)]
-pub fn escalation_args(
-    lang: Lang,
-    company: &str,
-    boss_title: &str,
-    boss_prompt: &str,
-    outline: &[String],
-    brief_path: &str,
-    resolution_path: &str,
-    blockage: &str,
-    dirs: &Dirs,
-) -> Vec<String> {
-    let blockage: String = blockage.chars().take(6000).collect();
-    let system = format!(
-        r###"You are "{boss_title}" of the company "{company}". A mission is BLOCKED: your team tried to correct the problem inside the hierarchy and nobody could, so the run is paused and escalated to you and to the user who requested the mission.
-
-{boss_prompt}
-
-Your company's org chart (level, seat · id → agent):
-{org}
-
-The blockage reported by your team:
-{blockage}
-
-Files (paths relative to the current directory):
-- the mission brief: {brief_path}
-- the decision file to write: {resolution_path}
-
-Steps, in order:
-1. Explain the blockage to the user plainly: what is blocked, why, what was already tried, what is missing (a permission, a tool, a prerequisite, a decision, a seat or agent that does not exist).
-2. Propose a clean correction plan, then discuss it with the user (AskUserQuestion fits for precise choices). Do not ask what you can decide alone. Do not minimize the problem and do not propose to skip it.
-3. If something must be created or adjusted for the team (a seat or its allow_bash in the company file, an agent file), do it once the user approves. Never touch the project's source code yourself: the team does that when the correction is retried.
-4. Write {resolution_path} IN FULL: the decisions agreed with the user, the correction plan, and who should do what. This file is handed to you as the requester's decision at the next correction round.
-5. Tell the user they can leave the session (/exit) to go back to the run: Enter retries the correction, Esc stops the mission. If you changed a company file, tell them the new organization only applies to a new run (stop, then resume the mission).
-
-Rules: modify no file other than {resolution_path}, company files and agent files; start no realisation yourself.
-
-{dirs}
-
-{note}"###,
-        org = outline.join("\n"),
-        dirs = dirs.note(),
-        note = lang_note(lang),
-    );
-    vec![
-        "--permission-mode".into(),
-        "plan".into(),
-        "--name".into(),
-        format!("essaim: blocage ({company})"),
-        "--append-system-prompt".into(),
-        system,
-        "--".into(),
-        "The mission is blocked. Explain the blockage and let us find a way out.".into(),
+        "I want to revise the plan before realisation. Summarize it, then ask me what to change.".into(),
     ]
 }
 
@@ -366,7 +306,7 @@ mod tests {
         assert!(sys.contains("delegate nothing yourself"));
         assert_eq!(a[a.len() - 2], "--");
         let b = mission_brief_args(Lang::Fr, "acme", "CEO", "", &org, false, "x.md");
-        assert!(b.iter().any(|x| x.contains("only produce documents")));
+        assert!(b.iter().any(|x| x.contains("mostly produce documents")));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Schémas JSON des sorties structurées et lecture des réponses (statut, délégation, plan de correction).
 
-use super::{Assignment, Blocker, Kind, Outcome, Question, Section, Status};
+use super::{Assignment, Blocker, Kind, Outcome, Section, Status};
 use crate::model::company::Company;
 use crate::runtime::executor::{NodeResult, NodeStatus};
 use crate::runtime::scope;
@@ -13,27 +13,13 @@ pub(super) const MODELS: [&str; 3] = ["haiku", "sonnet", "opus"];
 
 /// Schéma de sortie des appels de travail et de rapport. Avec un gabarit, `report` est remplacé par un champ
 /// obligatoire par section : la forme de la réponse est celle que le délégant a demandée.
-/// `ask` : l'employé peut poser une question cadrée (statut `question`) et attendre la réponse de son supérieur.
 ///
 /// Aucune borne `maxLength` n'est posée dans le schéma : `claude` valide la sortie structurée et renvoie une
 /// erreur d'outil au moindre dépassement (« must NOT have more than N characters »), que le modèle ne sait pas
 /// éviter — il compte mal les caractères. L'appel partait alors en boucle d'erreurs puis échouait sans rien
 /// rendre. Les tailles restent annoncées dans le prompt (budget) et appliquées à la lecture, par troncature.
-pub(super) fn outcome_schema(sections: &[Section], ask: bool) -> String {
+pub(super) fn outcome_schema(sections: &[Section]) -> String {
     let mut v = outcome_base();
-    if ask {
-        v["properties"]["status"]["enum"] = json!(["done", "blocked", "failed", "question"]);
-        v["properties"]["question"] = json!({
-            "type": "object",
-            "properties": {
-                "kind": {"type": "string", "enum": ["missing_info", "decision", "permission", "ambiguity"]},
-                "text": {"type": "string", "description": format!("one short question, about {QUESTION_CHARS} chars")},
-                "command": {"type": "string", "description": format!("the exact shell command, about {COMMAND_CHARS} chars")},
-                "options": {"type": "array", "items": {"type": "string"}}
-            },
-            "required": ["kind", "text"]
-        });
-    }
     if !sections.is_empty() {
         let props: serde_json::Map<String, Value> = sections
             .iter()
@@ -43,68 +29,7 @@ pub(super) fn outcome_schema(sections: &[Section], ask: bool) -> String {
         v["properties"]["sections"] = json!({"type": "object", "properties": props, "required": sections.iter().map(|s| s.key.clone()).collect::<Vec<_>>()});
         v["required"] = json!(["status", "sections"]);
     }
-    if ask {
-        // Un statut `question` n'a ni rapport ni sections à rendre : seul le statut reste obligatoire.
-        v["required"] = json!(["status"]);
-    }
     v.to_string()
-}
-
-/// Taille maximale d'une question d'employé et d'une réponse de supérieur. Appliquée à la lecture (troncature),
-/// jamais par le schéma : voir `outcome_schema`.
-pub(super) const QUESTION_CHARS: usize = 150;
-pub(super) const COMMAND_CHARS: usize = 120;
-pub(super) const ANSWER_CHARS: usize = 300;
-/// Taille maximale d'une option proposée dans une question.
-const OPTION_CHARS: usize = 60;
-
-/// Schéma de la réponse d'un supérieur : une réponse courte, ou l'aveu qu'il ne peut pas répondre.
-pub(super) fn answer_schema() -> String {
-    json!({
-        "type": "object",
-        "properties": {
-            "can_answer": {"type": "boolean"},
-            "answer": {"type": "string", "description": format!("the answer, about {ANSWER_CHARS} chars")}
-        },
-        "required": ["can_answer", "answer"]
-    })
-    .to_string()
-}
-
-/// Décision d'un supérieur sur une demande de commande shell : accepter, refuser, ou renvoyer plus haut.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Decision {
-    Approve,
-    Deny,
-    Escalate,
-}
-
-pub(super) fn permission_schema() -> String {
-    json!({
-        "type": "object",
-        "properties": {
-            "decision": {"type": "string", "enum": ["approve", "deny", "escalate"]},
-            "reason": {"type": "string", "description": "one short sentence"}
-        },
-        "required": ["decision", "reason"]
-    })
-    .to_string()
-}
-
-/// Sortie absente ou illisible = refus : on n'autorise jamais par défaut.
-pub(super) fn parse_decision(r: &NodeResult) -> Decision {
-    match r.structured.as_ref().filter(|_| !r.is_error).and_then(|v| v["decision"].as_str()) {
-        Some("approve") => Decision::Approve,
-        Some("escalate") => Decision::Escalate,
-        _ => Decision::Deny,
-    }
-}
-
-/// Réponse retenue : `None` si le supérieur ne peut pas répondre (la question devient un blocage remonté).
-pub(super) fn parse_answer(r: &NodeResult) -> Option<String> {
-    let v = r.structured.as_ref().filter(|_| !r.is_error)?;
-    let a = v["answer"].as_str()?.trim();
-    (v["can_answer"].as_bool() == Some(true) && !a.is_empty()).then(|| take_chars(a, ANSWER_CHARS))
 }
 
 fn outcome_base() -> Value {
@@ -131,34 +56,19 @@ fn outcome_base() -> Value {
 }
 
 /// Lit le résultat d'un appel de travail/rapport. `None` : sortie structurée absente ou illisible.
-/// Un refus de permission est toujours un blocage, même si l'agent se déclare « done ».
+/// Le statut est celui que l'agent déclare : un refus de l'humain en cours de route (profil protégé) n'est
+/// pas un blocage en soi, l'agent a pu faire autrement — c'est à lui de dire s'il a fini.
 pub(super) fn parse_outcome(r: &NodeResult, sections: &[Section]) -> Option<Outcome> {
     if r.is_error {
-        return Some(Outcome::failed(r.output.clone()));
+        return Some(Outcome { session: r.session_id.clone(), ..Outcome::failed(r.output.clone()) });
     }
     let v = r.structured.as_ref()?;
-    let mut status = match v["status"].as_str()? {
+    let status = match v["status"].as_str()? {
         "done" => Status::Done,
         "blocked" => Status::Blocked,
         "failed" => Status::Failed,
-        "question" => Status::Blocked,
         _ => return None,
     };
-    // Tailles appliquées ici, et non par le schéma : un dépassement raccourcit la question, il ne fait plus échouer l'appel.
-    let question = (v["status"] == "question").then(|| Question {
-        kind: v["question"]["kind"].as_str().unwrap_or("ambiguity").to_string(),
-        text: take_chars(v["question"]["text"].as_str().unwrap_or_default().trim(), QUESTION_CHARS),
-        command: take_chars(v["question"]["command"].as_str().unwrap_or_default().trim(), COMMAND_CHARS),
-        options: v["question"]["options"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|o| o.as_str())
-            .map(|o| take_chars(o.trim(), OPTION_CHARS))
-            .filter(|o| !o.is_empty())
-            .take(4)
-            .collect(),
-    });
     let text = |x: &Value| x.as_str().unwrap_or_default().trim().to_string();
     let mut blockers: Vec<Blocker> = v["blockers"]
         .as_array()
@@ -167,25 +77,6 @@ pub(super) fn parse_outcome(r: &NodeResult, sections: &[Section]) -> Option<Outc
         .map(|b| Blocker { kind: text(&b["kind"]).chars().take(20).collect(), detail: text(&b["detail"]), needs: text(&b["needs"]) })
         .filter(|b| !b.detail.is_empty())
         .collect();
-    let mut seen: Vec<&String> = vec![];
-    let mut denied: Vec<Blocker> = vec![];
-    for d in &r.denials {
-        if !seen.contains(&d) && denied.len() < 5 {
-            seen.push(d);
-            denied.push(Blocker { kind: "permission".into(), detail: format!("refused by permissions: {d}"), needs: "authorize it (allow_bash / scope) or give it to a seat that has it".into() });
-        }
-    }
-    if !denied.is_empty() {
-        blockers.extend(denied);
-        if status == Status::Done {
-            status = Status::Blocked;
-        }
-    }
-    // Question sans texte : rien à répondre, c'est un blocage ordinaire.
-    let question = question.filter(|q| !q.text.is_empty());
-    if let Some(q) = &question {
-        blockers.push(Blocker { kind: "other".into(), detail: format!("question ({}): {}", q.kind, q.text), needs: "an answer from the supervisor".into() });
-    }
     let report = if sections.is_empty() {
         text(&v["report"])
     } else {
@@ -201,7 +92,7 @@ pub(super) fn parse_outcome(r: &NodeResult, sections: &[Section]) -> Option<Outc
         let detail = report.lines().next().unwrap_or("not completed").to_string();
         blockers.push(Blocker { kind: "other".into(), detail, needs: String::new() });
     }
-    Some(Outcome { status, report, blockers, question })
+    Some(Outcome { status, report, blockers, session: r.session_id.clone() })
 }
 
 /// Statut affiché d'un nœud, d'après son résultat.
@@ -221,107 +112,92 @@ pub(super) fn node_status(kind: Kind, r: &NodeResult, sections: &[Section]) -> N
 }
 
 /// Schéma JSON de la délégation : `to` restreint aux ids des subordonnés directs.
-pub(super) fn delegation_schema(kid_ids: &[String], with_scope: bool) -> String {
-    delegation_value(kid_ids, with_scope).to_string()
-}
-
-fn delegation_value(kid_ids: &[String], with_scope: bool) -> Value {
-    let mut props = json!({
-        "to": {"type": "string", "enum": kid_ids},
-        "task": {"type": "string"},
-        "model": {"type": "string", "enum": MODELS},
-        "sections": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "expect": {"type": "string"},
-                    "max_chars": {"type": "integer"}
-                },
-                "required": ["name", "expect"]
-            }
-        }
-    });
-    let mut required = vec!["to", "task"];
-    if with_scope {
-        props["scope"] = json!({"type": "array", "minItems": 1, "items": {"type": "string"}});
-        required.push("scope");
-    }
+/// `context` : des pointeurs (fichiers, notes, URL) plutôt que des copies. `scope` : facultatif, il ne sert
+/// qu'à ordonner les travaux qui toucheraient les mêmes fichiers.
+pub(super) fn delegation_schema(kid_ids: &[String]) -> String {
     json!({
         "type": "object",
         "properties": {
             "assignments": {
                 "type": "array",
                 "minItems": 1,
-                "items": {"type": "object", "properties": props, "required": required}
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "to": {"type": "string", "enum": kid_ids},
+                        "task": {"type": "string"},
+                        "context": {"type": "array", "items": {"type": "string"}, "description": "pointers: project paths (optionally path:line-line), mission notes, URLs"},
+                        "scope": {"type": "array", "items": {"type": "string"}, "description": "file patterns this subordinate will modify"},
+                        "model": {"type": "string", "enum": MODELS},
+                        "sections": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "expect": {"type": "string"},
+                                    "max_chars": {"type": "integer"}
+                                },
+                                "required": ["name", "expect"]
+                            }
+                        }
+                    },
+                    "required": ["to", "task"]
+                }
             }
         },
         "required": ["assignments"]
     })
+    .to_string()
 }
 
-/// Schéma du plan de correction : `plan`, puis des affectations correctives ou une remontée (`escalate`).
-pub(super) fn fix_schema(kid_ids: &[String], with_scope: bool) -> String {
-    let mut v = delegation_value(kid_ids, with_scope);
-    v["properties"]["assignments"].as_object_mut().map(|a| a.remove("minItems"));
-    v["properties"]["plan"] = json!({"type": "string"});
-    v["properties"]["escalate"] = json!({"type": "string"});
-    v["required"] = json!(["plan"]);
-    v.to_string()
-}
-
-/// Schéma de la revue : verdict, constats, puis (si le résultat n'est pas conforme) les tâches de la redescente.
-pub(super) fn review_schema(kid_ids: &[String], with_scope: bool) -> String {
-    let mut v = delegation_value(kid_ids, with_scope);
-    v["properties"]["assignments"].as_object_mut().map(|a| a.remove("minItems"));
-    v["properties"]["accepted"] = json!({"type": "boolean"});
-    v["properties"]["findings"] = json!({"type": "string"});
-    v["required"] = json!(["accepted", "findings"]);
-    v.to_string()
+/// Schéma de la revue : un verdict et des constats. Elle ne relance rien : l'humain décide de la suite.
+pub(super) fn review_schema() -> String {
+    json!({
+        "type": "object",
+        "properties": {
+            "accepted": {"type": "boolean"},
+            "findings": {"type": "string"}
+        },
+        "required": ["accepted", "findings"]
+    })
+    .to_string()
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(super) enum ReviewPlan {
+pub(super) enum Review {
     /// Objectif atteint (ou revue impossible : elle n'ajoute qu'un garde-fou, son absence ne fait pas échouer la mission).
     Accepted,
-    /// Objectif non atteint : tâches complémentaires pour les subordonnés compétents.
-    Redo { findings: String, assignments: Vec<Assignment> },
-    /// Objectif non atteint et rien à relancer dans la branche : à décider avec l'utilisateur.
+    /// Objectif non atteint : les écarts constatés, à présenter à l'humain.
     Unmet(String),
 }
 
-pub(super) fn parse_review(v: &Value, c: &Company, kids: &[usize], parent_scope: Option<&[String]>) -> ReviewPlan {
+pub(super) fn parse_review(v: &Value) -> Review {
     if v["accepted"].as_bool() == Some(true) {
-        return ReviewPlan::Accepted;
+        return Review::Accepted;
     }
-    let findings = v["findings"].as_str().map(str::trim).filter(|f| !f.is_empty()).unwrap_or("goal not reached").to_string();
-    match parse_assignments(v, c, kids, parent_scope) {
-        Ok(assignments) => ReviewPlan::Redo { findings, assignments },
-        Err(_) => ReviewPlan::Unmet(findings),
-    }
+    Review::Unmet(v["findings"].as_str().map(str::trim).filter(|f| !f.is_empty()).unwrap_or("goal not reached").to_string())
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub(super) enum FixPlan {
-    Assign { plan: String, assignments: Vec<Assignment> },
-    /// Personne ne peut corriger dans cette branche : on remonte, avec la raison.
-    Escalate(String),
-}
+/// Nombre de pointeurs de contexte conservés par affectation, et taille de chacun.
+const MAX_POINTERS: usize = 12;
+const POINTER_CHARS: usize = 300;
 
-/// Lit le plan de correction : des affectations valides priment ; sinon la remontée.
-pub(super) fn parse_fix(v: &Value, c: &Company, kids: &[usize], parent_scope: Option<&[String]>) -> FixPlan {
-    let reason = v["escalate"].as_str().map(str::trim).filter(|r| !r.is_empty());
-    match parse_assignments(v, c, kids, parent_scope) {
-        Ok(assignments) => FixPlan::Assign { plan: v["plan"].as_str().unwrap_or_default().to_string(), assignments },
-        Err(e) => FixPlan::Escalate(reason.map(String::from).unwrap_or_else(|| e.to_string())),
+/// Tâche telle que le subordonné la reçoit : le texte du délégant, puis ses pointeurs de contexte.
+fn with_context(task: &str, a: &Value) -> String {
+    let pointers: Vec<String> = a["context"].as_array().into_iter().flatten().filter_map(|x| x.as_str()).map(|x| take_chars(x.trim(), POINTER_CHARS)).filter(|x| !x.is_empty()).take(MAX_POINTERS).collect();
+    if pointers.is_empty() {
+        return task.to_string();
     }
+    format!("{task}\n\nContext pointers from your supervisor (read what you need, look up the rest yourself):\n- {}", pointers.join("\n- "))
 }
 
-/// Lit la sortie structurée : ignore les destinataires inconnus, fusionne les doublons.
-/// `parent_scope` : en phase de réalisation, périmètre du délégant ; chaque `scope` enfant doit y être inclus
-/// (les motifs hors périmètre sont écartés ; une affectation sans motif valide est ignorée).
-pub(super) fn parse_assignments(v: &Value, c: &Company, kids: &[usize], parent_scope: Option<&[String]>) -> Result<Vec<Assignment>> {
+/// Lit la sortie structurée : ignore les destinataires inconnus, regroupe les affectations d'un même poste en étapes.
+/// `parent_scope` : périmètre du délégant. Le périmètre ne donne plus de droits : il sert à ne pas faire
+/// travailler deux postes sur les mêmes fichiers en même temps. Les motifs hors du périmètre du délégant sont
+/// écartés. Sans motif valide, un poste qui réalise (ou qui dirige une branche) hérite du périmètre du
+/// délégant — il passera donc après les autres — et un poste d'analyse n'en a aucun : il ne gêne personne.
+pub(super) fn parse_assignments(v: &Value, c: &Company, kids: &[usize], parent_scope: &[String]) -> Result<Vec<Assignment>> {
     let arr = v["assignments"].as_array().ok_or_else(|| anyhow::anyhow!("pas de liste « assignments »"))?;
     let mut out: Vec<Assignment> = vec![];
     for a in arr {
@@ -330,25 +206,23 @@ pub(super) fn parse_assignments(v: &Value, c: &Company, kids: &[usize], parent_s
         if task.trim().is_empty() {
             continue;
         }
-        let mut sc: Vec<String> = vec![];
-        if let Some(parent) = parent_scope {
-            let wanted: Vec<String> = a["scope"].as_array().into_iter().flatten().filter_map(|x| x.as_str()).map(scope::normalize).collect();
-            // Poste ⚒ : jamais « tout le projet » (`**` = écriture sans restriction) ni chemin réservé (.claude, .git…).
-            let builder = c.seats[idx].builds;
-            sc = wanted
-                .into_iter()
-                .filter(|w| scope::all_covered(parent, std::slice::from_ref(w)))
-                .filter(|w| !(builder && (scope::is_everything(w) || scope::is_sensitive(w))))
-                .collect();
-            sc.dedup();
-            if sc.is_empty() {
-                continue; // aucun motif dans le périmètre du délégant
-            }
+        let mut sc: Vec<String> = a["scope"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|x| x.as_str())
+            .map(scope::normalize)
+            .filter(|w| scope::all_covered(parent_scope, std::slice::from_ref(w)))
+            .collect();
+        sc.dedup();
+        if sc.is_empty() && (c.seats[idx].builds || !c.is_leaf(idx)) {
+            sc = parent_scope.to_vec();
         }
         let sections = Section::template(a["sections"].as_array().into_iter().flatten().map(|s| {
             (s["name"].as_str().unwrap_or_default().to_string(), s["expect"].as_str().unwrap_or_default().to_string(), s["max_chars"].as_u64())
         }));
         let model = a["model"].as_str().map(str::trim).filter(|m| MODELS.contains(m)).map(String::from);
+        let step = with_context(task.trim(), a);
         // Plusieurs affectations au même subordonné = plusieurs **étapes successives**, pas une tâche
         // fusionnée : chacune repart d'une session neuve, ce qui garde les contextes petits. `task` reste
         // leur concaténation, pour les rapports et l'historique du supérieur.
@@ -358,7 +232,7 @@ pub(super) fn parse_assignments(v: &Value, c: &Company, kids: &[usize], parent_s
                 if x.sections.is_empty() {
                     x.sections = sections;
                 }
-                x.steps.push(task.trim().to_string());
+                x.steps.push(step);
                 x.task.push_str("\n\n");
                 x.task.push_str(task.trim());
                 for m in sc {
@@ -367,11 +241,11 @@ pub(super) fn parse_assignments(v: &Value, c: &Company, kids: &[usize], parent_s
                     }
                 }
             }
-            None => out.push(Assignment { sections, to: idx, steps: vec![task.trim().to_string()], task: task.trim().to_string(), scope: sc, model }),
+            None => out.push(Assignment { sections, to: idx, steps: vec![step], task: task.trim().to_string(), scope: sc, model }),
         }
     }
     if out.is_empty() {
-        bail!("no valid delegation to a direct subordinate{}", if parent_scope.is_some() { " (with a scope included in yours)" } else { "" });
+        bail!("no valid delegation to a direct subordinate");
     }
     Ok(out)
 }

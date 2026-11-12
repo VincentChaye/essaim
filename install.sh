@@ -13,7 +13,13 @@
 #   --from-source        force la compilation locale (nécessite Rust)
 #   --download           force le téléchargement même depuis un clone
 #   --no-modify-path     ne touche pas au fichier de config du shell
+#   --profile <profil>   profil de sécurité des agents, sans poser la question : dedicated ou protected
 #   --uninstall          retire ce que ce script a installé
+#
+# Profil de sécurité : à la fin de l'installation, le script explique les deux profils et demande lequel
+# appliquer (aussi en « curl | bash » : la réponse est lue sur le terminal).
+#   dedicated  appareil sans données personnelles : les agents ont tous les droits, sans rien demander
+#   protected  machine personnelle : commandes dans le bac à sable de Claude Code, le reste vous est demandé
 #
 # Variable : ESSAIM_REPO=<owner>/<repo> pour télécharger depuis un autre dépôt GitHub.
 
@@ -25,6 +31,7 @@ VERSION="latest"
 MODE="auto"
 MODIFY_PATH=1
 UNINSTALL=0
+PROFILE=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -33,8 +40,9 @@ while [ $# -gt 0 ]; do
     --from-source) MODE="source"; shift ;;
     --download) MODE="download"; shift ;;
     --no-modify-path) MODIFY_PATH=0; shift ;;
+    --profile) PROFILE="${2:?--profile attend dedicated ou protected}"; shift 2 ;;
     --uninstall) UNINSTALL=1; shift ;;
-    -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,24p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) printf 'option inconnue : %s\n' "$1" >&2; exit 2 ;;
   esac
 done
@@ -43,6 +51,11 @@ BIN_DIR="$PREFIX/bin"
 MAN_DIR="$PREFIX/share/man/man1"
 
 die() { printf '\033[31m✖ %s\033[0m\n' "$*" >&2; exit 1; }
+
+case "$PROFILE" in
+  ""|dedicated|protected) ;;
+  *) die "--profile attend dedicated ou protected (reçu : $PROFILE)" ;;
+esac
 
 # Exécute avec sudo seulement si la destination n'est pas modifiable par l'utilisateur.
 run() {
@@ -153,4 +166,18 @@ if [ -f "$STAGE/essaim.1" ] && ! man -w essaim >/dev/null 2>&1 && [ "$PREFIX" !=
   [ "$MODIFY_PATH" = 1 ] && add_line "${ZDOTDIR:-$HOME}/.zshrc" "export MANPATH=\"$PREFIX/share/man:\${MANPATH:-}\"" >/dev/null 2>&1 || true
 fi
 command -v claude >/dev/null 2>&1 || echo "⚠ Claude Code ('claude') n'est pas installé : essaim en a besoin (https://claude.com/claude-code)."
+
+# --- Profil de sécurité : la question est posée ici, à l'installation --------------
+# `essaim profile` explique les deux profils, lit la réponse et l'enregistre. En « curl | bash »
+# l'entrée standard est le script lui-même : la réponse est donc lue sur le terminal.
+echo
+if [ -n "$PROFILE" ]; then
+  "$BIN_DIR/essaim" profile "$PROFILE" || echo "⚠ profil non enregistré : lancez 'essaim profile'."
+elif (exec < /dev/tty) 2>/dev/null; then
+  "$BIN_DIR/essaim" profile < /dev/tty || echo "⚠ profil non enregistré : lancez 'essaim profile'."
+else
+  echo "Pas de terminal pour choisir le profil de sécurité : essaim le demandera à son premier lancement"
+  echo "(ou : essaim profile). D'ici là, le profil « protégé » s'applique."
+fi
+echo
 echo "Lancez : essaim   ·   Manuel : man essaim"

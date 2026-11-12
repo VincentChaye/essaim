@@ -4,7 +4,7 @@ use crate::model::company::{self, Company, Seat, graph_nav};
 use crate::model::roles;
 use crate::runtime::claude_proc::ClaudeEvent;
 use crate::runtime::company_exec::{CompanyOptions, run_mission};
-use crate::runtime::executor::{EscalationReply, NodeStatus, RunEvent, claude_runner};
+use crate::runtime::executor::{AskKind, HumanAnswer, HumanRequest, NodeStatus, RunEvent, claude_runner};
 use crate::runtime::missions::{self, Mission};
 use crate::runtime::pause::{self, Gate};
 use crate::runtime::sessions::{self, Session};
@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use tokio::sync::{mpsc, watch};
 
 use super::editor::TextBuf;
-use super::settings::{self, Lang, Settings, tr};
+use super::settings::{self, Lang, Profile, Settings, tr};
 use crate::tf;
 use super::term::{TermSession, encode_key};
 
@@ -60,8 +60,6 @@ pub enum AssistantKind {
     Edit,
     /// Discussion sur le compte rendu d'une mission pour en tirer des actions.
     Debrief,
-    /// Discussion avec le CEO d'une mission bloquée, pour décider comment la débloquer.
-    Escalation,
 }
 
 /// Élément dont on choisit le mode d'édition (touche `e`).
@@ -253,7 +251,7 @@ impl AgentForm {
     }
 }
 
-/// Formulaire de poste (entreprise) : id, intitulé, agent, supérieur, expertise, réalisation, commandes shell.
+/// Formulaire de poste (entreprise) : id, intitulé, agent, modèle, supérieur, expertise, réalisation.
 pub struct SeatForm {
     pub fields: Vec<Field>,
     pub labels: Vec<String>,
@@ -319,7 +317,6 @@ impl SeatForm {
                 Field::choice_of(sup, s.reports_to.as_deref().unwrap_or("")),
                 Field::Text(TextBuf::new(s.expertise.as_deref().unwrap_or(""), false)),
                 Field::choice_of(vec!["non".into(), "oui".into()], if s.builds { "oui" } else { "non" }),
-                Field::Text(TextBuf::new(&s.allow_bash.join(", "), false)),
             ],
             labels: vec![
                 tr("Id (lettres, chiffres, - et _)", "Id (letters, digits, - and _)").into(),
@@ -329,7 +326,6 @@ impl SeatForm {
                 tr("Supérieur  (← → pour choisir)", "Supervisor  (← → to pick)").into(),
                 tr("Expertise (ce que le supérieur sait pouvoir lui déléguer)", "Expertise (what the supervisor knows can be delegated to it)").into(),
                 tr("Poste de réalisation ⚒  (← → ; modifie le projet, feuille uniquement)", "Realisation seat ⚒  (← → ; modifies the project, leaves only)").into(),
-                tr("Commandes shell autorisées, séparées par des virgules (⚒ seulement)", "Allowed shell commands, comma-separated (⚒ only)").into(),
             ],
             focus: 0,
             original: seat.map(|_| s.id.clone()),
@@ -355,8 +351,9 @@ impl SeatForm {
             reports_to: Some(t(4)).filter(|r| !r.is_empty()),
             expertise: Some(t(5)).filter(|e| !e.is_empty()),
             builds: t(6) == "oui",
-            allow_bash: t(7).split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(),
             // Non éditables dans le formulaire (TOML) : conservés tels quels à l'enregistrement.
+            // `allow_bash` n'a plus d'effet (tous les postes ont le shell) ; il est gardé pour ne pas réécrire le fichier sans lui.
+            allow_bash: self.initial.allow_bash.clone(),
             helpers: self.initial.helpers.clone(),
             max_budget_usd: self.initial.max_budget_usd,
         }
@@ -473,10 +470,20 @@ impl NodeView {
     }
 }
 
-/// Menu des réglages (langue). `first_run` : choix imposé au tout premier lancement.
+/// Page du menu des réglages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsPage {
+    Lang,
+    /// Profil de sécurité des agents (appareil dédié ou protégé).
+    Profile,
+}
+
+/// Menu des réglages : la langue, puis le profil de sécurité. `first_run` : choix imposé (premier
+/// lancement, ou profil jamais choisi).
 pub struct SettingsMenu {
     pub first_run: bool,
     pub sel: usize,
+    pub page: SettingsPage,
 }
 
 /// Mission passée ouverte en lecture : brief, plan et rapport.
@@ -496,11 +503,42 @@ pub struct CheckpointState {
     pub scroll: u16,
 }
 
-/// Mission bloquée que le CEO n'a pas pu débloquer : le run attend la décision de l'utilisateur.
-pub struct EscalationState {
-    pub summary: String,
-    pub reply: mpsc::UnboundedSender<EscalationReply>,
+/// Demande d'un agent (ou d'essaim) à l'humain, en attente de réponse. Les questions se répondent une à
+/// une : une option de la liste, ou un texte libre (dernière entrée de la liste).
+pub struct RequestState {
+    pub req: HumanRequest,
+    /// Réponses déjà données (une par question traitée).
+    pub answers: Vec<HumanAnswer>,
+    /// Entrée sélectionnée : une option, ou `options.len()` pour la réponse libre.
+    pub sel: usize,
+    /// Texte de la réponse libre.
+    pub input: String,
     pub scroll: u16,
+}
+
+impl RequestState {
+    pub fn new(req: HumanRequest) -> Self {
+        let mut r = RequestState { req, answers: vec![], sel: 0, input: String::new(), scroll: 0 };
+        r.reset_selection();
+        r
+    }
+
+    /// Question en cours.
+    pub fn question(&self) -> Option<&crate::runtime::executor::HumanQuestion> {
+        self.req.questions.get(self.answers.len())
+    }
+
+    /// Curseur au départ d'une question : l'option recommandée, sinon la première ; sans option, la réponse libre.
+    fn reset_selection(&mut self) {
+        self.sel = self.question().map(|q| q.recommended.filter(|i| *i < q.options.len()).unwrap_or(0)).unwrap_or(0);
+        self.input.clear();
+        self.scroll = 0;
+    }
+
+    /// Le curseur est-il sur la réponse libre ?
+    pub fn on_free_text(&self) -> bool {
+        self.question().is_none_or(|q| self.sel >= q.options.len())
+    }
 }
 
 pub struct RunView {
@@ -562,7 +600,12 @@ pub struct App {
     pub zone_in: bool,
     pub run: Option<RunView>,
     pub checkpoint: Option<CheckpointState>,
-    pub escalation: Option<EscalationState>,
+    /// Demandes à l'humain en attente, dans l'ordre d'arrivée : la première est à l'écran.
+    pub requests: Vec<RequestState>,
+    /// Le panneau des demandes est mis de côté (Échap) pour regarder le run ; `d` le rouvre.
+    pub requests_hidden: bool,
+    /// Réglages enregistrés (langue, profil de sécurité, ouvertures du bac à sable).
+    pub settings: Settings,
     /// Entreprise et dossier de la mission du run en cours : permettent de réviser le plan au point de contrôle.
     pub run_ctx: Option<(Company, PathBuf)>,
     pub mission_view: Option<MissionView>,
@@ -641,7 +684,9 @@ impl App {
             quota: None,
             run: None,
             checkpoint: None,
-            escalation: None,
+            requests: vec![],
+            requests_hidden: false,
+            settings: Settings::default(),
             run_ctx: None,
             mission_view: None,
             mission_open: Default::default(),
@@ -773,7 +818,7 @@ impl App {
             AssistantKind::Agent => self.agents.iter().map(|a| a.name.clone()).collect(),
             AssistantKind::Mission | AssistantKind::Debrief => self.missions.iter().map(|m| m.id.clone()).collect(),
             AssistantKind::Company => self.company_files(),
-            AssistantKind::Plan | AssistantKind::Edit | AssistantKind::Escalation => vec![],
+            AssistantKind::Plan | AssistantKind::Edit => vec![],
         }
     }
 
@@ -822,7 +867,6 @@ impl App {
                 };
             }
             AssistantKind::Plan => self.after_plan_revision(),
-            AssistantKind::Escalation => self.after_escalation_chat(),
             AssistantKind::Edit => {
                 self.status = match self.invalid_agent_files().first() {
                     Some((file, err)) => tf!("⚠ {file} est illisible : {err}", "⚠ {file} is unreadable: {err}"),
@@ -888,91 +932,129 @@ impl App {
         self.assistant_request = Some((AssistantKind::Plan, args));
     }
 
-    /// Au retour de la discussion avec le CEO : dit si une décision a été écrite pour le prochain tour de correction.
-    fn after_escalation_chat(&mut self) {
-        let written = self.run_ctx.as_ref().is_some_and(|(_, d)| d.join(missions::RESOLUTION_FILE).is_file());
-        self.status = if written {
-            tr("décision enregistrée — Entrée relance la correction avec elle, Échap arrête", "decision saved — Enter retries the correction with it, Esc stops").into()
-        } else {
-            tr("aucune décision écrite — Entrée relance quand même, Échap arrête, e rouvre la discussion", "no decision written — Enter retries anyway, Esc stops, e reopens the discussion").into()
-        };
+    /// Demandes encore attendues : celles dont le demandeur est parti (agent arrêté, run annulé) sont retirées.
+    pub fn prune_requests(&mut self) {
+        self.requests.retain(|r| r.req.pending());
+        if self.requests.is_empty() {
+            self.requests_hidden = false;
+        }
     }
 
-    /// `e` sur un blocage : le CEO en discute avec l'utilisateur et écrit sa décision.
-    fn request_escalation_chat(&mut self) {
-        let Some((company, dir)) = self.run_ctx.clone() else { return };
-        let Some(es) = self.escalation.as_ref() else { return };
-        let Some(boss) = company.root() else { return };
-        let seat = &company.seats[boss];
-        let prompt = self.agents.iter().find(|a| a.name == seat.agent).map(|a| a.prompt.clone()).unwrap_or_default();
-        let rel = |name: &str| dir.strip_prefix(&self.root).unwrap_or(&dir).join(name).display().to_string();
-        let args = super::assistant::escalation_args(
-            self.lang,
-            &company.name,
-            &seat.title,
-            &prompt,
-            &company.outline(),
-            &rel("brief.md"),
-            &rel(missions::RESOLUTION_FILE),
-            &es.summary,
-            &self.assistant_dirs(),
-        );
-        self.assistant_request = Some((AssistantKind::Escalation, args));
+    /// Le panneau des demandes est-il à l'écran (onglet Run, non mis de côté) ?
+    pub fn request_shown(&self) -> bool {
+        !self.requests.is_empty() && !self.requests_hidden && self.tab == Tab::Run && self.checkpoint.is_none()
     }
 
-    fn key_escalation(&mut self, k: KeyEvent) {
-        let Some(es) = self.escalation.as_mut() else { return };
+    /// Touches du panneau des demandes. ↑↓ choisissent une entrée (les options, puis la réponse libre),
+    /// un chiffre saute à l'option, toute autre frappe écrit la réponse libre, Entrée valide.
+    fn key_request(&mut self, k: KeyEvent) {
+        let Some(r) = self.requests.first_mut() else { return };
+        let Some(q) = r.question().cloned() else { return };
+        let n = q.options.len();
         match k.code {
-            KeyCode::Enter => {
-                let _ = es.reply.send(EscalationReply::Retry);
-                self.escalation = None;
-                self.status = tr("correction relancée", "correction retried").into();
-            }
+            KeyCode::Esc if !r.input.is_empty() => r.input.clear(),
             KeyCode::Esc => {
-                let _ = es.reply.send(EscalationReply::Stop);
-                self.escalation = None;
-                self.status = tr("mission arrêtée sur le blocage", "mission stopped on the blockage").into();
+                self.requests_hidden = true;
+                self.status = tr("demande mise de côté — d la rouvre, l'agent attend", "request set aside — d reopens it, the agent is waiting").into();
             }
-            KeyCode::Char('e') => self.request_escalation_chat(),
-            KeyCode::Char('c') => {
-                let summary = es.summary.clone();
-                self.copy_text(&summary);
+            KeyCode::Up => r.sel = r.sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Tab => r.sel = (r.sel + 1).min(n),
+            KeyCode::PageDown => r.scroll = r.scroll.saturating_add(5),
+            KeyCode::PageUp => r.scroll = r.scroll.saturating_sub(5),
+            KeyCode::Backspace => {
+                r.input.pop();
             }
-            KeyCode::Down | KeyCode::Char('j') => es.scroll = es.scroll.saturating_add(1),
-            KeyCode::Up | KeyCode::Char('k') => es.scroll = es.scroll.saturating_sub(1),
-            KeyCode::PageDown => es.scroll = es.scroll.saturating_add(10),
-            KeyCode::PageUp => es.scroll = es.scroll.saturating_sub(10),
+            KeyCode::Enter => {
+                let answer = if r.on_free_text() {
+                    if r.input.trim().is_empty() {
+                        self.status = tr("écrivez une réponse, ou choisissez une option avec ↑↓", "type an answer, or pick an option with ↑↓").into();
+                        return;
+                    }
+                    HumanAnswer::Text(r.input.trim().to_string())
+                } else {
+                    HumanAnswer::Option(r.sel)
+                };
+                r.answers.push(answer);
+                if r.answers.len() < r.req.questions.len() {
+                    r.reset_selection();
+                    return;
+                }
+                let done = self.requests.remove(0);
+                // Demandeur parti entre-temps : la réponse n'a plus de destinataire, l'ignorer est voulu.
+                let _ = done.req.reply.send(done.answers);
+                self.status = match self.requests.len() {
+                    0 => tr("réponse transmise", "answer sent").into(),
+                    n => tf!("réponse transmise — encore {n} demande(s)", "answer sent — {n} more request(s)"),
+                };
+            }
+            // Un chiffre désigne une option, sauf pendant la saisie de la réponse libre.
+            KeyCode::Char(c @ '1'..='9') if !r.on_free_text() && (c as usize - '1' as usize) < n => r.sel = c as usize - '1' as usize,
+            KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                r.sel = n;
+                r.input.push(c);
+            }
             _ => {}
         }
     }
 
-    /// Charge la langue mémorisée ; sans réglage, le menu de langue s'ouvre avant tout le reste.
+    /// Arrivée d'une demande : elle rejoint la file et l'onglet Run l'affiche.
+    fn on_human_request(&mut self, req: HumanRequest) {
+        let who = req.seat.clone();
+        let what = match req.kind {
+            AskKind::Question => tr("pose une question", "asks a question"),
+            AskKind::Action => tr("demande une action", "asks for an action"),
+            AskKind::Blocked => tr("est bloqué", "is blocked"),
+            AskKind::Permission => tr("demande une autorisation", "asks for a permission"),
+            AskKind::Review => tr("ne valide pas le résultat", "does not accept the result"),
+        };
+        self.requests.push(RequestState::new(req));
+        self.requests_hidden = false;
+        self.status = tf!("✋ {who} {what} — répondez dans l'onglet Run", "✋ {who} {what} — answer in the Run tab");
+        // On ne retire pas l'utilisateur d'une session Claude où il est en train d'écrire.
+        if !self.term_focus {
+            self.set_tab(Tab::Run);
+        }
+    }
+
+    /// Charge les réglages. Sans langue : le menu s'ouvre sur la langue. Sans profil de sécurité (premier
+    /// lancement, ou réglages d'avant les profils) : il s'ouvre sur le profil. Les deux choix sont imposés.
     pub fn load_settings(&mut self, path: Option<PathBuf>) {
         if let Some(p) = &path {
-            match settings::load(p).lang {
+            self.settings = settings::load(p);
+            match self.settings.lang {
                 Some(l) => {
                     self.lang = l;
                     settings::set_current(l);
+                    if self.settings.profile.is_none() {
+                        self.settings_menu = Some(SettingsMenu { first_run: true, sel: 1, page: SettingsPage::Profile });
+                    }
                 }
-                None => self.settings_menu = Some(SettingsMenu { first_run: true, sel: 0 }),
+                None => self.settings_menu = Some(SettingsMenu { first_run: true, sel: 0, page: SettingsPage::Lang }),
             }
         }
         self.settings_path = path;
     }
 
     fn open_settings(&mut self) {
-        self.settings_menu = Some(SettingsMenu { first_run: false, sel: Lang::ALL.iter().position(|l| *l == self.lang).unwrap_or(0) });
+        self.settings_menu = Some(SettingsMenu { first_run: false, sel: Lang::ALL.iter().position(|l| *l == self.lang).unwrap_or(0), page: SettingsPage::Lang });
     }
 
     fn key_settings(&mut self, k: KeyEvent) {
         let Some(m) = self.settings_menu.as_mut() else { return };
-        let n = Lang::ALL.len();
+        let n = match m.page {
+            SettingsPage::Lang => Lang::ALL.len(),
+            SettingsPage::Profile => Profile::ALL.len(),
+        };
         match k.code {
             KeyCode::Down | KeyCode::Right | KeyCode::Char('j') => m.sel = (m.sel + 1) % n,
             KeyCode::Up | KeyCode::Left | KeyCode::Char('k') => m.sel = (m.sel + n - 1) % n,
+            // Un chiffre choisit la langue tout de suite ; pour le profil il ne fait que déplacer le curseur :
+            // l'explication du profil doit être lue avant de valider.
             KeyCode::Char(c @ '1'..='9') if (c as usize - '1' as usize) < n => {
                 m.sel = c as usize - '1' as usize;
-                self.confirm_settings();
+                if m.page == SettingsPage::Lang {
+                    self.confirm_settings();
+                }
             }
             KeyCode::Enter => self.confirm_settings(),
             KeyCode::Esc if !m.first_run => self.settings_menu = None,
@@ -982,10 +1064,21 @@ impl App {
 
     fn confirm_settings(&mut self) {
         let Some(m) = self.settings_menu.take() else { return };
-        self.lang = Lang::ALL[m.sel];
-        settings::set_current(self.lang);
+        match m.page {
+            SettingsPage::Lang => {
+                self.lang = Lang::ALL[m.sel];
+                self.settings.lang = Some(self.lang);
+                settings::set_current(self.lang);
+                // Page suivante : le profil. Au premier lancement elle n'est imposée que s'il n'est pas choisi.
+                if !m.first_run || self.settings.profile.is_none() {
+                    let sel = Profile::ALL.iter().position(|p| *p == self.settings.profile.unwrap_or_default()).unwrap_or(1);
+                    self.settings_menu = Some(SettingsMenu { first_run: m.first_run, sel, page: SettingsPage::Profile });
+                }
+            }
+            SettingsPage::Profile => self.settings.profile = Some(Profile::ALL[m.sel]),
+        }
         if let Some(p) = &self.settings_path {
-            if let Err(e) = settings::save(p, &Settings { lang: Some(self.lang) }) {
+            if let Err(e) = settings::save(p, &self.settings) {
                 self.status = tf!("réglages non enregistrés : {e:#}", "settings not saved: {e:#}");
             }
         }
@@ -1006,6 +1099,7 @@ impl App {
             AppEvent::Run(r) => self.on_run_event(r),
             AppEvent::Tick => {
                 self.tick = self.tick.wrapping_add(1);
+                self.prune_requests();
                 if let Some(t) = &mut self.live_run {
                     t.tick();
                 }
@@ -1131,7 +1225,6 @@ impl App {
                     AssistantKind::Plan => ("révision du plan", Tab::Run),
                     AssistantKind::Edit => ("modification", self.tab),
                     AssistantKind::Debrief => ("compte rendu", Tab::Company),
-                    AssistantKind::Escalation => ("discussion avec le CEO", Tab::Run),
                 };
                 (Some(k), args, title.to_string(), origin)
             }
@@ -1303,8 +1396,9 @@ impl App {
             self.key_checkpoint(k);
             return;
         }
-        if self.escalation.is_some() && self.tab == Tab::Run {
-            self.key_escalation(k);
+        self.prune_requests();
+        if self.request_shown() {
+            self.key_request(k);
             return;
         }
         self.status.clear();
@@ -1506,6 +1600,11 @@ impl App {
                 }
                 if k.code == KeyCode::Char('p') && self.running() {
                     self.toggle_pause();
+                    return;
+                }
+                // `d` : rouvre le panneau des demandes à l'humain mis de côté.
+                if k.code == KeyCode::Char('d') && !self.requests.is_empty() {
+                    self.requests_hidden = false;
                     return;
                 }
                 if self.show_history {
@@ -2230,7 +2329,27 @@ impl App {
         });
         self.run_ctx = Some((company.clone(), mission.dir.clone()));
         let agents = self.agents.clone();
-        let opts = CompanyOptions { base_dir: self.root.clone(), mission_dir: Some(mission.dir.clone()), lang: self.lang, resume: resume && mission.resumable, pause: gate.clone() };
+        // Bus des demandes à l'humain : les agents y arrivent par l'outil `ask_human` de leur serveur MCP.
+        // S'il ne peut pas s'ouvrir, le run part quand même : les agents n'ont simplement pas l'outil.
+        let bus = match crate::runtime::bus::Bus::start(rtx.clone(), Some(mission.dir.join(missions::NOTES_DIR)), self.lang, gate.clone()) {
+            Ok(b) => {
+                b.trust_sandbox(&self.root);
+                Some(b)
+            }
+            Err(e) => {
+                self.status = tf!("⚠ demandes à l'humain indisponibles : {e:#}", "⚠ requests to the human unavailable: {e:#}");
+                None
+            }
+        };
+        let opts = CompanyOptions {
+            base_dir: self.root.clone(),
+            mission_dir: Some(mission.dir.clone()),
+            lang: self.lang,
+            resume: resume && mission.resumable,
+            pause: gate.clone(),
+            access: self.settings.access(),
+            bus: bus.clone(),
+        };
         if let Some(p) = mission.pause.filter(|_| gate.paused()) {
             self.status = tf!(
                 "mission reprise, encore en pause (limite d'abonnement) : reprise {} · p reprend sans attendre",
@@ -2246,7 +2365,7 @@ impl App {
         let dir = mission.dir.display().to_string();
         let lang = self.lang;
         tokio::spawn(async move {
-            let result = run_mission(&company, &agents, &brief, &opts, claude_runner(std::time::Duration::from_secs(company.node_timeout_s)), rtx, cancel_rx).await;
+            let result = run_mission(&company, &agents, &brief, &opts, claude_runner(std::time::Duration::from_secs(company.node_timeout_s), bus), rtx, cancel_rx).await;
             settings::set_current(lang);
             match result {
                 Ok(out) => {
@@ -2274,14 +2393,12 @@ impl App {
         }
         if let RunEvent::Checkpoint { plan, reply } = ev {
             self.checkpoint = Some(CheckpointState { plan, reply, scroll: 0 });
-            self.status = tr("plan consolidé prêt : Entrée lance la réalisation, Échap l'arrête", "consolidated plan ready: Enter starts realisation, Esc stops it").into();
+            self.status = tr("plan prêt : Entrée lance la réalisation, Échap l'arrête", "plan ready: Enter starts realisation, Esc stops it").into();
             self.set_tab(Tab::Run);
             return;
         }
-        if let RunEvent::Escalation { summary, reply } = ev {
-            self.escalation = Some(EscalationState { summary, reply, scroll: 0 });
-            self.status = tr("mission bloquée : e discute avec le CEO, Entrée relance la correction, Échap arrête", "mission blocked: e talks with the CEO, Enter retries the correction, Esc stops").into();
-            self.set_tab(Tab::Run);
+        if let RunEvent::HumanRequest(req) = ev {
+            self.on_human_request(req);
             return;
         }
         if let RunEvent::Paused { why, resets_at } = &ev {
@@ -2302,7 +2419,8 @@ impl App {
             return;
         }
         if matches!(ev, RunEvent::RunFinished { .. }) {
-            self.escalation = None;
+            self.requests.clear(); // plus personne n'attend de réponse
+            self.requests_hidden = false;
             self.checkpoint = None; // run terminé ou annulé pendant l'attente
             self.write_compte_rendu(&ev);
             self.missions = missions::list(&self.root); // conception.md / rapport.md viennent d'apparaître
@@ -2333,7 +2451,7 @@ impl App {
                     }
                 }
             }
-            RunEvent::Checkpoint { .. } | RunEvent::Escalation { .. } | RunEvent::Paused { .. } | RunEvent::Resumed => {} // traités avant le match
+            RunEvent::Checkpoint { .. } | RunEvent::HumanRequest(_) | RunEvent::Paused { .. } | RunEvent::Resumed => {} // traités avant le match
             RunEvent::NodeStarted { id } => {
                 if let Some(i) = node(run, &id) {
                     run.nodes[i].state = NodeState::Running;

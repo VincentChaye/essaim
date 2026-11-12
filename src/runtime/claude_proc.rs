@@ -42,6 +42,10 @@ pub enum ClaudeEvent {
     Usage { id: String, tokens: u64, volume: u64, cached: u64 },
     /// Quota de l'abonnement (`rate_limit_event`) : utilisation en fraction 0..1 des fenêtres 5 h et 7 j, reset en secondes epoch.
     RateLimit { five_hour: Option<f64>, seven_day: Option<f64>, resets_at: Option<u64> },
+    /// Demande de `claude` à son hôte (`control_request`) : il attend un `control_response` sur stdin et ne
+    /// fait rien d'autre d'ici là. `subtype` vaut `can_use_tool` pour une demande de permission ; `tool`
+    /// est alors l'outil (ou `SandboxNetworkAccess` pour un domaine réseau demandé depuis le bac à sable).
+    Control { request_id: String, subtype: String, tool: String, input: Value },
     /// Ligne ignorée ou non reconnue.
     Other,
 }
@@ -259,6 +263,9 @@ struct RawLine {
     #[serde(deserialize_with = "lenient::array")]
     permission_denials: Option<Vec<RawDenial>>,
     rate_limit_info: Option<RawRateInfo>,
+    #[serde(deserialize_with = "lenient::string")]
+    request_id: Option<String>,
+    request: Option<Value>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -430,6 +437,15 @@ pub fn parse_line(line: &str) -> Result<Vec<ClaudeEvent>> {
                     _ => None,
                 }))
                 .collect()
+        }
+        Some("control_request") => {
+            let r = v.request.unwrap_or_default();
+            vec![ClaudeEvent::Control {
+                request_id: v.request_id.unwrap_or_default(),
+                subtype: r["subtype"].as_str().unwrap_or_default().to_string(),
+                tool: r["tool_name"].as_str().unwrap_or_default().to_string(),
+                input: r["input"].clone(),
+            }]
         }
         Some("rate_limit_event") => {
             let info = v.rate_limit_info.unwrap_or_default();
@@ -638,6 +654,12 @@ pub struct RunSpec {
     pub append_system_prompt: Option<String>,
     /// `--json-schema` : schéma de la sortie structurée.
     pub json_schema: Option<String>,
+    /// `--mcp-config` : le serveur MCP d'essaim (demandes à l'humain), seul serveur de la session.
+    pub mcp_config: Option<String>,
+    /// `--permission-prompt-tool` : outil MCP qui reçoit les demandes de permission (profil protégé).
+    pub permission_prompt_tool: Option<String>,
+    /// `--settings` : réglages ajoutés pour cet appel (bac à sable du profil protégé).
+    pub settings: Option<String>,
 }
 
 impl RunSpec {
@@ -682,6 +704,16 @@ impl RunSpec {
         // machine — mesuré : prompt système de 9,3 k au lieu de ~1,5 k, relu à chaque tour — et le
         // `model` ou `autoContinueAtUsageLimit` de l'utilisateur écrase les choix d'essaim.
         a.extend(["--strict-mcp-config".into(), "--setting-sources".into(), "project,local".into()]);
+        // Le seul serveur MCP admis est celui d'essaim : c'est par lui qu'un agent s'adresse à l'humain.
+        if let Some(m) = &self.mcp_config {
+            a.extend(["--mcp-config".into(), m.clone()]);
+        }
+        if let Some(t) = &self.permission_prompt_tool {
+            a.extend(["--permission-prompt-tool".into(), t.clone()]);
+        }
+        if let Some(st) = &self.settings {
+            a.extend(["--settings".into(), st.clone()]);
+        }
         a.extend(self.common_args());
         if let Some(b) = self.max_budget_usd {
             a.extend(["--max-budget-usd".into(), b.to_string()]);
@@ -849,6 +881,16 @@ impl ClaudeProc {
         self.write_line(&user_message_line(text)).await
     }
 
+    /// Répond à un `control_request`. `body` : la décision (`{"behavior":"allow",…}` ou `{"behavior":"deny",…}`) ;
+    /// `None` : demande que l'hôte ne sait pas traiter, rendue en erreur pour que `claude` n'attende pas.
+    pub async fn send_control_response(&mut self, request_id: &str, body: Option<Value>) -> Result<()> {
+        let response = match body {
+            Some(b) => serde_json::json!({"subtype": "success", "request_id": request_id, "response": b}),
+            None => serde_json::json!({"subtype": "error", "request_id": request_id, "error": "unsupported control request"}),
+        };
+        self.write_line(&format!("{}\n", serde_json::json!({"type": "control_response", "response": response}))).await
+    }
+
     async fn write_line(&mut self, line: &str) -> Result<()> {
         let w = self.stdin.as_mut().context("stdin déjà fermé")?;
         w.write_all(line.as_bytes()).await?;
@@ -895,6 +937,19 @@ impl ClaudeProc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Demande de `claude` à son hôte, telle que relevée sur 2.1.322 (domaine réseau depuis le bac à sable).
+    #[test]
+    fn demande_de_controle_lue() {
+        let line = r#"{"type":"control_request","request_id":"573a","request":{"subtype":"can_use_tool","tool_name":"SandboxNetworkAccess","display_name":"SandboxNetworkAccess","input":{"host":"example.com"},"tool_use_id":"d90e","description":"Allow network connection to example.com?"}}"#;
+        match &parse_line(line).unwrap()[..] {
+            [ClaudeEvent::Control { request_id, subtype, tool, input }] => {
+                assert_eq!((request_id.as_str(), subtype.as_str(), tool.as_str()), ("573a", "can_use_tool", "SandboxNetworkAccess"));
+                assert_eq!(input["host"], "example.com");
+            }
+            e => panic!("{e:?}"),
+        }
+    }
 
     #[test]
     fn parse_fixture_reelle() {
@@ -1046,6 +1101,14 @@ mod tests {
     fn reprise_de_session_dans_les_arguments() {
         let a = RunSpec { prompt: "p".into(), resume: Some("sid".into()), ..Default::default() }.args();
         assert!(a.windows(2).any(|w| w == ["--resume", "sid"]));
+        // Serveur MCP d'essaim, outil de permission et bac à sable : passés seulement s'ils sont demandés.
+        let nu = RunSpec::default().args();
+        assert!(!nu.iter().any(|x| x == "--mcp-config" || x == "--permission-prompt-tool" || x == "--settings"), "{nu:?}");
+        let m = RunSpec { mcp_config: Some("{}".into()), permission_prompt_tool: Some("mcp__essaim__permission".into()), settings: Some("{\"sandbox\":{}}".into()), ..Default::default() }.args();
+        assert!(m.windows(2).any(|w| w == ["--mcp-config", "{}"]), "{m:?}");
+        assert!(m.windows(2).any(|w| w == ["--permission-prompt-tool", "mcp__essaim__permission"]), "{m:?}");
+        assert!(m.windows(2).any(|w| w == ["--settings", "{\"sandbox\":{}}"]), "{m:?}");
+        assert!(m.iter().any(|x| x == "--strict-mcp-config"), "aucun autre serveur MCP que celui d'essaim");
         assert!(!RunSpec::default().args().iter().any(|x| x == "--resume"));
     }
 

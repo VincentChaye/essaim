@@ -1,6 +1,14 @@
-//! Exécution d'une mission par une entreprise d'agents : délégation en cascade (boss → … → workers),
-//! puis remontée de rapports synthétisés à chaque niveau. Chaque étape est un appel `claude -p`
-//! indépendant ; essaim orchestre les niveaux (les sous-agents natifs ont une profondeur limitée).
+//! Exécution d'une mission par une entreprise d'agents.
+//!
+//! 1. **Plan** : le boss écrit seul le plan (il lit le projet, le web, et pose ses questions à l'humain).
+//! 2. **Point de contrôle** : l'humain valide le plan.
+//! 3. **Réalisation** : une seule descente. Chaque supérieur découpe sa tâche et confie à chaque subordonné
+//!    sa part, avec des pointeurs vers le contexte utile ; les feuilles travaillent ; les rapports remontent.
+//! 4. **Revue** : le boss vérifie le résultat. Un écart est présenté à l'humain, qui décide.
+//!
+//! Tous les postes ont tous les outils. Un poste qui n'aboutit pas ne déclenche aucune boucle de correction :
+//! il s'adresse à l'humain (en cours de tâche par l'outil `ask_human`, ou par essaim s'il finit bloqué).
+//! Chaque étape est un appel `claude -p` indépendant ; essaim orchestre les niveaux.
 
 use crate::tui::settings::Lang;
 use std::path::PathBuf;
@@ -29,7 +37,7 @@ impl Phase {
     }
     fn name(self) -> &'static str {
         match self {
-            Phase::Conception => "design",
+            Phase::Conception => "plan",
             Phase::Realisation => "realisation",
         }
     }
@@ -40,12 +48,8 @@ enum Kind {
     Delegate,
     Work,
     Report,
-    /// Plan de correction après l'échec ou le blocage de subordonnés.
-    Fix,
-    /// Revue du résultat par le CEO : vérification contre l'objectif, éventuelle redescente.
+    /// Revue du résultat par le boss : vérification contre l'objectif. Elle constate, l'humain décide.
     Review,
-    /// Réponse d'un supérieur à la question d'un subordonné en cours de tâche.
-    Answer,
 }
 
 impl Kind {
@@ -54,14 +58,12 @@ impl Kind {
             Kind::Delegate => "delegate",
             Kind::Work => "work",
             Kind::Report => "report",
-            Kind::Fix => "fix",
             Kind::Review => "review",
-            Kind::Answer => "answer",
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CompanyOptions {
     /// Dossier du projet : répertoire de travail de tous les appels.
     pub base_dir: PathBuf,
@@ -73,6 +75,18 @@ pub struct CompanyOptions {
     pub resume: bool,
     /// Pause du run, partagée avec l'interface : la limite de l'abonnement la ferme, la reprise l'ouvre.
     pub pause: std::sync::Arc<crate::runtime::pause::Gate>,
+    /// Droits des agents : profil de sécurité et ouvertures du bac à sable.
+    pub access: crate::tui::settings::Access,
+    /// Bus des demandes à l'humain (serveur MCP d'essaim) ; absent = les agents n'ont pas l'outil `ask_human`.
+    pub bus: Option<std::sync::Arc<crate::runtime::bus::Bus>>,
+}
+
+#[cfg(test)]
+impl CompanyOptions {
+    /// Options d'un run de test : profil dédié, aucun bus (les agents n'ont pas l'outil de demande à l'humain).
+    pub fn plain(base_dir: PathBuf, mission_dir: Option<PathBuf>, lang: Lang) -> Self {
+        CompanyOptions { base_dir, mission_dir, lang, resume: false, pause: crate::runtime::pause::Gate::new(), access: crate::tui::settings::Access::dedicated(), bus: None }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -157,7 +171,7 @@ pub struct Assignment {
     pub model: Option<String>,
 }
 
-/// Ce qui empêche une tâche d'aboutir : le supérieur le lit pour corriger ou rediriger.
+/// Ce qui empêche une tâche d'aboutir : présenté à l'humain, et rappelé dans le rapport du supérieur.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Blocker {
     /// tests | permission | prerequisite | bug | scope | other
@@ -182,33 +196,20 @@ pub enum Status {
     Failed,
 }
 
-/// Interruptions (questions ou demandes de commande shell) qu'un employé peut faire pendant une même tâche (au-delà : il finit ou se déclare bloqué).
-const MAX_QUESTIONS: u32 = 3;
-
-/// Question cadrée d'un employé à son supérieur (sortie structurée, courte).
-#[derive(Debug, Clone, PartialEq)]
-struct Question {
-    kind: String,
-    text: String,
-    /// Commande shell exacte demandée (kind = permission).
-    command: String,
-    options: Vec<String>,
-}
-
 #[derive(Debug, Clone)]
 struct Outcome {
     status: Status,
     report: String,
     blockers: Vec<Blocker>,
-    /// L'employé attend une réponse avant de continuer (statut `Blocked` si personne ne peut le reprendre).
-    question: Option<Question>,
+    /// Session `claude` de l'appel : c'est elle qu'on reprend quand l'humain répond à un poste bloqué.
+    session: Option<String>,
 }
 
 impl Outcome {
     fn failed(msg: impl Into<String>) -> Self {
         let msg = msg.into();
         let detail = msg.lines().next().unwrap_or("").trim().to_string();
-        Outcome { status: Status::Failed, blockers: vec![Blocker { kind: "other".into(), detail, needs: String::new() }], report: msg, question: None }
+        Outcome { status: Status::Failed, blockers: vec![Blocker { kind: "other".into(), detail, needs: String::new() }], report: msg, session: None }
     }
 }
 
@@ -216,6 +217,8 @@ struct SeatOut {
     status: Status,
     text: String,
     blockers: Vec<Blocker>,
+    /// Le poste n'a pas fini mais l'humain a dit de continuer sans lui : les travaux suivants ne sont pas arrêtés.
+    waived: bool,
 }
 
 impl SeatOut {
@@ -237,7 +240,7 @@ impl SeatOut {
 
 impl From<Outcome> for SeatOut {
     fn from(o: Outcome) -> Self {
-        SeatOut { status: o.status, text: o.report, blockers: o.blockers }
+        SeatOut { status: o.status, text: o.report, blockers: o.blockers, waived: false }
     }
 }
 
@@ -245,7 +248,8 @@ impl From<Outcome> for SeatOut {
 /// et le statut est celui de la dernière étape exécutée (une étape non aboutie arrête les suivantes).
 fn join_steps(parts: Vec<(usize, SeatOut)>) -> SeatOut {
     let n = parts.len();
-    let last = parts.last().map(|(_, o)| o.status.clone()).unwrap_or(Status::Failed);
+    let last = parts.last().map(|(_, o)| o.status).unwrap_or(Status::Failed);
+    let waived = parts.last().is_some_and(|(_, o)| o.waived);
     let mut text = String::new();
     let mut blockers = vec![];
     for (i, o) in parts {
@@ -257,7 +261,7 @@ fn join_steps(parts: Vec<(usize, SeatOut)>) -> SeatOut {
         text.push('\n');
         blockers.extend(o.blockers);
     }
-    SeatOut { status: last, text: text.trim_end().to_string(), blockers }
+    SeatOut { status: last, text: text.trim_end().to_string(), blockers, waived }
 }
 
 // ---------------------------------------------------------------- moteur
@@ -270,16 +274,18 @@ mod tests {
     use crate::model::agent::AgentDef;
     use crate::model::company::Company;
     use crate::runtime::claude_proc::RunSpec;
-    use crate::runtime::executor::{EscalationReply, NodeResult, NodeStatus, RunEvent, Runner};
+    use crate::runtime::executor::{AskKind, HumanAnswer, HumanRequest, NodeResult, NodeStatus, RunEvent, Runner};
+    use crate::tui::settings::{Access, Settings};
     use serde_json::{Value, json};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use tokio::sync::{mpsc, watch};
     use std::time::Duration;
+    use tokio::sync::{mpsc, watch};
 
     const SRC: &str = r#"
 name = "acme"
 max_parallel = 4
+checkpoint = false
 
 [[seat]]
 id = "ceo"
@@ -307,7 +313,6 @@ title = "Backend Engineer"
 agent = "a"
 reports_to = "mgr"
 builds = true
-allow_bash = ["cargo test"]
 [[seat]]
 id = "dev2"
 title = "Frontend Engineer"
@@ -320,6 +325,9 @@ title = "Security Analyst"
 agent = "a"
 reports_to = "ciso"
 "#;
+
+    /// Flux de base de `SRC` : le plan (1), délégation et rapport des 4 postes internes (8), les 3 feuilles, la revue (1).
+    const BASE_CALLS: u32 = 13;
 
     fn agents() -> Vec<AgentDef> {
         vec![AgentDef { name: "a".into(), description: "d".into(), prompt: "p".into(), ..Default::default() }]
@@ -343,40 +351,51 @@ reports_to = "ciso"
         interrupted: Mutex<Vec<String>>,
     }
 
+    impl Probe {
+        fn started(&self) -> Vec<String> {
+            self.started.lock().unwrap().clone()
+        }
+        fn prompt(&self, id: &str) -> String {
+            self.prompts.lock().unwrap().iter().find(|(i, _, _)| i == id).unwrap_or_else(|| panic!("appel jamais lancé : {id}")).1.clone()
+        }
+        fn system(&self, id: &str) -> String {
+            self.prompts.lock().unwrap().iter().find(|(i, _, _)| i == id).unwrap_or_else(|| panic!("appel jamais lancé : {id}")).2.clone()
+        }
+        fn spec(&self, id: &str) -> RunSpec {
+            self.specs.lock().unwrap().iter().find(|(i, _)| i == id).unwrap_or_else(|| panic!("appel jamais lancé : {id}")).1.clone()
+        }
+        /// L'appel qui a repris la session d'un poste (réponse de l'humain, ou reprise après pause).
+        fn resumed(&self, prefix: &str) -> Option<RunSpec> {
+            self.specs.lock().unwrap().iter().find(|(id, s)| id.starts_with(prefix) && s.resume.is_some()).map(|(_, s)| s.clone())
+        }
+    }
+
     #[derive(Default, Clone)]
     struct Behavior {
         fail: Vec<&'static str>,
         /// seat → sous-ensemble de subordonnés à qui déléguer (sinon tous).
         only: Vec<(&'static str, Vec<&'static str>)>,
         bad_delegation: Vec<&'static str>,
+        /// Ces postes ratent leur première délégation seulement.
+        bad_delegation_once: Vec<&'static str>,
         /// Tous les subordonnés reçoivent le périmètre de leur supérieur (chevauchement total).
         overlap: bool,
         /// Ces postes attribuent un périmètre hors du leur.
         escape: Vec<&'static str>,
-        /// Ces appels se déclarent « blocked » à chaque fois.
+        /// Ces postes ne donnent aucun périmètre.
+        no_scope: Vec<&'static str>,
+        /// Ces postes joignent des pointeurs de contexte à leurs affectations.
+        context: Vec<&'static str>,
+        /// Ces appels se déclarent « blocked » à chaque fois (reprises comprises).
         blocked: Vec<&'static str>,
-        /// Ces appels se déclarent « blocked » à leur premier passage seulement.
+        /// Ces appels se déclarent « blocked » à leur premier passage ; la reprise de leur session aboutit.
         blocked_once: Vec<&'static str>,
-        /// Ces appels disent « done » mais ont subi un refus de permission.
-        deny: Vec<&'static str>,
-        /// Ces postes réassignent la correction à tous leurs subordonnés (sinon : ils remontent).
-        fix_assign: Vec<&'static str>,
-        /// Le CEO rejette sa première revue en relançant une redescente (la suivante accepte).
-        review_redo_once: bool,
-        /// Le CEO rejette toujours sa revue sans pouvoir rien relancer.
+        /// La première revue du boss ne valide pas le résultat (la suivante valide).
+        review_unmet_once: bool,
+        /// La revue du boss ne valide jamais le résultat.
         review_unmet: bool,
         /// (poste délégant, destinataire, modèle) : le délégant choisit le modèle de ce destinataire.
         models: Vec<(&'static str, &'static str, &'static str)>,
-        /// Ces appels posent une question à leur premier passage (session annoncée), puis finissent à la reprise.
-        ask: Vec<&'static str>,
-        /// Le supérieur répond « je ne sais pas » aux questions.
-        boss_cannot_answer: bool,
-        /// (appel, commande) : l'employé demande cette commande shell (kind permission) à son premier passage.
-        ask_perm: Vec<(&'static str, &'static str)>,
-        /// Ces appels subissent un refus « Bash(git status) » mais annoncent leur session (la reprise est possible).
-        deny_session: Vec<&'static str>,
-        /// (supérieur, décision) sur les demandes de commande : approve par défaut.
-        perm: Vec<(&'static str, &'static str)>,
         /// Ces appels butent sur la limite de l'abonnement à leur premier passage, puis se comportent normalement.
         limit_once: Vec<&'static str>,
         /// Ces appels ne rendent jamais de sortie structurée : seulement du texte libre (outil `StructuredOutput` en échec).
@@ -393,11 +412,21 @@ reports_to = "ciso"
         v["properties"]["assignments"]["items"]["properties"]["to"]["enum"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect()
     }
 
-    /// Périmètre du délégant, lu dans son prompt (« Ton périmètre de fichiers : `a`, `b`. »).
+    /// Périmètre du délégant, lu dans son prompt (« Your file scope: `a`, `b`. »).
     fn parent_scope(prompt: &str) -> Vec<String> {
         let Some(rest) = prompt.split("Your file scope: `").nth(1) else { return vec![] };
         let list = rest.split("`. ").next().unwrap_or("");
         list.split("`, `").map(String::from).collect()
+    }
+
+    /// Vrai au premier passage de `id` dans `seen`, faux ensuite.
+    fn first_time(seen: &Mutex<Vec<String>>, id: &str) -> bool {
+        let mut done = seen.lock().unwrap();
+        let first = !done.iter().any(|x| x == id);
+        if first {
+            done.push(id.to_string());
+        }
+        first
     }
 
     fn fake(p: Arc<Probe>, b: Behavior) -> Runner {
@@ -415,27 +444,15 @@ reports_to = "ciso"
                 p.now.fetch_sub(1, Ordering::SeqCst);
                 p.finished.lock().unwrap().push(job.id.clone());
                 p.timeline.lock().unwrap().push(format!("E:{}", job.id));
-                // `kind` = le type d'appel seul. L'identifiant peut porter un suffixe d'étape (« work@2 »)
-                // ou de reprise (« work#7 ») : on garde ce dernier, que des scénarios testent.
-                let (seat, kind) = {
-                    let parts: Vec<&str> = job.id.split('/').collect();
-                    let brut = parts[2];
-                    // « work@2#7 » → « work#7 » ; « work@2 » → « work ».
-                    let kind = match (brut.find('@'), brut.find('#')) {
-                        (Some(a), Some(h)) if h > a => format!("{}{}", &brut[..a], &brut[h..]),
-                        (Some(a), _) => brut[..a].to_string(),
-                        (None, _) => brut.to_string(),
-                    };
-                    (parts[0].to_string(), kind)
-                };
-                if b.limit_once.contains(&job.id.as_str()) && {
-                    let mut done = p.limited.lock().unwrap();
-                    let first = !done.contains(&job.id);
-                    if first {
-                        done.push(job.id.clone());
-                    }
-                    first
-                } {
+                // Identifiant : « poste/phase/type », avec un suffixe d'étape (« work@2 ») et de reprise (« work#7 »).
+                let parts: Vec<&str> = job.id.split('/').collect();
+                let (seat, brut) = (parts[0].to_string(), parts[2]);
+                let resumed = brut.contains('#');
+                let kind = brut.split(['@', '#']).next().unwrap_or(brut).to_string();
+                // Identifiant sans le suffixe de reprise : c'est lui que les scénarios désignent.
+                let base = job.id.split('#').next().unwrap_or(&job.id).to_string();
+                let session = Some(format!("sid-{seat}"));
+                if b.limit_once.contains(&base.as_str()) && first_time(&p.limited, &base) {
                     // Ce que renvoie `run_local` quand `claude` refuse l'appel faute de quota.
                     return Ok(NodeResult {
                         output: "Claude AI usage limit reached|1761580800".into(),
@@ -444,67 +461,36 @@ reports_to = "ciso"
                         ..Default::default()
                     });
                 }
-                if b.interrupt_once.contains(&job.id.as_str()) && {
-                    let mut done = p.interrupted.lock().unwrap();
-                    let first = !done.contains(&job.id);
-                    if first {
-                        done.push(job.id.clone());
-                    }
-                    first
-                } {
+                if b.interrupt_once.contains(&base.as_str()) && first_time(&p.interrupted, &base) {
                     // Ce que rend `run_local` quand l'agent s'arrête sur le prompt prioritaire de la pause.
                     return Ok(NodeResult {
                         output: "Fait : la moitié. Reste : l'autre.".into(),
                         tokens: 100,
                         session_id: Some("sid-pause".into()),
-                        interrupted: Some(crate::runtime::executor::Interrupted {
-                            session: Some("sid-pause".into()),
-                            note: "Fait : la moitié. Reste : l'autre.".into(),
-                            killed: false,
-                        }),
+                        interrupted: Some(crate::runtime::executor::Interrupted { session: Some("sid-pause".into()), note: "Fait : la moitié. Reste : l'autre.".into(), killed: false }),
                         ..Default::default()
                     });
                 }
-                if kind.starts_with("answer") && job.spec.json_schema.as_deref().is_some_and(|x| x.contains("\"decision\"")) {
-                    let d = b.perm.iter().find(|(s, _)| *s == seat).map(|(_, d)| *d).unwrap_or("approve");
-                    return Ok(NodeResult { structured: Some(json!({"decision": d, "reason": "r"})), output: "{}".into(), ..Default::default() });
+                if b.no_structured.contains(&base.as_str()) {
+                    return Ok(NodeResult { output: "analyse en texte libre : trois failles XSS".into(), session_id: session, ..Default::default() });
                 }
-                if kind.starts_with("answer") {
-                    let a = if b.boss_cannot_answer { json!({"can_answer": false, "answer": ""}) } else { json!({"can_answer": true, "answer": "snake_case"}) };
-                    return Ok(NodeResult { structured: Some(a), output: "{}".into(), ..Default::default() });
+                if b.fail.contains(&base.as_str()) {
+                    return Ok(NodeResult { output: "boum".into(), is_error: true, session_id: session, ..Default::default() });
                 }
-                if kind.starts_with("work#") {
-                    let o = json!({"status": "done", "report": format!("reprise({seat})")});
-                    return Ok(NodeResult { structured: Some(o), output: "ok".into(), session_id: Some("sid-1".into()), ..Default::default() });
-                }
-                if let (true, Some((_, cmd))) = (kind == "work", b.ask_perm.iter().find(|(id, _)| *id == job.id)) {
-                    let q = json!({"status": "question", "question": {"kind": "permission", "text": "besoin d'une commande", "command": cmd}});
-                    return Ok(NodeResult { structured: Some(q), output: "q".into(), session_id: Some("sid-1".into()), ..Default::default() });
-                }
-                if kind == "work" && b.deny_session.contains(&job.id.as_str()) {
-                    let o = json!({"status": "done", "report": "fait"});
-                    return Ok(NodeResult { structured: Some(o), output: "ok".into(), denials: vec!["Bash(rm -rf cache)".into()], session_id: Some("sid-1".into()), ..Default::default() });
-                }
-                if kind == "work" && b.ask.contains(&job.id.as_str()) {
-                    let q = json!({"status": "question", "question": {"kind": "decision", "text": "snake_case ou camelCase ?", "options": ["snake_case", "camelCase"]}});
-                    return Ok(NodeResult { structured: Some(q), output: "q".into(), session_id: Some("sid-1".into()), ..Default::default() });
-                }
-                if b.no_structured.contains(&job.id.as_str()) {
-                    return Ok(NodeResult { output: "analyse en texte libre : trois failles XSS".into(), ..Default::default() });
-                }
-                if b.fail.contains(&job.id.as_str()) {
-                    return Ok(NodeResult { output: "boum".into(), is_error: true, ..Default::default() });
-                }
+                let passage = {
+                    let mut seen = p.seen.lock().unwrap();
+                    let c = seen.entry(base.clone()).or_insert(0);
+                    *c += 1;
+                    *c
+                };
                 Ok(match kind.as_str() {
-                    "delegate" if b.bad_delegation.contains(&seat.as_str()) => NodeResult {
+                    "delegate" if b.bad_delegation.contains(&seat.as_str()) || (b.bad_delegation_once.contains(&seat.as_str()) && passage <= 2) => NodeResult {
                         structured: Some(json!({"assignments": [{"to": "inconnu", "task": "x", "scope": ["src/x/**"]}]})),
                         output: "{}".into(),
                         ..Default::default()
                     },
                     "delegate" => {
-                        let schema = job.spec.json_schema.as_deref().unwrap();
-                        let ids = enum_ids(schema);
-                        let with_scope = schema.contains("\"scope\"");
+                        let ids = enum_ids(job.spec.json_schema.as_deref().unwrap());
                         let parent = parent_scope(&job.spec.prompt);
                         let dir = parent.first().map(|s| s.trim_end_matches("/**").to_string()).filter(|s| s != "**").unwrap_or_else(|| "src".into());
                         let picked: Vec<String> = match b.only.iter().find(|(s, _)| *s == seat) {
@@ -518,7 +504,10 @@ reports_to = "ciso"
                                 if let Some((_, _, m)) = b.models.iter().find(|(from, to, _)| *from == seat && to == k) {
                                     a["model"] = json!(m);
                                 }
-                                if with_scope {
+                                if b.context.contains(&seat.as_str()) {
+                                    a["context"] = json!([format!("src/{k}.rs:10-40"), "https://exemple.fr/doc"]);
+                                }
+                                if !b.no_scope.contains(&seat.as_str()) {
                                     let sc = if b.escape.contains(&seat.as_str()) {
                                         "docs/**".to_string()
                                     } else if b.overlap {
@@ -544,70 +533,28 @@ reports_to = "ciso"
                         } else {
                             items
                         };
-                        NodeResult { structured: Some(json!({"assignments": items})), output: "{}".into(), tokens: 0, ..Default::default() }
+                        NodeResult { structured: Some(json!({"assignments": items})), output: "{}".into(), session_id: session, ..Default::default() }
                     }
                     "work" | "report" => {
-                        let n = {
-                            let mut seen = p.seen.lock().unwrap();
-                            let c = seen.entry(job.id.clone()).or_insert(0);
-                            *c += 1;
-                            *c
+                        let text = match (kind.as_str(), resumed) {
+                            ("work", true) => format!("reprise({seat})"),
+                            ("work", false) => format!("travail({seat})"),
+                            _ => format!("rapport({seat})"),
                         };
-                        let text = if kind == "work" { format!("travail({seat})") } else { format!("rapport({seat})") };
-                        let blocked = b.blocked.contains(&job.id.as_str()) || (n == 1 && b.blocked_once.contains(&job.id.as_str()));
+                        let blocked = b.blocked.contains(&base.as_str()) || (!resumed && b.blocked_once.contains(&base.as_str()));
                         let structured = if blocked {
                             json!({"status": "blocked", "report": text, "blockers": [{"kind": "tests", "detail": format!("tests rouges chez {seat}"), "needs": "corriger"}]})
                         } else {
                             json!({"status": "done", "report": text, "blockers": []})
                         };
-                        let denials = if b.deny.contains(&job.id.as_str()) { vec!["Bash(git status)".to_string()] } else { vec![] };
-                        NodeResult { structured: Some(structured), output: text, denials, ..Default::default() }
+                        NodeResult { structured: Some(structured), output: text, session_id: session, ..Default::default() }
                     }
                     "review" => {
-                        let n = {
-                            let mut seen = p.seen.lock().unwrap();
-                            let c = seen.entry(job.id.clone()).or_insert(0);
-                            *c += 1;
-                            *c
-                        };
-                        if b.review_unmet {
-                            NodeResult { structured: Some(json!({"accepted": false, "findings": "critère X non atteint"})), output: "{}".into(), ..Default::default() }
-                        } else if b.review_redo_once && n == 1 {
-                            let schema = job.spec.json_schema.as_deref().unwrap();
-                            let with_scope = schema.contains("\"scope\"");
-                            let items: Vec<Value> = enum_ids(schema)
-                                .iter()
-                                .map(|k| {
-                                    let mut a = json!({"to": k, "task": format!("complément pour {k}")});
-                                    if with_scope {
-                                        a["scope"] = json!([format!("src/{k}/**")]);
-                                    }
-                                    a
-                                })
-                                .collect();
-                            NodeResult { structured: Some(json!({"accepted": false, "findings": "il manque un livrable", "assignments": items})), output: "{}".into(), ..Default::default() }
-                        } else {
-                            NodeResult { structured: Some(json!({"accepted": true, "findings": "ok"})), output: "{}".into(), ..Default::default() }
-                        }
+                        let unmet = b.review_unmet || (b.review_unmet_once && passage == 1);
+                        let v = if unmet { json!({"accepted": false, "findings": "critère X non atteint"}) } else { json!({"accepted": true, "findings": "ok"}) };
+                        NodeResult { structured: Some(v), output: "{}".into(), session_id: session, ..Default::default() }
                     }
-                    "fix" if b.fix_assign.contains(&seat.as_str()) => {
-                        let schema = job.spec.json_schema.as_deref().unwrap();
-                        let with_scope = schema.contains("\"scope\"");
-                        let parent = parent_scope(&job.spec.prompt);
-                        let dir = parent.first().map(|s| s.trim_end_matches("/**").to_string()).filter(|s| s != "**").unwrap_or_else(|| "src".into());
-                        let items: Vec<Value> = enum_ids(schema)
-                            .iter()
-                            .map(|k| {
-                                let mut a = json!({"to": k, "task": format!("correctif pour {k}")});
-                                if with_scope {
-                                    a["scope"] = json!([format!("{dir}/{k}/**")]);
-                                }
-                                a
-                            })
-                            .collect();
-                        NodeResult { structured: Some(json!({"plan": "plan de correction", "assignments": items})), output: "{}".into(), ..Default::default() }
-                    }
-                    _ => NodeResult { structured: Some(json!({"plan": "personne ne peut corriger ici", "escalate": "aucun poste compétent dans cette branche"})), output: "{}".into(), ..Default::default() },
+                    k => panic!("type d'appel inattendu : {k} ({})", job.id),
                 })
             })
         })
@@ -621,8 +568,13 @@ reports_to = "ciso"
         mission_dir: Option<PathBuf>,
         cancel_after_ms: Option<u64>,
         resume: bool,
-        /// Réponses successives aux escalades vers l'utilisateur (défaut : arrêter).
-        escalations: Vec<EscalationReply>,
+        /// Réponses successives de l'humain aux demandes ; une fois épuisées, plus personne ne répond.
+        humans: Vec<HumanAnswer>,
+        access: Option<Access>,
+    }
+
+    fn options(cfg: &Cfg) -> CompanyOptions {
+        CompanyOptions { resume: cfg.resume, access: cfg.access.clone().unwrap_or_else(Access::dedicated), ..CompanyOptions::plain(std::env::temp_dir(), cfg.mission_dir.clone(), Lang::Fr) }
     }
 
     async fn run_cfg(c: &Company, p: Arc<Probe>, b: Behavior, cfg: Cfg) -> (MissionOutcome, Vec<RunEvent>) {
@@ -631,14 +583,17 @@ reports_to = "ciso"
         let events = Arc::new(Mutex::new(Vec::<RunEvent>::new()));
         let ev2 = events.clone();
         let answer = cfg.answer;
-        let mut script = cfg.escalations.clone().into_iter();
+        let mut script = cfg.humans.clone().into_iter();
         let collector = tokio::spawn(async move {
             while let Some(e) = rx.recv().await {
                 if let (RunEvent::Checkpoint { reply, .. }, Some(a)) = (&e, answer) {
                     let _ = reply.send(a);
                 }
-                if let RunEvent::Escalation { reply, .. } = &e {
-                    let _ = reply.send(script.next().unwrap_or(EscalationReply::Stop));
+                if let RunEvent::HumanRequest(req) = &e {
+                    let _ = req.reply.send(match script.next() {
+                        Some(a) => vec![a],
+                        None => req.unattended(),
+                    });
                 }
                 ev2.lock().unwrap().push(e);
             }
@@ -650,32 +605,30 @@ reports_to = "ciso"
                 let _ = ctx.send(true);
             });
         }
-        let opts = CompanyOptions { base_dir: std::env::temp_dir(), mission_dir: cfg.mission_dir.clone(), lang: Lang::Fr, resume: cfg.resume, pause: crate::runtime::pause::Gate::new() };
-        let out = run_mission(c, &agents(), "Brief de test", &opts, fake(p, b), tx, crx).await.unwrap();
+        let out = run_mission(c, &agents(), "Brief de test", &options(&cfg), fake(p, b), tx, crx).await.unwrap();
         collector.await.unwrap();
         drop(ctx);
         let evs = std::mem::take(&mut *events.lock().unwrap());
         (out, evs)
     }
 
-    async fn run(c: &Company, p: Arc<Probe>, b: Behavior, cancel: bool) -> (MissionOutcome, Vec<RunEvent>) {
-        run_cfg(c, p, b, Cfg { cancel_at_start: cancel, answer: Some(true), ..Default::default() }).await
+    async fn run(c: &Company, p: Arc<Probe>, b: Behavior) -> (MissionOutcome, Vec<RunEvent>) {
+        run_cfg(c, p, b, Cfg::default()).await
     }
 
-    /// Organigramme sans poste de réalisation : conception seule.
+    /// Demandes adressées à l'humain pendant un run.
+    fn requests(evs: &[RunEvent]) -> Vec<HumanRequest> {
+        evs.iter().filter_map(|e| if let RunEvent::HumanRequest(r) = e { Some(r.clone()) } else { None }).collect()
+    }
+
+    /// Organigramme de test, sans point de contrôle.
     fn company() -> Company {
-        let mut c = Company::parse(SRC).unwrap();
-        for s in &mut c.seats {
-            s.builds = false;
-            s.allow_bash.clear();
-        }
-        c
+        Company::parse(SRC).unwrap()
     }
 
-    /// Organigramme avec dev1/dev2 en réalisation, sans point de contrôle.
-    fn company_build() -> Company {
-        let mut c = Company::parse(SRC).unwrap();
-        c.checkpoint = false;
+    fn company_checkpoint() -> Company {
+        let mut c = company();
+        c.checkpoint = true;
         c
     }
 
@@ -683,7 +636,8 @@ reports_to = "ciso"
         std::env::temp_dir().join(format!("essaim-mission-{}", uuid::Uuid::new_v4()))
     }
 
-    /// Un verrou du coût empoisonné par une panique ailleurs reste utilisable (pas de panic en chaîne).
+    // ----------------------------------------------------------- schémas et lectures
+
     #[test]
     fn gabarit_de_reponse_schema_et_lecture() {
         let secs = Section::template([
@@ -694,13 +648,15 @@ reports_to = "ciso"
         assert_eq!(secs.len(), 2);
         assert_ne!(secs[0].key, secs[1].key, "clés uniques");
         assert_eq!((secs[0].max_chars, secs[1].max_chars), (MAX_SECTION_CHARS, MIN_SECTION_CHARS), "tailles bornées");
-        let v: serde_json::Value = serde_json::from_str(&schema::outcome_schema(&secs, false)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&schema::outcome_schema(&secs)).unwrap();
         assert!(v["properties"]["report"].is_null());
         let champ = &v["properties"]["sections"]["properties"][&secs[0].key];
         // Aucune borne dans le schéma : elle ferait échouer l'outil `StructuredOutput` au moindre dépassement.
         assert!(champ["maxLength"].is_null(), "taille jamais imposée par le schéma");
         assert!(champ["description"].as_str().unwrap().contains("1000 chars"), "budget annoncé au modèle");
         assert_eq!(v["required"], json!(["status", "sections"]));
+        // Plus de statut « question » : une question se pose à l'humain par l'outil, pendant la tâche.
+        assert_eq!(v["properties"]["status"]["enum"], json!(["done", "blocked", "failed"]));
         let r = NodeResult { structured: Some(json!({"status": "done", "sections": {secs[0].key.clone(): "r1"}})), ..Default::default() };
         let o = parse_outcome(&r, &secs).unwrap();
         assert_eq!(o.report, "### Risques\nr1\n\n### Risques\n—", "ordre du gabarit, section vide visible");
@@ -713,6 +669,99 @@ reports_to = "ciso"
         assert!(Section::template((0..10).map(|i| (format!("s{i}"), String::new(), None))).len() <= MAX_SECTIONS);
     }
 
+    #[test]
+    fn sortie_sans_statut_jamais_un_succes() {
+        let lu = |v: Value| parse_outcome(&NodeResult { structured: Some(v), session_id: Some("s".into()), ..Default::default() }, &[]);
+        assert!(lu(json!({"report": "fait"})).is_none(), "statut absent");
+        assert!(lu(json!({"status": "termine", "report": "fait"})).is_none(), "statut inconnu");
+        let o = lu(json!({"status": "blocked", "report": "le build casse"})).unwrap();
+        assert_eq!(o.status, Status::Blocked);
+        assert_eq!(o.blockers.len(), 1, "un blocage est toujours nommé, même si l'agent n'en liste pas");
+        assert_eq!(o.session.as_deref(), Some("s"), "la session suit le résultat : c'est elle qu'on reprend");
+        let o = parse_outcome(&NodeResult { is_error: true, output: "boum\nsuite".into(), ..Default::default() }, &[]).unwrap();
+        assert_eq!((o.status, o.blockers[0].detail.as_str()), (Status::Failed, "boum"));
+    }
+
+    #[test]
+    fn schema_restreint_aux_subordonnes_directs() {
+        let v: Value = serde_json::from_str(&delegation_schema(&["cto".to_string(), "ciso".to_string()])).unwrap();
+        let item = &v["properties"]["assignments"]["items"];
+        assert_eq!(item["properties"]["to"]["enum"], json!(["cto", "ciso"]));
+        assert_eq!(item["required"], json!(["to", "task"]), "le périmètre et le contexte sont facultatifs");
+        assert!(item["properties"]["context"].is_object() && item["properties"]["scope"].is_object());
+        let r: Value = serde_json::from_str(&review_schema()).unwrap();
+        assert_eq!(r["required"], json!(["accepted", "findings"]));
+        assert!(r["properties"]["assignments"].is_null(), "la revue constate, elle ne relance rien");
+    }
+
+    #[test]
+    fn lecture_des_affectations() {
+        let c = company();
+        let kids = c.children(c.root().unwrap());
+        let all = vec!["**".to_string()];
+        let v = json!({"assignments": [
+            {"to": "cto", "task": " étape 1 ", "context": ["src/api.rs:10-40", " ", "https://exemple.fr/doc"], "scope": ["src/api/**"]},
+            {"to": "inconnu", "task": "x"},
+            {"to": "ciso", "task": "  "},
+            {"to": "cto", "task": "étape 2", "scope": ["src/api/**", "docs/api.md"]},
+        ]});
+        let a = parse_assignments(&v, &c, &kids, &all).unwrap();
+        assert_eq!(a.len(), 1, "destinataire inconnu et tâche vide écartés, doublon regroupé");
+        assert_eq!(a[0].steps.len(), 2, "deux affectations au même poste = deux étapes");
+        // Les pointeurs voyagent avec l'étape qui les porte : le subordonné lit lui-même ce qu'ils désignent.
+        assert!(a[0].steps[0].starts_with("étape 1\n\nContext pointers") && a[0].steps[0].contains("- src/api.rs:10-40\n- https://exemple.fr/doc"), "{}", a[0].steps[0]);
+        assert_eq!(a[0].steps[1], "étape 2");
+        assert_eq!(a[0].task, "étape 1\n\nétape 2", "la tâche rappelée au supérieur ne porte pas les pointeurs");
+        assert_eq!(a[0].scope, vec!["src/api/**", "docs/api.md"]);
+        assert!(parse_assignments(&json!({"assignments": [{"to": "x", "task": "y"}]}), &c, &kids, &all).is_err());
+        assert!(parse_assignments(&json!({}), &c, &kids, &all).is_err());
+    }
+
+    /// Le périmètre ne donne plus de droits : il ordonne les travaux. Hors de celui du délégant, il est écarté.
+    #[test]
+    fn lecture_des_perimetres() {
+        let c = company();
+        let mgr = c.index_of("mgr").unwrap();
+        let kids = c.children(mgr);
+        let parent = vec!["src/api/**".to_string()];
+        let v = json!({"assignments": [
+            {"to": "dev1", "task": "t", "scope": ["./src/api/a/**", "docs/**", "../secret/**"]},
+            {"to": "dev2", "task": "t"},
+        ]});
+        let a = parse_assignments(&v, &c, &kids, &parent).unwrap();
+        assert_eq!(a[0].scope, vec!["src/api/a/**"], "normalisé ; hors périmètre et remontée écartés");
+        assert_eq!(a[1].scope, parent, "un poste qui réalise sans périmètre hérite de celui du délégant : il passera après les autres");
+        // Un poste d'analyse sans périmètre n'en a aucun : il ne retient personne.
+        let ciso = c.index_of("ciso").unwrap();
+        let a = parse_assignments(&json!({"assignments": [{"to": "sec", "task": "t"}]}), &c, &c.children(ciso), &parent).unwrap();
+        assert!(a[0].scope.is_empty());
+        // Un poste qui dirige une branche garde un périmètre : ses subordonnés en ont besoin pour se répartir.
+        let cto = c.index_of("cto").unwrap();
+        let a = parse_assignments(&json!({"assignments": [{"to": "mgr", "task": "t"}]}), &c, &c.children(cto), &parent).unwrap();
+        assert_eq!(a[0].scope, parent);
+    }
+
+    #[test]
+    fn lecture_de_la_revue() {
+        assert_eq!(parse_review(&json!({"accepted": true, "findings": "ok"})), Review::Accepted);
+        assert_eq!(parse_review(&json!({"accepted": false, "findings": " il manque X "})), Review::Unmet("il manque X".into()));
+        assert_eq!(parse_review(&json!({"findings": ""})), Review::Unmet("goal not reached".into()), "verdict absent : non validé");
+    }
+
+    #[test]
+    fn refus_de_realisation_signale() {
+        assert!(note_refus(Some(false)).is_some());
+        assert!(note_refus(Some(true)).is_none() && note_refus(None).is_none());
+    }
+
+    #[test]
+    fn rapport_tronque_les_gros_resultats() {
+        let gros = "x".repeat(MAX_CHILD_CHARS * 2);
+        let p = report_prompt("t", &[("T".into(), "id".into(), "sous-tâche".into(), true, gros)], &[]);
+        assert!(p.contains("chars omitted") && p.len() < MAX_CHILD_CHARS * 2);
+    }
+
+    /// Un verrou du coût empoisonné par une panique ailleurs reste utilisable (pas de panic en chaîne).
     #[test]
     fn compteur_de_cout_reste_utilisable_apres_empoisonnement() {
         let cost = Arc::new(Mutex::new(5u64));
@@ -727,6 +776,518 @@ reports_to = "ciso"
         assert_eq!(*super::shared::cost_guard(&cost), 6);
     }
 
+    // ----------------------------------------------------------- plan puis descente unique
+
+    #[tokio::test]
+    async fn le_boss_planifie_seul_puis_une_seule_descente() {
+        let p = Arc::new(Probe::default());
+        let (out, evs) = run(&company(), p.clone(), Behavior::default()).await;
+        assert!(out.ok, "{out:?}");
+        assert_eq!(out.report, "rapport(ceo)");
+        let started = p.started();
+        assert_eq!(started.len() as u32, BASE_CALLS, "{started:?}");
+        assert_eq!(out.calls, BASE_CALLS);
+        assert_eq!(c_estimate(&company()), BASE_CALLS, "l'estimation annonce le flux de base");
+        // Le plan : un appel, celui du boss. Personne d'autre ne « conçoit ».
+        assert_eq!(started.iter().filter(|id| id.contains("/conception/")).cloned().collect::<Vec<_>>(), vec!["ceo/conception/work"]);
+        assert_eq!(started[0], "ceo/conception/work", "le plan précède toute délégation");
+        assert_eq!(out.conception.report, "travail(ceo)", "le plan est le livrable du boss");
+        // La descente mobilise tout l'organigramme, postes d'analyse compris.
+        for id in ["ceo/realisation/delegate", "mgr/realisation/delegate", "dev1/realisation/work", "sec/realisation/work", "ciso/realisation/report", "ceo/realisation/review", "ceo/realisation/report"] {
+            assert!(started.iter().any(|s| s == id), "{id} absent : {started:?}");
+        }
+        assert!(out.realisation.is_some() && out.approved == Some(true));
+        assert!(requests(&evs).is_empty(), "rien n'a bloqué : aucune demande à l'humain");
+        assert!(matches!(evs.last(), Some(RunEvent::RunFinished { ok: true, .. })));
+    }
+
+    fn c_estimate(c: &Company) -> u32 {
+        c.estimate_calls().total()
+    }
+
+    #[tokio::test]
+    async fn le_plan_demande_les_questions_avant_d_ecrire_et_part_au_boss() {
+        let p = Arc::new(Probe::default());
+        run(&company(), p.clone(), Behavior::default()).await;
+        let plan = p.prompt("ceo/conception/work");
+        assert!(plan.contains("BEFORE writing, ask the human") && plan.contains("mcp__essaim__ask_human"), "{plan}");
+        assert!(plan.contains("Backend Engineer") && plan.contains("Security Analyst"), "le boss voit tout l'organigramme pour répartir : {plan}");
+        assert!(p.system("ceo/conception/work").contains("PLAN PHASE"));
+        // Le plan validé revient au boss pour la descente.
+        let root = p.prompt("ceo/realisation/delegate");
+        assert!(root.contains("approved by the human") && root.contains("travail(ceo)"), "{root}");
+    }
+
+    #[tokio::test]
+    async fn ordre_haut_en_bas_puis_bas_en_haut() {
+        let p = Arc::new(Probe::default());
+        run(&company(), p.clone(), Behavior::default()).await;
+        let started = p.started();
+        let finished = p.finished.lock().unwrap().clone();
+        let s = |id: &str| started.iter().position(|x| x == id).unwrap_or_else(|| panic!("{id} jamais lancé : {started:?}"));
+        let f = |id: &str| finished.iter().position(|x| x == id).unwrap();
+        assert!(f("ceo/conception/work") < s("ceo/realisation/delegate"));
+        assert!(f("ceo/realisation/delegate") < s("cto/realisation/delegate"));
+        assert!(f("cto/realisation/delegate") < s("mgr/realisation/delegate"));
+        assert!(f("mgr/realisation/delegate") < s("dev1/realisation/work"));
+        assert!(f("dev1/realisation/work") < s("mgr/realisation/report"));
+        assert!(f("dev2/realisation/work") < s("mgr/realisation/report"));
+        assert!(f("mgr/realisation/report") < s("cto/realisation/report"));
+        assert!(f("sec/realisation/work") < s("ciso/realisation/report"));
+        assert!(f("cto/realisation/report") < s("ceo/realisation/review"), "la revue porte sur les résultats remontés");
+        assert!(f("ceo/realisation/review") < s("ceo/realisation/report"));
+    }
+
+    #[tokio::test]
+    async fn entreprise_d_un_seul_poste_le_boss_planifie_puis_realise() {
+        let c = Company::parse("name = \"solo\"\ncheckpoint = false\n[[seat]]\nid = \"ceo\"\ntitle = \"CEO\"\nagent = \"a\"\n").unwrap();
+        let p = Arc::new(Probe::default());
+        let (out, evs) = run(&c, p.clone(), Behavior::default()).await;
+        assert!(out.ok);
+        assert_eq!(p.started(), vec!["ceo/conception/work", "ceo/realisation/work"], "ni délégation, ni rapport, ni revue");
+        assert_eq!(c_estimate(&c), 2);
+        assert!(p.system("ceo/realisation/work").contains("You carry out the work in the project yourself"));
+        assert!(p.prompt("ceo/realisation/work").contains("Carry it out in the project"));
+        assert!(evs.iter().any(|e| matches!(e, RunEvent::Label { label, .. } if label == "CEO · builds ⚒")));
+    }
+
+    // ----------------------------------------------------------- distribution de l'information
+
+    #[tokio::test]
+    async fn chaque_poste_recoit_sa_tache_et_va_chercher_le_reste() {
+        let dir = tmpdir();
+        let p = Arc::new(Probe::default());
+        let b = Behavior { context: vec!["mgr"], ..Default::default() };
+        // La mission est rangée dans le projet (ici le dossier temporaire) : les chemins annoncés aux postes sont relatifs.
+        let (out, _) = run_cfg(&company(), p.clone(), b, Cfg { mission_dir: Some(dir.clone()), ..Default::default() }).await;
+        assert!(out.ok);
+        let nom = dir.file_name().unwrap().to_str().unwrap().to_string();
+
+        // Le brief ne va qu'au boss ; un autre poste sait seulement où le trouver s'il en a besoin.
+        let sys = p.system("mgr/realisation/delegate");
+        assert!(p.system("ceo/realisation/delegate").contains("Brief de test"), "le boss garde le brief");
+        assert!(!sys.contains("Brief de test"), "le brief ne descend pas sous le boss");
+        assert!(sys.contains("You do not see the company brief") && sys.contains(&format!("the brief is `{nom}/brief.md`")), "{sys}");
+        assert!(sys.contains("Engineering Manager") && sys.contains("N-2") && sys.contains("CEO → CTO → Engineering Manager (you)"));
+        assert!(sys.contains("dev1 · Backend Engineer · builds in the project"), "{sys}");
+
+        // Un fait se cherche, une intention se demande à l'humain, on ne demande rien au supérieur.
+        for regle in ["a FACT", "you look up yourself", "An INTENT", "mcp__essaim__ask_human", "Never ask your supervisor anything", "at most two attempts at the same failure"] {
+            assert!(sys.contains(regle), "règle absente de la fiche de poste : {regle}");
+        }
+        // Notes partagées et décisions de l'humain : annoncées à tous, créées avec la mission.
+        assert!(sys.contains(&format!("`{nom}/notes/`")) && sys.contains(&format!("`{nom}/notes/decisions.md`")), "{sys}");
+        assert!(dir.join("notes").is_dir(), "dossier de notes créé au lancement");
+
+        // Le délégant donne des pointeurs, pas des copies ; ils arrivent dans la tâche du subordonné.
+        let del = p.prompt("mgr/realisation/delegate");
+        assert!(del.contains("`context`") && del.contains("instead of copying their content"), "{del}");
+        let work = p.prompt("dev1/realisation/work");
+        assert!(work.contains("task for dev1") && work.contains("Context pointers from your supervisor") && work.contains("- src/dev1.rs:10-40"), "{work}");
+        // Le rapport du supérieur rappelle la tâche, sans les pointeurs.
+        let rep = p.prompt("mgr/realisation/report");
+        assert!(rep.contains("travail(dev1)") && rep.contains("travail(dev2)") && rep.contains("Assigned task: task for dev1") && !rep.contains("src/dev1.rs"), "{rep}");
+        let ceo = p.prompt("ceo/realisation/report");
+        assert!(ceo.contains("rapport(cto)") && ceo.contains("rapport(ciso)"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn un_poste_qui_realise_et_un_poste_qui_conseille_n_ont_pas_la_meme_consigne() {
+        let p = Arc::new(Probe::default());
+        run(&company(), p.clone(), Behavior::default()).await;
+        assert!(p.prompt("dev1/realisation/work").contains("Carry it out in the project"));
+        assert!(p.system("dev1/realisation/work").contains("File scope assigned to you: src/cto/mgr/dev1/**"));
+        let sec = p.prompt("sec/realisation/work");
+        assert!(sec.contains("Produce your deliverable") && !sec.contains("Carry it out"), "{sec}");
+        assert!(p.system("sec/realisation/work").contains("You analyse and advise"));
+        assert!(p.system("cto/realisation/delegate").contains("You coordinate"));
+    }
+
+    // ----------------------------------------------------------- droits
+
+    #[tokio::test]
+    async fn tous_les_postes_ont_tous_les_outils_sans_aucun_refus() {
+        let p = Arc::new(Probe::default());
+        run(&company(), p.clone(), Behavior::default()).await;
+        for id in ["ceo/conception/work", "ceo/realisation/delegate", "mgr/realisation/delegate", "dev1/realisation/work", "sec/realisation/work", "mgr/realisation/report", "ceo/realisation/review"] {
+            let s = p.spec(id);
+            assert_eq!(s.tools.as_deref(), Some("Read,Grep,Glob,Edit,Write,Bash,WebSearch,WebFetch"), "{id}");
+            assert_eq!(s.permission_mode.as_deref(), Some("bypassPermissions"), "{id} : profil dédié, rien n'est refusé");
+            assert!(s.allowed_tools.is_empty() && s.settings.is_none() && s.permission_prompt_tool.is_none(), "{id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn profil_protege_bac_a_sable_et_demandes_a_l_humain() {
+        let p = Arc::new(Probe::default());
+        let cfg = Cfg { access: Some(Settings::default().access()), ..Default::default() };
+        run_cfg(&company(), p.clone(), Behavior::default(), cfg).await;
+        let s = p.spec("dev1/realisation/work");
+        assert_eq!(s.tools.as_deref(), Some("Read,Grep,Glob,Edit,Write,Bash,WebSearch,WebFetch"), "mêmes outils : c'est la machine qui est protégée");
+        assert_eq!(s.permission_mode.as_deref(), Some("acceptEdits"));
+        assert_eq!(s.allowed_tools, vec!["WebSearch"]);
+        let v: Value = serde_json::from_str(s.settings.as_deref().expect("réglages du bac à sable")).unwrap();
+        assert_eq!(v["sandbox"]["enabled"], true);
+        assert_eq!(v["permissions"]["blockReadsOutsideWorkingDirectories"], true);
+        // Sans bus (pas d'humain joignable), aucun outil de permission n'est annoncé : `claude` refuse de lui-même.
+        assert!(s.permission_prompt_tool.is_none() && s.mcp_config.is_none());
+    }
+
+    #[tokio::test]
+    async fn la_liste_d_outils_de_l_agent_ne_restreint_plus_le_poste() {
+        let p = Arc::new(Probe::default());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (_ctx, crx) = watch::channel(false);
+        let ag = vec![AgentDef { name: "a".into(), description: "d".into(), prompt: "p".into(), tools: Some(vec!["Read".into()]), ..Default::default() }];
+        run_mission(&company(), &ag, "Brief", &options(&Cfg::default()), fake(p.clone(), Behavior::default()), tx, crx).await.unwrap();
+        assert!(p.spec("dev1/realisation/work").agents["a"]["tools"].is_null(), "essaim équipe les postes, pas le fichier d'agent");
+    }
+
+    #[tokio::test]
+    async fn assistants_legers_avec_un_modele_moindre() {
+        let mut c = company();
+        let dev1 = c.index_of("dev1").unwrap();
+        c.seats[dev1].helpers = Some("haiku".into());
+        let p = Arc::new(Probe::default());
+        run(&c, p.clone(), Behavior::default()).await;
+        let s = p.spec("dev1/realisation/work");
+        assert!(s.tools.as_deref().unwrap().ends_with(",Agent"));
+        let h = &s.agents["essaim-assistant"];
+        assert_eq!(h["model"], "haiku");
+        assert_eq!(h["tools"], json!(["Read", "Grep", "Glob", "Bash"]), "l'assistant lit et lance, il n'écrit pas de fichiers");
+        assert!(p.system("dev1/realisation/work").contains("light assistants"));
+        assert!(!p.spec("dev2/realisation/work").agents.contains_key("essaim-assistant"), "seulement pour le poste qui en déclare");
+    }
+
+    // ----------------------------------------------------------- blocages : l'humain, et lui seul
+
+    #[tokio::test]
+    async fn poste_bloque_l_humain_repond_et_le_poste_reprend_sa_session() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { blocked_once: vec!["dev1/realisation/work"], ..Default::default() };
+        let cfg = Cfg { humans: vec![HumanAnswer::Text("le port est 8080".into())], ..Default::default() };
+        let (out, evs) = run_cfg(&company(), p.clone(), b, cfg).await;
+        assert!(out.ok, "la réponse de l'humain a débloqué le poste : {out:?}");
+        let reqs = requests(&evs);
+        assert_eq!(reqs.len(), 1, "une seule demande, directement à l'humain");
+        assert_eq!((reqs[0].kind, reqs[0].seat.as_str()), (AskKind::Blocked, "Backend Engineer"));
+        assert!(reqs[0].questions[0].text.contains("tests rouges chez dev1") && reqs[0].questions[0].text.contains("needs: corriger"), "{}", reqs[0].questions[0].text);
+        assert_eq!(reqs[0].questions[0].options.len(), 3, "relancer, continuer sans lui, arrêter");
+        // Le poste repart dans SA session, avec la réponse : rien n'est refait, aucun supérieur n'est appelé.
+        let reprise = p.resumed("dev1/realisation/work").expect("un appel de reprise");
+        assert_eq!(reprise.resume.as_deref(), Some("sid-dev1"));
+        assert!(reprise.prompt.contains("le port est 8080") && reprise.prompt.contains("Do not redo what is already done"), "{}", reprise.prompt);
+        assert_eq!(out.calls, BASE_CALLS + 1, "un appel de plus : la reprise, rien d'autre");
+        let started = p.started();
+        assert!(!started.iter().any(|id| id.contains("/fix") || id.contains("/answer")), "aucune boucle de correction : {started:?}");
+        assert!(p.prompt("mgr/realisation/report").contains("reprise(dev1)"), "le supérieur reçoit le résultat abouti");
+    }
+
+    #[tokio::test]
+    async fn poste_bloque_sans_humain_reste_bloque_et_rien_ne_boucle() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { blocked: vec!["dev1/realisation/work"], ..Default::default() };
+        let (out, evs) = run(&company(), p.clone(), b).await;
+        assert!(!out.ok);
+        assert_eq!(requests(&evs).len(), 1, "la demande est posée une fois, pas à chaque échelon");
+        assert_eq!(p.started().iter().filter(|id| id.starts_with("dev1/")).count(), 1, "aucun nouvel essai automatique");
+        let r = out.realisation.unwrap();
+        assert!(r.blockers.iter().any(|b| b.kind == "tests" && b.detail.contains("Backend Engineer") && b.detail.contains("tests rouges chez dev1")), "{:?}", r.blockers);
+        let mgr = p.prompt("mgr/realisation/report");
+        assert!(mgr.contains("NOT COMPLETED") && mgr.contains("tests rouges chez dev1"), "{mgr}");
+        // Un résultat que la branche sait incomplet n'est pas soumis à la revue : ce qui manque est déjà connu.
+        assert!(!p.started().iter().any(|id| id == "ceo/realisation/review"));
+        assert!(evs.iter().any(|e| matches!(e, RunEvent::NodeFinished { id, status: NodeStatus::Blocked(_), .. } if id == "dev1/realisation/work")));
+    }
+
+    #[tokio::test]
+    async fn chaque_nouvel_essai_est_une_decision_de_l_humain() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { blocked: vec!["dev1/realisation/work"], ..Default::default() };
+        // L'humain relance deux fois (une consigne, puis l'option « relancer »), puis plus personne ne répond.
+        let cfg = Cfg { humans: vec![HumanAnswer::Text("essaie avec --locked".into()), HumanAnswer::Option(0)], ..Default::default() };
+        let (out, evs) = run_cfg(&company(), p.clone(), b, cfg).await;
+        assert!(!out.ok);
+        assert_eq!(requests(&evs).len(), 3, "une demande par issue non aboutie");
+        assert_eq!(p.started().iter().filter(|id| id.starts_with("dev1/")).count(), 3, "le premier appel et deux reprises demandées");
+        let reprises: Vec<String> = p.specs.lock().unwrap().iter().filter(|(id, s)| id.starts_with("dev1/") && s.resume.is_some()).map(|(_, s)| s.prompt.clone()).collect();
+        assert!(reprises[0].contains("essaie avec --locked"));
+        assert!(reprises[1].starts_with("The human asks you to try again."), "{}", reprises[1]);
+    }
+
+    #[tokio::test]
+    async fn sans_l_accord_de_l_humain_les_travaux_suivants_ne_partent_pas() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { overlap: true, blocked: vec!["dev1/realisation/work"], ..Default::default() };
+        let (out, _) = run(&company(), p.clone(), b).await;
+        assert!(!out.ok);
+        let started = p.started();
+        assert!(!started.iter().any(|id| id == "dev2/realisation/work"), "dev2 passait après dev1 (même périmètre) : il ne part pas");
+        assert!(out.realisation.unwrap().blockers.iter().any(|b| b.kind == "prerequisite" && b.detail.contains("Frontend Engineer")));
+    }
+
+    #[tokio::test]
+    async fn l_humain_dit_de_continuer_sans_le_poste() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { overlap: true, blocked: vec!["dev1/realisation/work"], ..Default::default() };
+        let cfg = Cfg { humans: vec![HumanAnswer::Option(1)], ..Default::default() };
+        let (out, evs) = run_cfg(&company(), p.clone(), b, cfg).await;
+        assert!(!out.ok, "le poste n'a pas fini : la mission n'est pas déclarée réussie");
+        assert_eq!(requests(&evs).len(), 1);
+        assert!(p.started().iter().any(|id| id == "dev2/realisation/work"), "le travail suivant part quand même");
+        // La branche bloquée n'arrête pas non plus ses voisines : le CISO, lancé après le CTO, travaille.
+        assert!(p.started().iter().any(|id| id == "sec/realisation/work"));
+    }
+
+    #[tokio::test]
+    async fn l_humain_arrete_la_mission() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { overlap: true, blocked: vec!["dev1/realisation/work"], ..Default::default() };
+        let cfg = Cfg { humans: vec![HumanAnswer::Option(2)], ..Default::default() };
+        let (out, evs) = run_cfg(&company(), p.clone(), b, cfg).await;
+        assert!(!out.ok);
+        let started = p.started();
+        let apres: Vec<&String> = started.iter().skip_while(|id| *id != "dev1/realisation/work").skip(1).collect();
+        assert!(apres.is_empty(), "plus aucun appel après l'arrêt demandé : {apres:?}");
+        assert!(matches!(evs.last(), Some(RunEvent::RunFinished { ok: false, .. })));
+    }
+
+    #[tokio::test]
+    async fn sortie_structuree_perdue_le_texte_produit_est_montre_a_l_humain() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { no_structured: vec!["sec/realisation/work"], ..Default::default() };
+        let (out, evs) = run(&company(), p.clone(), b).await;
+        assert!(!out.ok);
+        let ids: Vec<String> = p.started().into_iter().filter(|id| id.starts_with("sec/")).collect();
+        assert_eq!(ids.len(), 2, "le format est redemandé une fois, dans la même session : {ids:?}");
+        assert_eq!(p.resumed("sec/realisation/work").and_then(|s| s.resume).as_deref(), Some("sid-sec"));
+        let reqs = requests(&evs);
+        assert!(reqs[0].questions[0].text.contains("trois failles XSS"), "{}", reqs[0].questions[0].text);
+        assert!(p.prompt("ciso/realisation/report").contains("trois failles XSS"), "le texte produit n'est pas perdu");
+    }
+
+    #[tokio::test]
+    async fn plan_bloque_l_humain_est_consulte_et_rien_n_est_realise_sans_plan() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { blocked: vec!["ceo/conception/work"], ..Default::default() };
+        let (out, evs) = run(&company(), p.clone(), b).await;
+        assert!(!out.ok && out.realisation.is_none());
+        assert_eq!(requests(&evs).len(), 1);
+        assert_eq!(p.started(), vec!["ceo/conception/work"]);
+    }
+
+    #[tokio::test]
+    async fn delegation_illisible_l_humain_decide() {
+        // Sans humain : la branche échoue, le supérieur le rapporte.
+        let p = Arc::new(Probe::default());
+        let b = Behavior { bad_delegation: vec!["mgr"], ..Default::default() };
+        let (out, evs) = run(&company(), p.clone(), b).await;
+        assert!(!out.ok);
+        let started = p.started();
+        assert_eq!(started.iter().filter(|id| id.starts_with("mgr/realisation/delegate")).count(), 2, "un nouvel essai de format, dans la même session");
+        assert!(!started.iter().any(|id| id.starts_with("dev")), "personne n'a reçu de tâche");
+        assert_eq!(requests(&evs).len(), 1);
+        assert!(p.prompt("cto/realisation/report").contains("delegation impossible"));
+
+        // Avec une consigne de l'humain : la délégation repart, avec cette consigne.
+        let p = Arc::new(Probe::default());
+        let b = Behavior { bad_delegation_once: vec!["mgr"], ..Default::default() };
+        let cfg = Cfg { humans: vec![HumanAnswer::Text("confie tout à dev1".into())], ..Default::default() };
+        let (out, _) = run_cfg(&company(), p.clone(), b, cfg).await;
+        assert!(out.ok, "{out:?}");
+        let relance = p.prompts.lock().unwrap().iter().filter(|(id, _, _)| id.starts_with("mgr/realisation/delegate")).map(|(_, pr, _)| pr.clone()).next_back().unwrap();
+        assert!(relance.contains("Instruction from the human:\nconfie tout à dev1"), "{relance}");
+    }
+
+    // ----------------------------------------------------------- revue du boss : elle constate, l'humain décide
+
+    #[tokio::test]
+    async fn revue_non_conforme_l_humain_relance_une_descente_corrective() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { review_unmet_once: true, ..Default::default() };
+        let cfg = Cfg { humans: vec![HumanAnswer::Text("priorité au critère X".into())], ..Default::default() };
+        let (out, evs) = run_cfg(&company(), p.clone(), b, cfg).await;
+        assert!(out.ok, "{out:?}");
+        let reqs = requests(&evs);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].kind, AskKind::Review);
+        assert!(reqs[0].questions[0].text.contains("critère X non atteint"));
+        let started = p.started();
+        assert_eq!(started.iter().filter(|id| *id == "ceo/realisation/review").count(), 2, "revue, descente corrective, nouvelle revue");
+        let delegations: Vec<String> = p.prompts.lock().unwrap().iter().filter(|(id, _, _)| id == "ceo/realisation/delegate").map(|(_, pr, _)| pr.clone()).collect();
+        assert_eq!(delegations.len(), 2);
+        assert!(delegations[1].contains("critère X non atteint") && delegations[1].contains("priorité au critère X") && delegations[1].contains("assign only what is needed"), "{}", delegations[1]);
+        assert_eq!(started.iter().filter(|id| *id == "ceo/realisation/report").count(), 1, "un seul rapport final");
+    }
+
+    #[tokio::test]
+    async fn revue_non_conforme_sans_humain_la_mission_n_est_pas_reussie() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { review_unmet: true, ..Default::default() };
+        let (out, evs) = run(&company(), p.clone(), b).await;
+        assert!(!out.ok);
+        assert_eq!(requests(&evs).len(), 1);
+        assert_eq!(p.started().iter().filter(|id| *id == "ceo/realisation/review").count(), 1, "aucune relance automatique");
+        assert!(out.realisation.unwrap().blockers.iter().any(|b| b.detail.contains("critère X non atteint")));
+    }
+
+    #[tokio::test]
+    async fn revue_non_conforme_acceptee_telle_quelle_par_l_humain() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { review_unmet: true, ..Default::default() };
+        let cfg = Cfg { humans: vec![HumanAnswer::Option(1)], ..Default::default() };
+        let (out, _) = run_cfg(&company(), p.clone(), b, cfg).await;
+        assert!(out.ok, "l'humain a accepté le résultat");
+        assert_eq!(p.started().iter().filter(|id| *id == "ceo/realisation/review").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn revue_desactivee() {
+        let reglages: [fn(&mut Company); 2] = [|c| c.review = Some(false), |c| c.max_review_rounds = 0];
+        for regler in reglages {
+            let mut c = company();
+            regler(&mut c);
+            let p = Arc::new(Probe::default());
+            let (out, _) = run(&c, p.clone(), Behavior::default()).await;
+            assert!(out.ok);
+            assert!(!p.started().iter().any(|id| id.contains("/review")));
+            assert_eq!(out.calls, BASE_CALLS - 1);
+            assert_eq!(c_estimate(&c), BASE_CALLS - 1);
+        }
+    }
+
+    // ----------------------------------------------------------- étapes, périmètres, parallélisme
+
+    /// Deux affectations au même subordonné s'exécutent comme deux étapes **successives**, chacune dans
+    /// un appel `claude` neuf : c'est ce qui garde les contextes petits.
+    #[tokio::test]
+    async fn deux_etapes_pour_un_meme_poste_sont_deux_appels_successifs() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { two_steps: vec!["mgr"], ..Default::default() };
+        let (out, _) = run(&company(), p.clone(), b).await;
+        assert!(out.ok, "{out:?}");
+        let ids: Vec<String> = p.started().into_iter().filter(|id| id.starts_with("dev1/")).collect();
+        assert_eq!(ids, vec!["dev1/realisation/work@1", "dev1/realisation/work@2"], "deux étapes = deux nœuds nommés");
+        let tl = p.timeline.lock().unwrap().clone();
+        let pos = |x: &str| tl.iter().position(|e| e == x).unwrap_or_else(|| panic!("absent de la chronologie : {x}\n{tl:?}"));
+        assert!(pos("E:dev1/realisation/work@1") < pos("S:dev1/realisation/work@2"), "{tl:?}");
+        let (un, deux) = (p.prompt("dev1/realisation/work@1"), p.prompt("dev1/realisation/work@2"));
+        assert!(un.contains("task for dev1") && !un.contains("etape2 pour dev1"), "{un}");
+        assert!(deux.contains("etape2 pour dev1") && !deux.contains("task for dev1"), "{deux}");
+        assert!(un.contains("Step 1 of 2") && deux.contains("Step 2 of 2"), "{un}\n---\n{deux}");
+        assert!(!un.contains("one commit"), "pas de commit imposé sans `commit_steps`");
+    }
+
+    #[tokio::test]
+    async fn commit_par_etape_seulement_si_l_entreprise_le_demande() {
+        let mut c = company();
+        c.commit_steps = true;
+        let p = Arc::new(Probe::default());
+        run(&c, p.clone(), Behavior { two_steps: vec!["mgr"], ..Default::default() }).await;
+        assert!(p.prompt("dev1/realisation/work@1").contains("End this step with one commit covering exactly it."));
+    }
+
+    #[tokio::test]
+    async fn une_etape_en_echec_arrete_les_suivantes() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { two_steps: vec!["mgr"], fail: vec!["dev1/realisation/work@1"], ..Default::default() };
+        run(&company(), p.clone(), b).await;
+        let ids: Vec<String> = p.started().into_iter().filter(|id| id.starts_with("dev1/")).collect();
+        assert_eq!(ids, vec!["dev1/realisation/work@1"], "la 2e étape ne part pas après l'échec de la 1re");
+    }
+
+    #[tokio::test]
+    async fn perimetres_disjoints_en_parallele_chevauchement_en_sequence() {
+        let chrono = |tl: &[String], a: &str, b: &str| {
+            let pos = |x: String| tl.iter().position(|e| *e == x).unwrap();
+            (pos(format!("S:{a}")), pos(format!("E:{a}")), pos(format!("S:{b}")), pos(format!("E:{b}")))
+        };
+        let p = Arc::new(Probe::default());
+        run(&company(), p.clone(), Behavior::default()).await;
+        let tl = p.timeline.lock().unwrap().clone();
+        let (s1, e1, s2, e2) = chrono(&tl, "dev1/realisation/work", "dev2/realisation/work");
+        assert!(s1 < e2 && s2 < e1, "périmètres disjoints : en même temps ({tl:?})");
+
+        let p = Arc::new(Probe::default());
+        run(&company(), p.clone(), Behavior { overlap: true, ..Default::default() }).await;
+        let tl = p.timeline.lock().unwrap().clone();
+        let (s1, e1, s2, e2) = chrono(&tl, "dev1/realisation/work", "dev2/realisation/work");
+        assert!(e1 < s2 || e2 < s1, "même périmètre : l'un après l'autre ({tl:?})");
+    }
+
+    #[tokio::test]
+    async fn perimetre_absent_ou_hors_de_celui_du_delegant() {
+        // Hors périmètre : écarté ; le poste qui réalise hérite de celui du délégant, et travaille quand même.
+        let p = Arc::new(Probe::default());
+        let (out, _) = run(&company(), p.clone(), Behavior { escape: vec!["mgr"], ..Default::default() }).await;
+        assert!(out.ok);
+        assert!(p.system("dev1/realisation/work").contains("File scope assigned to you: src/cto/mgr/**"), "{}", p.system("dev1/realisation/work"));
+        // Un poste d'analyse sans périmètre : aucun fichier du projet à modifier, et il ne retient personne.
+        let p = Arc::new(Probe::default());
+        run(&company(), p.clone(), Behavior { no_scope: vec!["ciso"], ..Default::default() }).await;
+        assert!(p.system("sec/realisation/work").contains("No file scope was assigned to you"));
+    }
+
+    #[tokio::test]
+    async fn parallelisme_borne_par_max_parallel() {
+        let mut c = company();
+        c.max_parallel = 1;
+        let p = Arc::new(Probe::default());
+        run(&c, p.clone(), Behavior::default()).await;
+        assert_eq!(p.peak.load(Ordering::SeqCst), 1);
+
+        let p = Arc::new(Probe::default());
+        run(&company(), p.clone(), Behavior::default()).await;
+        let peak = p.peak.load(Ordering::SeqCst);
+        assert!(peak > 1 && peak <= 4, "pic = {peak}");
+    }
+
+    #[tokio::test]
+    async fn delegation_partielle_ne_mobilise_que_les_choisis() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { only: vec![("ceo", vec!["cto"])], ..Default::default() };
+        let (out, _) = run(&company(), p.clone(), b).await;
+        assert!(out.ok);
+        let started = p.started();
+        assert!(!started.iter().any(|id| id.starts_with("ciso/") || id.starts_with("sec/")), "{started:?}");
+        assert_eq!(started.len(), 1 + 2 + 2 + 2 + 2 + 1, "plan ; ceo, cto, mgr (2 appels chacun) ; dev1, dev2 ; revue");
+    }
+
+    #[tokio::test]
+    async fn evenements_etiquetes_et_indentes() {
+        let p = Arc::new(Probe::default());
+        let (_, evs) = run(&company(), p, Behavior::default()).await;
+        let labels: Vec<(String, usize)> = evs.iter().filter_map(|e| if let RunEvent::Label { label, depth, .. } = e { Some((label.clone(), *depth)) } else { None }).collect();
+        for attendu in [("CEO · plans", 0), ("CEO · delegates", 0), ("Engineering Manager · reports", 2), ("Backend Engineer · builds ⚒", 3), ("Security Analyst · analyses", 2), ("CEO · reviews", 0)] {
+            assert!(labels.contains(&(attendu.0.to_string(), attendu.1)), "{attendu:?} absent de {labels:?}");
+        }
+    }
+
+    // ----------------------------------------------------------- plafond, annulation, pause
+
+    #[tokio::test]
+    async fn plafond_d_appels_partage_par_toute_la_mission() {
+        let mut c = company();
+        c.max_calls = 4;
+        let p = Arc::new(Probe::default());
+        let (out, evs) = run(&c, p.clone(), Behavior::default()).await;
+        assert!(!out.ok);
+        assert_eq!(p.started().len(), 4, "jamais plus que max_calls");
+        assert_eq!(out.calls, 4);
+        assert!(requests(&evs).is_empty(), "plafond atteint : aucune relance n'est possible, on ne demande rien à l'humain");
+    }
+
+    #[tokio::test]
+    async fn annulation_avant_depart() {
+        let p = Arc::new(Probe::default());
+        let (out, evs) = run_cfg(&company(), p.clone(), Behavior::default(), Cfg { cancel_at_start: true, ..Default::default() }).await;
+        assert!(!out.ok);
+        assert!(p.started().is_empty());
+        assert!(requests(&evs).is_empty());
+        assert!(matches!(evs.last(), Some(RunEvent::RunFinished { ok: false, .. })));
+    }
+
     /// R1 : un livrable qui ne peut pas être écrit n'est plus avalé : le run se ferme en échec et l'erreur remonte.
     #[tokio::test]
     async fn echec_d_ecriture_du_livrable_ferme_le_run_en_echec() {
@@ -734,7 +1295,7 @@ reports_to = "ciso"
         std::fs::create_dir_all(&base).unwrap();
         let bloque = base.join("bloque");
         std::fs::write(&bloque, "x").unwrap(); // un fichier à la place d'un dossier : la création du dossier de mission échoue
-        let opts = CompanyOptions { base_dir: base.clone(), mission_dir: Some(bloque.join("mission")), lang: Lang::Fr, resume: false, pause: crate::runtime::pause::Gate::new() };
+        let opts = CompanyOptions::plain(base.clone(), Some(bloque.join("mission")), Lang::Fr);
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (_ctx, crx) = watch::channel(false);
         let res = run_mission(&company(), &agents(), "Brief", &opts, fake(Arc::new(Probe::default()), Behavior::default()), tx, crx).await;
@@ -748,69 +1309,25 @@ reports_to = "ciso"
     }
 
     /// Limite de l'abonnement atteinte : le run se met en pause au lieu d'échouer, reprend seul à l'heure
-    /// annoncée, rejoue l'appel refusé, et ne lui compte ni coût ni appel. Horloge virtuelle : l'attente
-    /// jusqu'à la réinitialisation est franchie sans dormir.
+    /// annoncée, rejoue l'appel refusé, et ne lui compte ni coût ni appel.
     #[tokio::test(start_paused = true)]
     async fn limite_d_abonnement_met_le_run_en_pause_puis_le_reprend() {
         let dir = tmpdir();
         std::fs::create_dir_all(&dir).unwrap();
         let p = Arc::new(Probe::default());
-        let b = Behavior { limit_once: vec!["dev1/conception/work"], ..Default::default() };
-        let (out, evs) = run_cfg(&company(), p.clone(), b, Cfg { answer: Some(true), mission_dir: Some(dir.clone()), ..Default::default() }).await;
+        let b = Behavior { limit_once: vec!["dev1/realisation/work"], ..Default::default() };
+        let (out, evs) = run_cfg(&company(), p.clone(), b, Cfg { mission_dir: Some(dir.clone()), ..Default::default() }).await;
         assert!(out.ok, "la limite ne fait pas échouer la mission");
-        assert_eq!(out.calls, 12, "l'appel refusé ne consomme pas le plafond");
-        assert_eq!(p.started.lock().unwrap().iter().filter(|id| *id == "dev1/conception/work").count(), 2, "appel rejoué à la reprise");
+        assert_eq!(out.calls, BASE_CALLS, "l'appel refusé ne consomme pas le plafond");
+        assert_eq!(p.started().iter().filter(|id| *id == "dev1/realisation/work").count(), 2, "appel rejoué à la reprise");
         assert_eq!(evs.iter().filter(|e| matches!(e, RunEvent::Paused { .. })).count(), 1, "une seule annonce de pause");
         assert!(evs.iter().any(|e| matches!(e, RunEvent::Paused { why: crate::runtime::pause::Why::Limit, resets_at: Some(_) })));
         assert_eq!(evs.iter().filter(|e| matches!(e, RunEvent::Resumed)).count(), 1, "une seule annonce de reprise");
-        // Le nœud n'est clos qu'une fois, en réussite : la limite ne laisse aucune erreur derrière elle.
-        let finis: Vec<_> = evs
-            .iter()
-            .filter_map(|e| match e {
-                RunEvent::NodeFinished { id, status, .. } if id == "dev1/conception/work" => Some(status.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(finis, vec![NodeStatus::Succeeded]);
+        let finis: Vec<_> = evs.iter().filter_map(|e| if let RunEvent::NodeFinished { id, status, .. } = e { (id == "dev1/realisation/work").then(|| status.clone()) } else { None }).collect();
+        assert_eq!(finis, vec![NodeStatus::Succeeded], "le nœud n'est clos qu'une fois, en réussite");
+        assert!(requests(&evs).is_empty(), "la limite n'est pas un blocage : rien n'est demandé à l'humain");
         assert!(crate::runtime::missions::read_pause(&dir).is_none(), "marque de pause levée à la reprise");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Deux affectations au même subordonné s'exécutent comme deux étapes **successives**, chacune dans
-    /// un appel `claude` neuf : c'est ce qui garde les contextes petits. Les fusionner en une tâche unique
-    /// ferait une session longue, dont le coût croît avec le carré de sa durée.
-    #[tokio::test]
-    async fn deux_etapes_pour_un_meme_poste_sont_deux_appels_successifs() {
-        let p = Arc::new(Probe::default());
-        let b = Behavior { two_steps: vec!["mgr"], ..Default::default() };
-        let (out, _) = run_cfg(&company(), p.clone(), b, Cfg { answer: Some(true), ..Default::default() }).await;
-        assert!(out.ok, "{out:?}");
-        // Un nœud distinct par étape, numéroté, pour que le journal et le coût ne se confondent pas.
-        let ids: Vec<String> = p.started.lock().unwrap().iter().filter(|id| id.starts_with("dev1/")).cloned().collect();
-        assert_eq!(ids, vec!["dev1/conception/work@1", "dev1/conception/work@2"], "deux étapes = deux nœuds nommés");
-        // Successives, jamais en parallèle : la 1re est finie avant que la 2e démarre.
-        let tl = p.timeline.lock().unwrap().clone();
-        let pos = |x: &str| tl.iter().position(|e| e == x).unwrap_or_else(|| panic!("absent de la chronologie : {x}\n{tl:?}"));
-        assert!(pos("E:dev1/conception/work@1") < pos("S:dev1/conception/work@2"), "{tl:?}");
-        // Chaque étape ne reçoit QUE la sienne : c'est là qu'est l'économie de contexte.
-        let prompts = p.prompts.lock().unwrap();
-        let un = &prompts.iter().find(|(id, _, _)| id == "dev1/conception/work@1").unwrap().1;
-        let deux = &prompts.iter().find(|(id, _, _)| id == "dev1/conception/work@2").unwrap().1;
-        assert!(un.contains("task for dev1") && !un.contains("etape2 pour dev1"), "{un}");
-        assert!(deux.contains("etape2 pour dev1") && !deux.contains("task for dev1"), "{deux}");
-        // Et chacune sait où elle en est, pour ne rien refaire ni anticiper.
-        assert!(un.contains("Step 1 of 2") && deux.contains("Step 2 of 2"), "{un}\n---\n{deux}");
-    }
-
-    /// Une étape qui n'aboutit pas arrête les suivantes : on ne construit pas sur une base cassée.
-    #[tokio::test]
-    async fn une_etape_en_echec_arrete_les_suivantes() {
-        let p = Arc::new(Probe::default());
-        let b = Behavior { two_steps: vec!["mgr"], fail: vec!["dev1/conception/work@1"], ..Default::default() };
-        let _ = run_cfg(&company(), p.clone(), b, Cfg { answer: Some(true), ..Default::default() }).await;
-        let ids: Vec<String> = p.started.lock().unwrap().iter().filter(|id| id.starts_with("dev1/conception/work")).cloned().collect();
-        assert!(ids.contains(&"dev1/conception/work@1".to_string()), "{ids:?}");
-        assert!(!ids.contains(&"dev1/conception/work@2".to_string()), "la 2e étape ne part pas après l'échec de la 1re : {ids:?}");
     }
 
     /// Pause demandée pendant qu'un poste travaille : il s'arrête avec un bilan, le poste n'échoue pas,
@@ -818,42 +1335,25 @@ reports_to = "ciso"
     #[tokio::test]
     async fn un_appel_arrete_par_la_pause_reprend_sa_session() {
         let p = Arc::new(Probe::default());
-        let b = Behavior { interrupt_once: vec!["dev1/conception/work"], ..Default::default() };
-        let (out, evs) = run_cfg(&company(), p.clone(), b, Cfg { answer: Some(true), ..Default::default() }).await;
+        let b = Behavior { interrupt_once: vec!["dev1/realisation/work"], ..Default::default() };
+        let (out, evs) = run(&company(), p.clone(), b).await;
         assert!(out.ok, "un arrêt demandé ne fait pas échouer la mission");
-        assert_eq!(out.calls, 12, "l'appel arrêté ne consomme pas le plafond");
-        // Le nœud n'est clos qu'une fois, en réussite : l'arrêt ne laisse aucune erreur derrière lui.
-        let finis: Vec<_> = evs
-            .iter()
-            .filter_map(|e| match e {
-                RunEvent::NodeFinished { id, status, .. } if id.starts_with("dev1/conception/work") => Some(status.clone()),
-                _ => None,
-            })
-            .collect();
+        assert_eq!(out.calls, BASE_CALLS, "l'appel arrêté ne consomme pas le plafond");
+        let finis: Vec<_> = evs.iter().filter_map(|e| if let RunEvent::NodeFinished { id, status, .. } = e { id.starts_with("dev1/realisation/work").then(|| status.clone()) } else { None }).collect();
         assert_eq!(finis, vec![NodeStatus::Succeeded]);
-        // La reprise passe par `--resume` sur la session rendue, et le prompt reprend le bilan de l'agent.
-        let reprise = p
-            .specs
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(id, s)| id.starts_with("dev1/conception/work") && s.resume.is_some())
-            .map(|(_, s)| s.clone())
-            .expect("un appel de reprise");
+        let reprise = p.resumed("dev1/realisation/work").expect("un appel de reprise");
         assert_eq!(reprise.resume.as_deref(), Some("sid-pause"));
-        assert!(reprise.prompt.contains("Reste : l'autre."), "le bilan sert de point de reprise : {}", reprise.prompt);
-        assert!(reprise.prompt.contains("Do not redo what you already completed"), "{}", reprise.prompt);
-        // Les jetons réellement brûlés avant l'arrêt sont comptés : sinon le coût du run est faux.
+        assert!(reprise.prompt.contains("Reste : l'autre.") && reprise.prompt.contains("Do not redo what you already completed"), "{}", reprise.prompt);
         assert!(out.tokens >= 100, "les jetons de l'appel arrêté sont comptés : {}", out.tokens);
+        assert!(requests(&evs).is_empty());
     }
 
     /// Run annulé pendant la pause (c'est ce qui se passe en quittant essaim) : la mission garde sa marque
-    /// de pause, donc elle est reprenable plus tard, et rien n'est annoncé comme une erreur de limite.
+    /// de pause, donc elle est reprenable plus tard.
     #[tokio::test(start_paused = true)]
     async fn annulation_pendant_la_pause_laisse_la_mission_reprenable() {
         let dir = tmpdir();
         std::fs::create_dir_all(&dir).unwrap();
-        let gate = crate::runtime::pause::Gate::new();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (ctx, crx) = watch::channel(false);
         // Dès l'annonce de la pause, on annule : c'est la séquence « q » pendant une pause.
@@ -868,8 +1368,8 @@ reports_to = "ciso"
             }
             evs
         });
-        let opts = CompanyOptions { base_dir: std::env::temp_dir(), mission_dir: Some(dir.clone()), lang: Lang::Fr, resume: false, pause: gate.clone() };
-        let b = Behavior { limit_once: vec!["dev1/conception/work"], ..Default::default() };
+        let opts = CompanyOptions::plain(std::env::temp_dir(), Some(dir.clone()), Lang::Fr);
+        let b = Behavior { limit_once: vec!["ceo/conception/work"], ..Default::default() };
         let out = run_mission(&company(), &agents(), "Brief", &opts, fake(Arc::new(Probe::default()), b), tx, crx).await.unwrap();
         let evs = collector.await.unwrap();
         assert!(!out.ok, "mission interrompue");
@@ -879,331 +1379,71 @@ reports_to = "ciso"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ----------------------------------------------------------- conception
-
-    #[tokio::test]
-    async fn cascade_complete_remontee_des_rapports() {
-        let p = Arc::new(Probe::default());
-        let (out, evs) = run(&company(), p.clone(), Behavior::default(), false).await;
-        assert!(out.ok);
-        assert_eq!(out.report, "rapport(ceo)");
-        // 4 postes internes × 2 appels + 3 feuilles + 1 revue du CEO = 12 (= estimation de conception).
-        assert_eq!(p.started.lock().unwrap().len(), 12);
-        assert_eq!(out.calls, 12);
-        assert_eq!(out.tokens, 0);
-        assert!(out.realisation.is_none() && out.approved.is_none(), "pas de poste de réalisation");
-        assert!(!evs.iter().any(|e| matches!(e, RunEvent::Checkpoint { .. })));
-        assert!(matches!(evs.last(), Some(RunEvent::RunFinished { ok: true, .. })));
-    }
-
-    #[tokio::test]
-    async fn ordre_haut_en_bas_puis_bas_en_haut() {
-        let p = Arc::new(Probe::default());
-        run(&company(), p.clone(), Behavior::default(), false).await;
-        let started = p.started.lock().unwrap().clone();
-        let finished = p.finished.lock().unwrap().clone();
-        let s = |id: &str| started.iter().position(|x| x == id).unwrap_or_else(|| panic!("{id} jamais lancé : {started:?}"));
-        let f = |id: &str| finished.iter().position(|x| x == id).unwrap();
-        assert!(f("ceo/conception/delegate") < s("cto/conception/delegate"));
-        assert!(f("cto/conception/delegate") < s("mgr/conception/delegate"));
-        assert!(f("mgr/conception/delegate") < s("dev1/conception/work"));
-        assert!(f("dev1/conception/work") < s("mgr/conception/report"));
-        assert!(f("dev2/conception/work") < s("mgr/conception/report"));
-        assert!(f("mgr/conception/report") < s("cto/conception/report"));
-        assert!(f("cto/conception/report") < s("ceo/conception/report"));
-        assert!(f("sec/conception/work") < s("ciso/conception/report"));
-        assert!(f("ciso/conception/report") < s("ceo/conception/report"));
-    }
-
-    #[tokio::test]
-    async fn le_rapport_contient_les_resultats_des_subordonnes() {
-        let p = Arc::new(Probe::default());
-        run(&company(), p.clone(), Behavior::default(), false).await;
-        let prompts = p.prompts.lock().unwrap();
-        let ceo_report = &prompts.iter().find(|(id, _, _)| id == "ceo/conception/report").unwrap().1;
-        assert!(ceo_report.contains("rapport(cto)") && ceo_report.contains("rapport(ciso)"));
-        assert!(ceo_report.contains("task for cto"));
-        let mgr_report = &prompts.iter().find(|(id, _, _)| id == "mgr/conception/report").unwrap().1;
-        assert!(mgr_report.contains("travail(dev1)") && mgr_report.contains("travail(dev2)"));
-        let sys = &prompts.iter().find(|(id, _, _)| id == "mgr/conception/delegate").unwrap().2;
-        assert!(sys.contains("Engineering Manager") && sys.contains("N-2") && sys.contains("CEO → CTO → Engineering Manager (you)"));
-        assert!(sys.contains("dev1 · Backend Engineer"));
-        // Un manager ne voit pas le brief : il travaille sur la seule tâche écrite par son supérieur.
-        assert!(!sys.contains("Brief de test"), "le brief ne descend pas sous le boss");
-        assert!(sys.contains("You do not see the company brief"));
-        // Le boss, lui, l'a : c'est lui qui le digère.
-        let ceo_sys = &prompts.iter().find(|(id, _, _)| id == "ceo/conception/delegate").unwrap().2;
-        assert!(ceo_sys.contains("Brief de test"), "le boss garde le brief");
-    }
-
-    #[tokio::test]
-    async fn la_conception_interdit_de_traiter_l_absence_de_resultat_comme_un_echec() {
-        let p = Arc::new(Probe::default());
-        run(&company_build(), p.clone(), Behavior::default(), false).await;
-        let prompts = p.prompts.lock().unwrap();
-        let (_, prompt, sys) = prompts.iter().find(|(id, _, _)| id == "dev1/conception/work").unwrap();
-        assert!(sys.contains("DESIGN PHASE") && sys.contains("build NOTHING") && sys.contains("Never report as a failure"));
-        assert!(prompt.contains("You do not have to modify the project"));
-        let (_, dprompt, _) = prompts.iter().find(|(id, _, _)| id == "ceo/conception/delegate").unwrap();
-        assert!(dprompt.contains("ANALYSIS or SPECIFICATION"));
-        let (_, rprompt, rsys) = prompts.iter().find(|(id, _, _)| id == "dev1/realisation/work").unwrap();
-        assert!(rsys.contains("REALISATION PHASE") && !rsys.contains("DESIGN PHASE"));
-        assert!(rprompt.contains("Carry it out"));
-        let (_, rdprompt, _) = prompts.iter().find(|(id, _, _)| id == "ceo/realisation/delegate").unwrap();
-        assert!(!rdprompt.contains("ANALYSIS or SPECIFICATION"));
-    }
-
-    #[tokio::test]
-    async fn parallelisme_borne_par_max_parallel() {
-        let mut c = company();
-        c.max_parallel = 1;
-        let p = Arc::new(Probe::default());
-        run(&c, p.clone(), Behavior::default(), false).await;
-        assert_eq!(p.peak.load(Ordering::SeqCst), 1);
-
-        let mut c = company();
-        c.max_parallel = 4;
-        let p = Arc::new(Probe::default());
-        run(&c, p.clone(), Behavior::default(), false).await;
-        let peak = p.peak.load(Ordering::SeqCst);
-        assert!(peak > 1 && peak <= 4, "pic = {peak}");
-    }
-
-    #[tokio::test]
-    async fn conception_en_lecture_seule_sans_outils_pour_les_managers() {
-        let p = Arc::new(Probe::default());
-        run(&company(), p.clone(), Behavior::default(), false).await;
-        let specs = p.specs.lock().unwrap();
-        let spec = |id: &str| specs.iter().find(|(i, _)| i == id).unwrap().1.clone();
-        assert_eq!(spec("dev1/conception/work").tools.as_deref(), Some("Read,Grep,Glob"));
-        assert_eq!(spec("mgr/conception/delegate").tools.as_deref(), Some(""));
-        assert_eq!(spec("mgr/conception/report").tools.as_deref(), Some("Read,Grep,Glob,Bash"), "un supérieur lit et vérifie, jamais d'écriture");
-        assert!(spec("dev1/conception/work").allowed_tools.is_empty() && spec("dev1/conception/work").permission_mode.is_none());
-    }
-
-    #[tokio::test]
-    async fn echec_d_un_worker_escalade_au_manager() {
-        let p = Arc::new(Probe::default());
-        let b = Behavior { fail: vec!["dev1/conception/work"], ..Default::default() };
-        let (out, _) = run(&company(), p.clone(), b, false).await;
-        assert!(!out.ok);
-        assert_eq!(out.report, "rapport(ceo)", "le boss produit quand même son rapport");
-        let prompts = p.prompts.lock().unwrap();
-        let mgr = &prompts.iter().find(|(id, _, _)| id == "mgr/conception/report").unwrap().1;
-        assert!(mgr.contains("FAILED") && mgr.contains("boum"), "{mgr}");
-    }
-
-    #[tokio::test]
-    async fn delegation_partielle_ne_mobilise_que_les_choisis() {
-        let p = Arc::new(Probe::default());
-        let b = Behavior { only: vec![("ceo", vec!["cto"])], ..Default::default() };
-        let (out, _) = run(&company(), p.clone(), b, false).await;
-        assert!(out.ok);
-        let started = p.started.lock().unwrap().clone();
-        assert!(!started.iter().any(|id| id.starts_with("ciso/") || id.starts_with("sec/")), "{started:?}");
-        assert_eq!(started.len(), 2 + 2 + 2 + 1 + 1 + 1, "ceo, cto, mgr (2 appels chacun) + dev1, dev2 (1 chacun) + revue du ceo");
-    }
-
-    #[tokio::test]
-    async fn delegation_invalide_nouvel_essai_puis_echec_escalade() {
-        let p = Arc::new(Probe::default());
-        let b = Behavior { bad_delegation: vec!["mgr"], ..Default::default() };
-        let (out, _) = run(&company(), p.clone(), b, false).await;
-        assert!(!out.ok);
-        let started = p.started.lock().unwrap().clone();
-        assert_eq!(started.iter().filter(|id| *id == "mgr/conception/delegate").count(), 2, "un nouvel essai");
-        assert!(!started.iter().any(|id| id.starts_with("dev")), "personne n'a reçu de tâche");
-        let prompts = p.prompts.lock().unwrap();
-        let cto = &prompts.iter().find(|(id, _, _)| id == "cto/conception/report").unwrap().1;
-        assert!(cto.contains("delegation impossible"), "{cto}");
-    }
-
-    #[tokio::test]
-    async fn plafond_d_appels() {
-        let mut c = company();
-        c.max_calls = 4;
-        let p = Arc::new(Probe::default());
-        let (out, _) = run(&c, p.clone(), Behavior::default(), false).await;
-        assert!(!out.ok);
-        assert_eq!(p.started.lock().unwrap().len(), 4, "jamais plus que max_calls");
-        assert_eq!(out.calls, 4);
-    }
-
-    #[tokio::test]
-    async fn annulation_avant_depart() {
-        let p = Arc::new(Probe::default());
-        let (out, evs) = run(&company(), p.clone(), Behavior::default(), true).await;
-        assert!(!out.ok);
-        assert!(p.started.lock().unwrap().is_empty());
-        assert!(matches!(evs.last(), Some(RunEvent::RunFinished { ok: false, .. })));
-    }
-
-    #[tokio::test]
-    async fn evenements_etiquetes_et_indentes() {
-        let p = Arc::new(Probe::default());
-        let (_, evs) = run(&company(), p, Behavior::default(), false).await;
-        let labels: Vec<(String, usize)> = evs
-            .iter()
-            .filter_map(|e| match e {
-                RunEvent::Label { label, depth, .. } => Some((label.clone(), *depth)),
-                _ => None,
-            })
-            .collect();
-        assert!(labels.contains(&("CEO · delegates".to_string(), 0)));
-        assert!(labels.contains(&("Engineering Manager · reports".to_string(), 2)));
-        assert!(labels.contains(&("Backend Engineer · analyses".to_string(), 3)));
-    }
-
-    // ----------------------------------------------------------- réalisation
-
-    #[tokio::test]
-    async fn realisation_limitee_a_la_branche_des_builders() {
-        let p = Arc::new(Probe::default());
-        let (out, evs) = run(&company_build(), p.clone(), Behavior::default(), false).await;
-        assert!(out.ok, "{:?}", out.report);
-        let started = p.started.lock().unwrap().clone();
-        let real: Vec<&String> = started.iter().filter(|id| id.contains("/realisation/")).collect();
-        // ceo, cto, mgr (2 appels) + dev1, dev2 (1) + revue du ceo = 9 ; ciso et sec ne participent pas.
-        assert_eq!(real.len(), 9, "{real:?}");
-        assert!(!real.iter().any(|id| id.starts_with("ciso/") || id.starts_with("sec/")));
-        assert!(real.iter().any(|id| *id == "dev1/realisation/work") && real.iter().any(|id| *id == "dev2/realisation/work"));
-        assert_eq!(out.calls, 12 + 9);
-        assert!(out.realisation.is_some());
-        assert!(!evs.iter().any(|e| matches!(e, RunEvent::Checkpoint { .. })), "checkpoint = false");
-    }
-
-    #[tokio::test]
-    async fn builders_verrouilles_sur_leur_perimetre() {
-        let p = Arc::new(Probe::default());
-        run(&company_build(), p.clone(), Behavior::default(), false).await;
-        let specs = p.specs.lock().unwrap();
-        let spec = |id: &str| specs.iter().find(|(i, _)| i == id).unwrap().1.clone();
-        let d1 = spec("dev1/realisation/work");
-        assert_eq!(d1.permission_mode.as_deref(), Some("dontAsk"), "tout ce qui n'est pas autorisé est refusé");
-        assert!(d1.allowed_tools.contains(&"Edit(src/cto/mgr/dev1/**)".to_string()), "{:?}", d1.allowed_tools);
-        assert!(d1.allowed_tools.contains(&"Write(src/cto/mgr/dev1/**)".to_string()));
-        assert!(!d1.allowed_tools.iter().any(|r| r == "Edit" || r == "Write"), "jamais d'écriture sans restriction");
-        assert_eq!(d1.tools.as_deref(), Some("Read,Grep,Glob,Edit,Write,Bash"));
-        assert!(d1.allowed_tools.contains(&"Bash(cargo test:*)".to_string()));
-        let d2 = spec("dev2/realisation/work");
-        assert_eq!(d2.tools.as_deref(), Some("Read,Grep,Glob,Edit,Write"), "pas de shell sans allow_bash");
-        assert!(!d2.allowed_tools.iter().any(|r| r.starts_with("Bash")));
-        assert!(d2.allowed_tools.contains(&"Edit(src/cto/mgr/dev2/**)".to_string()));
-        // Les managers ne touchent à rien.
-        assert_eq!(spec("mgr/realisation/delegate").tools.as_deref(), Some(""));
-        assert!(!spec("mgr/realisation/report").allowed_tools.iter().any(|r| r.starts_with("Edit") || r.starts_with("Write")), "un supérieur n'écrit jamais");
-        // La fiche de poste rappelle le périmètre et les commandes.
-        let sys = p.prompts.lock().unwrap().iter().find(|(id, _, _)| id == "dev1/realisation/work").unwrap().2.clone();
-        assert!(sys.contains("File scope assigned to you: src/cto/mgr/dev1/**"));
-        assert!(sys.contains("Allowed shell commands: cargo test"));
-    }
-
-    #[tokio::test]
-    async fn perimetres_disjoints_en_parallele_chevauchement_en_sequence() {
-        let pos = |t: &Vec<String>, ev: &str| t.iter().position(|x| x == ev).unwrap_or_else(|| panic!("{ev} absent de {t:?}"));
-
-        // Disjoints : dev2 démarre avant que dev1 ait fini.
-        let p = Arc::new(Probe::default());
-        run(&company_build(), p.clone(), Behavior::default(), false).await;
-        let t = p.timeline.lock().unwrap().clone();
-        assert!(pos(&t, "S:dev2/realisation/work") < pos(&t, "E:dev1/realisation/work"), "parallèle : {t:?}");
-
-        // Chevauchants : l'un finit avant que l'autre ne commence.
-        let p = Arc::new(Probe::default());
-        let b = Behavior { overlap: true, ..Default::default() };
-        run(&company_build(), p.clone(), b, false).await;
-        let t = p.timeline.lock().unwrap().clone();
-        let seq = pos(&t, "E:dev1/realisation/work") < pos(&t, "S:dev2/realisation/work") || pos(&t, "E:dev2/realisation/work") < pos(&t, "S:dev1/realisation/work");
-        assert!(seq, "séquentiel : {t:?}");
-    }
-
-    #[tokio::test]
-    async fn perimetre_hors_de_celui_du_delegant_refuse() {
-        let p = Arc::new(Probe::default());
-        let b = Behavior { escape: vec!["mgr"], ..Default::default() };
-        let (out, _) = run(&company_build(), p.clone(), b, false).await;
-        assert!(!out.ok);
-        let started = p.started.lock().unwrap().clone();
-        assert_eq!(started.iter().filter(|id| *id == "mgr/realisation/delegate").count(), 2, "un nouvel essai");
-        assert!(!started.iter().any(|id| id.starts_with("dev") && id.contains("realisation")), "personne n'écrit hors périmètre");
-        let prompts = p.prompts.lock().unwrap();
-        let cto = &prompts.iter().find(|(id, _, _)| id == "cto/realisation/report").unwrap().1;
-        assert!(cto.contains("delegation impossible"), "{cto}");
-    }
+    // ----------------------------------------------------------- point de contrôle et reprise
 
     #[tokio::test]
     async fn point_de_controle_accepte_ecrit_les_livrables() {
         let dir = tmpdir();
-        let mut c = company_build();
-        c.checkpoint = true;
         let p = Arc::new(Probe::default());
         let cfg = Cfg { answer: Some(true), mission_dir: Some(dir.clone()), ..Default::default() };
-        let (out, evs) = run_cfg(&c, p.clone(), Behavior::default(), cfg).await;
+        let (out, evs) = run_cfg(&company_checkpoint(), p.clone(), Behavior::default(), cfg).await;
         assert_eq!(out.approved, Some(true));
-        let plan = evs.iter().find_map(|e| match e { RunEvent::Checkpoint { plan, .. } => Some(plan.clone()), _ => None }).expect("point de contrôle");
-        assert_eq!(plan, "rapport(ceo)");
-        assert_eq!(std::fs::read_to_string(dir.join("conception.md")).unwrap(), "rapport(ceo)");
+        let plan = evs.iter().find_map(|e| if let RunEvent::Checkpoint { plan, .. } = e { Some(plan.clone()) } else { None }).expect("point de contrôle");
+        assert_eq!(plan, "travail(ceo)", "c'est le plan du boss qui est soumis à l'humain");
+        assert_eq!(std::fs::read_to_string(dir.join("conception.md")).unwrap(), "travail(ceo)");
         assert_eq!(std::fs::read_to_string(dir.join("rapport.md")).unwrap(), "rapport(ceo)");
-        // Le plan validé est transmis au boss pour la réalisation.
-        let prompts = p.prompts.lock().unwrap();
-        let root = &prompts.iter().find(|(id, _, _)| id == "ceo/realisation/delegate").unwrap().1;
-        assert!(root.contains("consolidated plan, approved") && root.contains("rapport(ceo)"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn point_de_controle_refuse_arrete_sur_le_plan() {
         let dir = tmpdir();
-        let mut c = company_build();
-        c.checkpoint = true;
         let p = Arc::new(Probe::default());
         let cfg = Cfg { answer: Some(false), mission_dir: Some(dir.clone()), ..Default::default() };
-        let (out, evs) = run_cfg(&c, p.clone(), Behavior::default(), cfg).await;
+        let (out, evs) = run_cfg(&company_checkpoint(), p.clone(), Behavior::default(), cfg).await;
         assert_eq!(out.approved, Some(false));
         assert!(out.ok, "refuser n'est pas un échec");
         assert!(out.realisation.is_none());
-        assert!(!p.started.lock().unwrap().iter().any(|id| id.contains("/realisation/")));
+        assert_eq!(p.started(), vec!["ceo/conception/work"], "rien n'est réalisé sans accord");
         assert!(dir.join("conception.md").is_file() && !dir.join("rapport.md").exists());
+        assert!(!dir.join("reussie").exists(), "un plan refusé n'est pas une mission réussie");
         assert!(matches!(evs.last(), Some(RunEvent::RunFinished { ok: true, .. })));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    async fn reprise_saute_la_conception_terminee() {
+    async fn reprise_saute_le_plan_deja_ecrit() {
         let dir = tmpdir();
-        let mut c = company_build();
-        c.checkpoint = true;
-        // 1er run : conception menée à terme, réalisation refusée (= run interrompu avant la réalisation).
+        let c = company_checkpoint();
+        // 1er run : plan écrit, réalisation refusée (= run interrompu avant la réalisation).
         let cfg = Cfg { answer: Some(false), mission_dir: Some(dir.clone()), ..Default::default() };
         run_cfg(&c, Arc::new(Probe::default()), Behavior::default(), cfg).await;
         assert!(crate::runtime::missions::resumable_plan(&dir).is_some());
-        // Reprise : aucun nœud de conception, le plan validé alimente la réalisation.
+        // Reprise : le plan n'est pas réécrit, il alimente la descente.
         let p = Arc::new(Probe::default());
         let cfg = Cfg { answer: Some(true), mission_dir: Some(dir.clone()), resume: true, ..Default::default() };
         let (out, _) = run_cfg(&c, p.clone(), Behavior::default(), cfg).await;
         assert!(out.ok && out.approved == Some(true) && out.realisation.is_some());
-        {
-            let started = p.started.lock().unwrap();
-            assert!(!started.iter().any(|id| id.contains("/conception/")), "{started:?}");
-            assert!(started.iter().any(|id| id.contains("/realisation/")));
-        }
+        let started = p.started();
+        assert!(!started.iter().any(|id| id.contains("/conception/")), "{started:?}");
+        assert!(p.prompt("ceo/realisation/delegate").contains("travail(ceo)"));
         assert!(dir.join("rapport.md").is_file());
-        // Sans --resume, la conception est rejouée.
+        // Sans reprise, le plan est réécrit.
         let p = Arc::new(Probe::default());
         let cfg = Cfg { answer: Some(false), mission_dir: Some(dir.clone()), ..Default::default() };
         run_cfg(&c, p.clone(), Behavior::default(), cfg).await;
-        assert!(p.started.lock().unwrap().iter().any(|id| id.contains("/conception/")));
+        assert!(p.started().iter().any(|id| id.contains("/conception/")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn plan_retouche_pendant_le_point_de_controle_est_celui_de_la_realisation() {
         let dir = tmpdir();
-        let mut c = company_build();
-        c.checkpoint = true;
         let p = Arc::new(Probe::default());
-        let cfg = Cfg { answer: None, mission_dir: Some(dir.clone()), ..Default::default() };
         // Personne ne répond automatiquement : on retouche le plan puis on valide, comme la TUI.
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (_ctx, crx) = watch::channel(false);
-        let opts = CompanyOptions { base_dir: std::env::temp_dir(), mission_dir: cfg.mission_dir.clone(), lang: Lang::Fr, resume: false, pause: crate::runtime::pause::Gate::new() };
+        let opts = CompanyOptions::plain(std::env::temp_dir(), Some(dir.clone()), Lang::Fr);
         let d2 = dir.clone();
         let collector = tokio::spawn(async move {
             while let Some(e) = rx.recv().await {
@@ -1213,43 +1453,30 @@ reports_to = "ciso"
                 }
             }
         });
-        run_mission(&c, &agents(), "Brief", &opts, fake(p.clone(), Behavior::default()), tx, crx).await.unwrap();
+        run_mission(&company_checkpoint(), &agents(), "Brief", &opts, fake(p.clone(), Behavior::default()), tx, crx).await.unwrap();
         collector.await.unwrap();
-        let prompts = p.prompts.lock().unwrap();
-        let root = &prompts.iter().find(|(id, _, _)| id == "ceo/realisation/delegate").unwrap().1;
-        assert!(root.contains("PLAN RETOUCHE") && !root.contains("rapport(ceo)"), "{root}");
+        let root = p.prompt("ceo/realisation/delegate");
+        assert!(root.contains("PLAN RETOUCHE") && !root.contains("travail(ceo)"), "{root}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    async fn conception_annulee_non_reprenable() {
+    async fn plan_annule_non_reprenable() {
         let dir = tmpdir();
-        let c = company_build();
-        let cfg = Cfg { cancel_at_start: true, answer: Some(true), mission_dir: Some(dir.clone()), ..Default::default() };
-        run_cfg(&c, Arc::new(Probe::default()), Behavior::default(), cfg).await;
+        let cfg = Cfg { cancel_at_start: true, mission_dir: Some(dir.clone()), ..Default::default() };
+        run_cfg(&company(), Arc::new(Probe::default()), Behavior::default(), cfg).await;
         assert!(crate::runtime::missions::resumable_plan(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn annulation_pendant_le_point_de_controle() {
-        let mut c = company_build();
-        c.checkpoint = true;
         let p = Arc::new(Probe::default());
         // Personne ne répond ; l'annulation arrive pendant l'attente.
         let cfg = Cfg { answer: None, cancel_after_ms: Some(400), ..Default::default() };
-        let (out, _) = tokio::time::timeout(Duration::from_secs(10), run_cfg(&c, p.clone(), Behavior::default(), cfg)).await.expect("ne doit pas rester bloqué");
+        let (out, _) = tokio::time::timeout(Duration::from_secs(10), run_cfg(&company_checkpoint(), p.clone(), Behavior::default(), cfg)).await.expect("ne doit pas rester bloqué");
         assert_eq!(out.approved, Some(false));
-        assert!(!p.started.lock().unwrap().iter().any(|id| id.contains("/realisation/")));
-    }
-
-    #[tokio::test]
-    async fn plafond_d_appels_partage_entre_les_deux_phases() {
-        let mut c = company_build();
-        c.max_calls = 14; // 11 en conception, il n'en reste que 3 pour la réalisation
-        let p = Arc::new(Probe::default());
-        let (out, _) = run(&c, p.clone(), Behavior::default(), false).await;
-        assert_eq!(p.started.lock().unwrap().len(), 14);
-        assert!(!out.ok);
-        assert_eq!(out.calls, 14);
+        assert!(!p.started().iter().any(|id| id.contains("/realisation/")));
     }
 
     // ----------------------------------------------------------- modèle choisi par les délégants
@@ -1262,425 +1489,25 @@ reports_to = "ciso"
         c.seats[dev2].model = Some("opus".into()); // épinglé dans le .toml : le choix dynamique ne le change pas
         // Le CEO met la branche du CTO en haiku ; le manager relève dev1 en sonnet.
         let b = Behavior { models: vec![("ceo", "cto", "haiku"), ("mgr", "dev1", "sonnet")], ..Default::default() };
-        let (out, evs) = run(&c, p.clone(), b, false).await;
+        let (out, evs) = run(&c, p.clone(), b).await;
         assert!(out.ok);
-        let specs = p.specs.lock().unwrap();
-        let model = |id: &str| specs.iter().find(|(i, _)| i == id).map(|(_, s)| s.agents["a"]["model"].as_str().map(String::from)).unwrap();
-        assert_eq!(model("dev1/conception/work").as_deref(), Some("sonnet"), "choix du manager sur sa feuille");
-        assert_eq!(model("dev2/conception/work").as_deref(), Some("opus"), "modèle épinglé du poste");
-        assert_eq!(model("cto/conception/report"), None, "un manager garde son modèle");
-        let prompts = p.prompts.lock().unwrap();
-        let del = &prompts.iter().find(|(id, _, _)| id == "ceo/conception/delegate").unwrap().1;
-        assert!(del.contains("cheapest level"), "{del}");
-        let sys = &prompts.iter().find(|(id, _, _)| id == "mgr/conception/delegate").unwrap().2;
-        assert!(sys.contains("model pinned: opus"), "{sys}");
-        assert!(evs.iter().any(|e| matches!(e, RunEvent::Label { id, label, .. } if id == "dev1/conception/work" && label.contains("[sonnet]"))));
+        let model = |id: &str| p.spec(id).agents["a"]["model"].as_str().map(String::from);
+        assert_eq!(model("dev1/realisation/work").as_deref(), Some("sonnet"), "choix du manager sur sa feuille");
+        assert_eq!(model("dev2/realisation/work").as_deref(), Some("opus"), "modèle épinglé du poste");
+        assert_eq!(model("cto/realisation/report"), None, "un manager garde son modèle");
+        assert!(p.prompt("ceo/realisation/delegate").contains("cheapest level"));
+        assert!(p.system("mgr/realisation/delegate").contains("model pinned: opus"));
+        assert!(evs.iter().any(|e| matches!(e, RunEvent::Label { id, label, .. } if id == "dev1/realisation/work" && label.contains("[sonnet]"))));
     }
 
     #[tokio::test]
     async fn modele_de_branche_herite_par_les_feuilles_sans_choix() {
         let p = Arc::new(Probe::default());
         let b = Behavior { models: vec![("ceo", "cto", "haiku")], ..Default::default() };
-        let (_, _) = run(&company(), p.clone(), b, false).await;
-        let specs = p.specs.lock().unwrap();
-        let m = |id: &str| specs.iter().find(|(i, _)| i == id).map(|(_, s)| s.agents["a"]["model"].as_str().map(String::from)).unwrap();
-        assert_eq!(m("dev1/conception/work").as_deref(), Some("haiku"));
-        assert_eq!(m("dev2/conception/work").as_deref(), Some("haiku"));
-        assert_eq!(m("sec/conception/work"), None, "autre branche : modèle par défaut de l'agent");
-    }
-
-    // ----------------------------------------------------------- revue du CEO : vérification et redescente
-
-    #[tokio::test]
-    async fn revue_acceptee_une_seule_fois_par_le_ceo() {
-        let p = Arc::new(Probe::default());
-        let (out, _) = run(&company(), p.clone(), Behavior::default(), false).await;
-        assert!(out.ok);
-        let started = p.started.lock().unwrap().clone();
-        assert_eq!(started.iter().filter(|id| id.ends_with("/review")).collect::<Vec<_>>(), vec!["ceo/conception/review"], "seul le CEO relit");
-        let prompts = p.prompts.lock().unwrap();
-        let review = &prompts.iter().find(|(id, _, _)| id == "ceo/conception/review").unwrap().1;
-        assert!(review.contains("success criteria") && review.contains("rapport(cto)"), "{review}");
-    }
-
-    #[tokio::test]
-    async fn revue_non_conforme_relance_une_redescente_puis_le_rapport_final() {
-        let p = Arc::new(Probe::default());
-        let b = Behavior { review_redo_once: true, ..Default::default() };
-        let (out, _) = run(&company(), p.clone(), b, false).await;
-        assert!(out.ok, "la redescente a comblé le manque : {:?}", out.conception.blockers);
-        let started = p.started.lock().unwrap().clone();
-        assert_eq!(started.iter().filter(|id| *id == "cto/conception/delegate").count(), 2, "le CTO reçoit une tâche complémentaire");
-        assert_eq!(started.iter().filter(|id| *id == "ceo/conception/review").count(), 1, "max_review_rounds = 1");
-        let prompts = p.prompts.lock().unwrap();
-        let rep = &prompts.iter().rev().find(|(id, _, _)| id == "ceo/conception/report").unwrap().1;
-        assert!(rep.contains("complément pour cto"), "le rapport final contient la redescente : {rep}");
-    }
-
-    #[tokio::test]
-    async fn revue_sans_solution_remonte_a_l_utilisateur() {
-        let p = Arc::new(Probe::default());
-        let b = Behavior { review_unmet: true, ..Default::default() };
-        let (out, evs) = run(&company(), p.clone(), b, false).await;
-        assert!(!out.ok, "objectif non atteint = jamais ✔");
-        let summary = evs.iter().find_map(|e| match e { RunEvent::Escalation { summary, .. } => Some(summary.clone()), _ => None }).expect("escalade");
-        assert!(summary.contains("critère X non atteint"), "{summary}");
-    }
-
-    #[tokio::test]
-    async fn revue_desactivee_a_zero_tour() {
-        let p = Arc::new(Probe::default());
-        let mut c = company();
-        c.max_review_rounds = 0;
-        let (out, _) = run(&c, p.clone(), Behavior::default(), false).await;
-        assert!(out.ok && !p.started.lock().unwrap().iter().any(|id| id.ends_with("/review")));
-    }
-
-    #[tokio::test]
-    async fn superieurs_verifient_sans_ecrire() {
-        let p = Arc::new(Probe::default());
-        let (_, _) = run(&company_build(), p.clone(), Behavior::default(), false).await;
-        let specs = p.specs.lock().unwrap();
-        let spec = |id: &str| specs.iter().find(|(i, _)| i == id).map(|(_, s)| s.clone()).unwrap();
-        let rev = spec("ceo/realisation/review");
-        let tools = rev.tools.as_deref().unwrap();
-        assert!(tools.contains("Bash") && !tools.contains("Edit") && !tools.contains("Write"), "{tools}");
-        assert!(rev.allowed_tools.iter().any(|r| r == "Bash(cargo test:*)"), "commandes de vérification héritées des feuilles : {:?}", rev.allowed_tools);
-        assert!(rev.allowed_tools.iter().any(|r| r == "Bash(git status:*)"));
-        assert!(!rev.allowed_tools.iter().any(|r| r.starts_with("Edit") || r.starts_with("Write")));
-        assert_eq!(rev.permission_mode.as_deref(), Some("dontAsk"));
-        assert_eq!(spec("mgr/realisation/delegate").tools.as_deref(), Some(""), "la délégation reste du raisonnement pur");
-    }
-
-    #[tokio::test]
-    async fn assistants_legers_en_lecture_seule_avec_un_modele_moindre() {
-        let p = Arc::new(Probe::default());
-        let mut c = company_build();
-        let dev1 = c.index_of("dev1").unwrap();
-        c.seats[dev1].helpers = Some("haiku".into());
-        c.validate(&["a".to_string()]).unwrap();
-        let (_, _) = run(&c, p.clone(), Behavior::default(), false).await;
-        let specs = p.specs.lock().unwrap();
-        let spec = |id: &str| specs.iter().find(|(i, _)| i == id).map(|(_, s)| s.clone()).unwrap();
-        let d1 = spec("dev1/realisation/work");
-        let h = &d1.agents["essaim-assistant"];
-        assert_eq!(h["model"], "haiku");
-        let ht: Vec<&str> = h["tools"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
-        assert!(ht.contains(&"Bash") && !ht.contains(&"Edit") && !ht.contains(&"Write"), "{ht:?}");
-        assert!(d1.tools.as_deref().unwrap().split(',').any(|t| t == "Agent"));
-        let prompts = p.prompts.lock().unwrap();
-        assert!(prompts.iter().find(|(id, _, _)| id == "dev1/realisation/work").unwrap().2.contains("light assistants"));
-        // dev2 n'a pas d'assistants : ni sous-agent, ni outil Agent.
-        let d2 = spec("dev2/realisation/work");
-        assert!(!d2.agents.contains_key("essaim-assistant") && !d2.tools.as_deref().unwrap().contains("Agent"));
-        // Un modèle farfelu est refusé.
-        let mut bad = company_build();
-        bad.seats[dev1].helpers = Some("ha iku;".into());
-        assert!(bad.validate(&["a".to_string()]).is_err());
-    }
-
-    // ----------------------------------------------------------- blocages : correction et escalade
-
-    fn resumed_spec(p: &Probe, seat_id: &str) -> Option<RunSpec> {
-        p.specs.lock().unwrap().iter().find(|(id, _)| id.starts_with(&format!("{seat_id}/conception/work#"))).map(|(_, s)| s.clone())
-    }
-
-    #[tokio::test]
-    async fn commande_sure_demandee_est_accordee_durablement() {
-        let p = Arc::new(Probe::default());
-        let b = Behavior { ask_perm: vec![("dev1/conception/work", "cargo clippy --all-targets")], ..Default::default() };
-        let (out, _) = run(&company(), p.clone(), b, false).await;
-        assert!(out.ok, "{:?}", out.conception.blockers);
-        let s = resumed_spec(&p, "dev1").expect("reprise");
-        assert!(s.allowed_tools.iter().any(|r| r == "Bash(cargo clippy --all-targets:*)"), "{:?}", s.allowed_tools);
-        assert!(s.tools.as_deref().unwrap().contains("Bash") && s.permission_mode.as_deref() == Some("dontAsk"));
-        assert!(p.started.lock().unwrap().iter().any(|id| id.starts_with("mgr/conception/answer")), "le n+1 décide");
-    }
-
-    #[tokio::test]
-    async fn commande_a_risque_usage_unique_et_refus_par_defaut() {
-        let p = Arc::new(Probe::default());
-        let b = Behavior { deny_session: vec!["dev1/conception/work"], ..Default::default() };
-        let (out, _) = run(&company(), p.clone(), b, false).await;
-        assert!(out.ok, "{:?}", out.conception.blockers);
-        let s = resumed_spec(&p, "dev1").expect("reprise");
-        assert!(s.allowed_tools.iter().any(|r| r == "Bash(rm -rf cache)"), "règle exacte, sans :* : {:?}", s.allowed_tools);
-        assert!(!s.allowed_tools.iter().any(|r| r.contains(":*") && r.contains("rm")), "jamais de préfixe permanent");
-        assert!(p.prompts.lock().unwrap().iter().any(|(id, pr, _)| id.starts_with("mgr/conception/answer") && pr.contains("ONE single run")), "le supérieur sait que c'est à usage unique");
-
-        // Refusé par le n+1 : pas de reprise, le blocage de permission remonte.
-        let p2 = Arc::new(Probe::default());
-        let b2 = Behavior { deny_session: vec!["dev1/conception/work"], perm: vec![("mgr", "deny")], ..Default::default() };
-        let (out2, evs) = run(&company(), p2.clone(), b2, false).await;
-        assert!(!out2.ok && resumed_spec(&p2, "dev1").is_none());
-        assert!(evs.iter().any(|e| matches!(e, RunEvent::NodeFinished { id, status: NodeStatus::Blocked(m), .. } if id == "dev1/conception/work" && m.contains("rm -rf cache"))));
-    }
-
-    #[tokio::test]
-    async fn demande_remontee_jusqu_au_ceo() {
-        let p = Arc::new(Probe::default());
-        let b = Behavior { ask_perm: vec![("dev1/conception/work", "cargo test")], perm: vec![("mgr", "escalate"), ("cto", "escalate"), ("ceo", "approve")], ..Default::default() };
-        let (out, _) = run(&company(), p.clone(), b, false).await;
-        assert!(out.ok);
-        let started = p.started.lock().unwrap().clone();
-        for boss in ["mgr", "cto", "ceo"] {
-            assert!(started.iter().any(|id| id.starts_with(&format!("{boss}/conception/answer"))), "{boss} consulté : {started:?}");
-        }
-        // Le CEO est l'autorité finale : un « escalate » de sa part vaut refus.
-        let p2 = Arc::new(Probe::default());
-        let b2 = Behavior { ask_perm: vec![("dev1/conception/work", "cargo test")], perm: vec![("mgr", "escalate"), ("cto", "escalate"), ("ceo", "escalate")], ..Default::default() };
-        let (out2, _) = run(&company(), p2.clone(), b2, false).await;
-        assert!(!out2.ok && resumed_spec(&p2, "dev1").is_none());
-    }
-
-    #[tokio::test]
-    async fn question_de_l_employe_reponse_du_chef_puis_reprise() {
-        let p = Arc::new(Probe::default());
-        let b = Behavior { ask: vec!["dev1/conception/work"], ..Default::default() };
-        let (out, _) = run(&company(), p.clone(), b, false).await;
-        assert!(out.ok, "{:?}", out.conception.blockers);
-        let started = p.started.lock().unwrap().clone();
-        assert_eq!(started.iter().filter(|id| id.starts_with("mgr/conception/answer")).count(), 1, "le manager répond");
-        assert!(started.iter().any(|id| id.starts_with("dev1/conception/work#")), "l'employé est repris");
-        let specs = p.specs.lock().unwrap();
-        let resumed = specs.iter().find(|(id, _)| id.starts_with("dev1/conception/work#")).unwrap();
-        assert_eq!(resumed.1.resume.as_deref(), Some("sid-1"));
-        assert!(resumed.1.prompt.contains("snake_case"), "la réponse est transmise");
-        let ans = specs.iter().find(|(id, _)| id.starts_with("mgr/conception/answer")).unwrap();
-        assert!(ans.1.prompt.contains("snake_case ou camelCase") && ans.1.json_schema.as_deref().unwrap().contains("can_answer"));
-        let first = &specs.iter().find(|(id, _)| id == "dev1/conception/work").unwrap().1;
-        assert!(first.json_schema.as_deref().unwrap().contains("\"question\""), "la question est permise à la première passe");
-        let rep = &p.prompts.lock().unwrap().iter().find(|(id, _, _)| id == "mgr/conception/report").unwrap().1.clone();
-        assert!(rep.contains("reprise(dev1)"), "le rapport vient de la reprise : {rep}");
-    }
-
-    #[tokio::test]
-    async fn question_sans_reponse_possible_devient_un_blocage() {
-        let p = Arc::new(Probe::default());
-        let b = Behavior { ask: vec!["dev1/conception/work"], boss_cannot_answer: true, ..Default::default() };
-        let (out, evs) = run(&company(), p.clone(), b, false).await;
-        assert!(!out.ok);
-        assert!(!p.started.lock().unwrap().iter().any(|id| id.starts_with("dev1/conception/work#")), "pas de reprise sans réponse");
-        assert!(evs.iter().any(|e| matches!(e, RunEvent::NodeFinished { id, status: NodeStatus::Blocked(m), .. } if id == "dev1/conception/work" && m.contains("snake_case ou camelCase"))));
-    }
-
-    #[tokio::test]
-    async fn blocage_corrige_par_le_manager_la_phase_reussit() {
-        let p = Arc::new(Probe::default());
-        let b = Behavior { blocked_once: vec!["dev1/conception/work"], fix_assign: vec!["mgr"], ..Default::default() };
-        let (out, evs) = run(&company(), p.clone(), b, false).await;
-        assert!(out.ok, "le correctif a réussi : {:?}", out.conception.blockers);
-        let started = p.started.lock().unwrap().clone();
-        assert_eq!(started.iter().filter(|id| *id == "mgr/conception/fix").count(), 1);
-        assert_eq!(started.iter().filter(|id| *id == "dev1/conception/work").count(), 2, "relancé une fois");
-        assert!(evs.iter().any(|e| matches!(e, RunEvent::NodeFinished { id, status: NodeStatus::Blocked(_), .. } if id == "dev1/conception/work")));
-        let prompts = p.prompts.lock().unwrap();
-        let fix = &prompts.iter().find(|(id, _, _)| id == "mgr/conception/fix").unwrap().1;
-        assert!(fix.contains("could NOT complete") && fix.contains("tests rouges chez dev1") && fix.contains("correction plan"), "{fix}");
-        let rep = &prompts.iter().find(|(id, _, _)| id == "mgr/conception/report").unwrap().1;
-        assert!(rep.contains("correctif pour dev1") || rep.contains("travail(dev1)"), "{rep}");
-    }
-
-    #[tokio::test]
-    async fn blocage_non_reglable_remonte_au_superieur_qui_corrige() {
-        let p = Arc::new(Probe::default());
-        // mgr ne peut rien faire (il remonte) ; cto prend la main et réassigne.
-        let b = Behavior { blocked: vec!["dev1/conception/work"], fix_assign: vec!["cto"], ..Default::default() };
-        let (out, _) = run(&company(), p.clone(), b, false).await;
-        assert!(!out.ok, "dev1 reste bloqué malgré les correctifs");
-        let started = p.started.lock().unwrap().clone();
-        assert!(started.iter().any(|id| id == "mgr/conception/fix"), "le manager essaie d'abord");
-        assert!(started.iter().any(|id| id == "cto/conception/fix"), "puis le supérieur reçoit le blocage");
-        let prompts = p.prompts.lock().unwrap();
-        let cto = &prompts.iter().find(|(id, _, _)| id == "cto/conception/fix").unwrap().1;
-        assert!(cto.contains("Engineering Manager") && cto.contains("tests rouges chez dev1"), "{cto}");
-    }
-
-    #[tokio::test]
-    async fn ceo_bloque_previent_l_utilisateur_et_s_arrete_sur_stop() {
-        let p = Arc::new(Probe::default());
-        let b = Behavior { blocked: vec!["dev1/conception/work"], ..Default::default() };
-        let (out, evs) = run(&company(), p.clone(), b, false).await;
-        assert!(!out.ok);
-        let summary = evs.iter().find_map(|e| match e { RunEvent::Escalation { summary, .. } => Some(summary.clone()), _ => None }).expect("escalade vers l'utilisateur");
-        assert!(summary.contains("tests rouges chez dev1"), "{summary}");
-        assert!(!out.conception.blockers.is_empty() && out.conception.blockers.iter().any(|b| b.kind == "tests"));
-        assert!(matches!(evs.last(), Some(RunEvent::RunFinished { ok: false, .. })));
-    }
-
-    #[tokio::test]
-    async fn relance_apres_discussion_injecte_la_decision_de_l_utilisateur() {
-        let dir = tmpdir();
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("resolution.md"), "DECISION: autoriser git").unwrap();
-        let p = Arc::new(Probe::default());
-        let b = Behavior { blocked: vec!["dev1/conception/work"], ..Default::default() };
-        let cfg = Cfg { answer: Some(true), mission_dir: Some(dir), escalations: vec![EscalationReply::Retry], ..Default::default() };
-        let (out, evs) = run_cfg(&company(), p.clone(), b, cfg).await;
-        assert!(!out.ok);
-        assert_eq!(evs.iter().filter(|e| matches!(e, RunEvent::Escalation { .. })).count(), 2, "relance puis nouveau blocage");
-        let prompts = p.prompts.lock().unwrap();
-        let fixes: Vec<&String> = prompts.iter().filter(|(id, _, _)| id == "ceo/conception/fix").map(|(_, pr, _)| pr).collect();
-        assert!(fixes.len() >= 2 && !fixes[0].contains("DECISION") && fixes.iter().skip(1).all(|f| f.contains("DECISION: autoriser git")), "{fixes:?}");
-    }
-
-    /// Sortie structurée perdue malgré le nouvel essai : le texte produit remonte comme blocage au lieu d'être jeté.
-    #[tokio::test]
-    async fn sortie_structuree_perdue_remonte_le_texte_produit() {
-        let p = Arc::new(Probe::default());
-        let b = Behavior { no_structured: vec!["dev1/conception/work"], ..Default::default() };
-        let (out, _) = run(&company(), p.clone(), b, false).await;
-        assert!(!out.ok, "rien ne prouve que la tâche est faite");
-        assert_eq!(p.started.lock().unwrap().iter().filter(|id| *id == "dev1/conception/work").count(), 2, "un seul nouvel essai");
-        let prompts = p.prompts.lock().unwrap();
-        let fix = &prompts.iter().find(|(id, _, _)| id == "mgr/conception/fix").unwrap().1;
-        assert!(fix.contains("trois failles XSS"), "le texte produit sert au correctif : {fix}");
-    }
-
-    #[tokio::test]
-    async fn refus_de_permission_est_un_blocage_meme_si_l_agent_dit_done() {
-        let p = Arc::new(Probe::default());
-        let b = Behavior { deny: vec!["dev1/conception/work"], ..Default::default() };
-        let (out, evs) = run(&company(), p.clone(), b, false).await;
-        assert!(!out.ok);
-        let blocked = evs.iter().find_map(|e| match e { RunEvent::NodeFinished { id, status: NodeStatus::Blocked(m), .. } if id == "dev1/conception/work" => Some(m.clone()), _ => None });
-        assert!(blocked.is_some_and(|m| m.contains("[permission]") && m.contains("git status")));
-    }
-
-    #[tokio::test]
-    async fn lot_bloque_les_suivants_ne_demarrent_pas() {
-        let p = Arc::new(Probe::default());
-        let b = Behavior { overlap: true, blocked: vec!["dev1/realisation/work", "dev2/realisation/work"], ..Default::default() };
-        let (out, _) = run(&company_build(), p.clone(), b, false).await;
-        assert!(!out.ok);
-        let started = p.started.lock().unwrap().clone();
-        let n = started.iter().filter(|id| *id == "dev1/realisation/work" || *id == "dev2/realisation/work").count();
-        assert_eq!(n, 1, "le second lot n'est pas lancé sur une base bloquée : {started:?}");
-    }
-
-    #[tokio::test]
-    async fn conception_bloquee_ne_lance_pas_la_realisation() {
-        let p = Arc::new(Probe::default());
-        let b = Behavior { blocked: vec!["dev1/conception/work"], ..Default::default() };
-        let (out, _) = run(&company_build(), p.clone(), b, false).await;
-        assert!(!out.ok && out.realisation.is_none() && out.approved.is_none());
-        assert!(!p.started.lock().unwrap().iter().any(|id| id.contains("/realisation/")));
-    }
-
-    #[tokio::test]
-    async fn tours_de_correction_bornes_par_max_fix_rounds() {
-        let mut c = company();
-        c.max_fix_rounds = 1;
-        let p = Arc::new(Probe::default());
-        let b = Behavior { blocked: vec!["dev1/conception/work"], fix_assign: vec!["mgr"], ..Default::default() };
-        let (out, _) = run(&c, p.clone(), b, false).await;
-        assert!(!out.ok);
-        let started = p.started.lock().unwrap().clone();
-        assert_eq!(started.iter().filter(|id| *id == "mgr/conception/fix").count(), 1);
-        assert_eq!(started.iter().filter(|id| *id == "dev1/conception/work").count(), 2);
-    }
-
-    #[test]
-    fn lecture_du_plan_de_correction() {
-        let c = Company::parse(SRC).unwrap();
-        let kids = c.children(c.index_of("ceo").unwrap());
-        let ok = json!({"plan": "p", "assignments": [{"to": "cto", "task": "corriger"}]});
-        assert!(matches!(parse_fix(&ok, &c, &kids, None), FixPlan::Assign { .. }));
-        let esc = json!({"plan": "p", "escalate": "il manque un droit"});
-        assert_eq!(parse_fix(&esc, &c, &kids, None), FixPlan::Escalate("il manque un droit".into()));
-        assert!(matches!(parse_fix(&json!({"plan": "p"}), &c, &kids, None), FixPlan::Escalate(_)), "rien à assigner : on remonte");
-    }
-
-    #[test]
-    fn sortie_sans_statut_ou_refus_jamais_un_succes() {
-        let r = |structured: Option<Value>, denials: Vec<String>| NodeResult { structured, denials, output: "txt".into(), ..Default::default() };
-        assert!(parse_outcome(&r(None, vec![]), &[]).is_none(), "sortie structurée absente");
-        assert!(parse_outcome(&r(Some(json!({"status": "oups", "report": "x"})), vec![]), &[]).is_none());
-        let o = parse_outcome(&r(Some(json!({"status": "done", "report": "ok"})), vec!["Bash(git push)".into()]), &[]).unwrap();
-        assert_eq!(o.status, Status::Blocked);
-        assert_eq!(o.blockers[0].kind, "permission");
-        let o = parse_outcome(&r(Some(json!({"status": "blocked", "report": "KO"})), vec![]), &[]).unwrap();
-        assert_eq!(o.blockers.len(), 1, "un blocage est toujours expliqué");
-        assert_eq!(parse_outcome(&NodeResult { is_error: true, output: "boum".into(), ..Default::default() }, &[]).unwrap().status, Status::Failed);
-    }
-
-    // ----------------------------------------------------------- briques pures
-
-    #[test]
-    fn schema_restreint_aux_subordonnes_directs() {
-        let c = Company::parse(SRC).unwrap();
-        let kids = c.children(c.index_of("ceo").unwrap());
-        let ids: Vec<String> = kids.iter().map(|&k| c.seats[k].id.clone()).collect();
-        let v: Value = serde_json::from_str(&delegation_schema(&ids, false)).unwrap();
-        assert_eq!(v["properties"]["assignments"]["items"]["properties"]["to"]["enum"], json!(["cto", "ciso"]));
-        assert!(v["properties"]["assignments"]["items"]["properties"].get("scope").is_none());
-        let v: Value = serde_json::from_str(&delegation_schema(&ids, true)).unwrap();
-        assert!(v["properties"]["assignments"]["items"]["required"].as_array().unwrap().contains(&json!("scope")));
-    }
-
-    #[test]
-    fn lecture_des_affectations() {
-        let c = Company::parse(SRC).unwrap();
-        let kids = c.children(c.index_of("ceo").unwrap());
-        let v = json!({"assignments": [
-            {"to": "cto", "task": "A"}, {"to": "cto", "task": "B"}, {"to": "dev1", "task": "hors hiérarchie"},
-            {"to": "ciso", "task": "  "}, {"to": 3, "task": "x"}
-        ]});
-        let a = parse_assignments(&v, &c, &kids, None).unwrap();
-        assert_eq!(a.len(), 1);
-        assert_eq!(a[0].task, "A\n\nB", "doublons regroupés sur un seul poste, inconnus/vides ignorés");
-        assert_eq!(a[0].steps, vec!["A", "B"], "deux affectations au même poste = deux étapes successives, pas une tâche fusionnée");
-        assert!(parse_assignments(&json!({"assignments": []}), &c, &kids, None).is_err());
-        assert!(parse_assignments(&json!({}), &c, &kids, None).is_err());
-    }
-
-    #[test]
-    fn lecture_des_perimetres() {
-        let c = Company::parse(SRC).unwrap();
-        let kids = c.children(c.index_of("ceo").unwrap());
-        let parent = vec!["src/**".to_string()];
-        let v = json!({"assignments": [
-            {"to": "cto", "task": "A", "scope": ["./src/api/**", "docs/x.md", "src/ui/**"]},
-            {"to": "ciso", "task": "B", "scope": ["docs/**"]},
-            {"to": "ciso", "task": "C"}
-        ]});
-        let a = parse_assignments(&v, &c, &kids, Some(&parent)).unwrap();
-        assert_eq!(a.len(), 1, "ciso n'a aucun motif valide : ignoré");
-        assert_eq!(a[0].scope, vec!["src/api/**", "src/ui/**"], "docs/x.md hors du périmètre du délégant est écarté");
-        assert!(parse_assignments(&json!({"assignments": [{"to": "cto", "task": "A", "scope": ["docs/**"]}]}), &c, &kids, Some(&parent)).is_err());
-        let total = vec!["**".to_string()];
-        assert!(parse_assignments(&json!({"assignments": [{"to": "cto", "task": "A", "scope": ["../secret/**"]}]}), &c, &kids, Some(&total)).is_err(), "remontée hors du projet refusée, même sous un parent total");
-    }
-
-    #[test]
-    fn poste_de_realisation_sans_tout_le_projet_ni_chemin_reserve() {
-        let c = Company::parse(SRC).unwrap();
-        let kids_mgr = c.children(c.index_of("mgr").unwrap());
-        let total = vec!["**".to_string()];
-        // dev1 est un poste ⚒ : « tout le projet » (écriture sans restriction) est refusé.
-        let v = json!({"assignments": [{"to": "dev1", "task": "A", "scope": ["**"]}]});
-        assert!(parse_assignments(&v, &c, &kids_mgr, Some(&total)).is_err());
-        // Chemins réservés (.claude, .git) écartés ; le reste du périmètre est conservé.
-        let v = json!({"assignments": [{"to": "dev1", "task": "A", "scope": [".claude/**", ".git/hooks/**", "src/dev1/**"]}]});
-        let a = parse_assignments(&v, &c, &kids_mgr, Some(&total)).unwrap();
-        assert_eq!(a[0].scope, vec!["src/dev1/**"]);
-        // Un poste qui n'écrit pas (manager) garde son périmètre tel quel.
-        let kids_cto = c.children(c.index_of("cto").unwrap());
-        let v = json!({"assignments": [{"to": "mgr", "task": "A", "scope": ["**"]}]});
-        assert_eq!(parse_assignments(&v, &c, &kids_cto, Some(&total)).unwrap()[0].scope, vec!["**"]);
-    }
-
-    #[test]
-    fn refus_de_realisation_signale() {
-        assert!(note_refus(Some(false)).is_some(), "refus : le message doit apparaître");
-        assert!(note_refus(Some(true)).is_none() && note_refus(None).is_none());
-    }
-
-    #[test]
-    fn rapport_tronque_les_gros_resultats() {
-        let big = "x".repeat(MAX_CHILD_CHARS + 500);
-        let p = report_prompt("t", &[("CTO".into(), "cto".into(), "sous-tâche".into(), true, big)], &[]);
-        assert!(p.contains("chars omitted"));
-        assert!(p.len() < MAX_CHILD_CHARS + 1500);
+        run(&company(), p.clone(), b).await;
+        let m = |id: &str| p.spec(id).agents["a"]["model"].as_str().map(String::from);
+        assert_eq!(m("dev1/realisation/work").as_deref(), Some("haiku"));
+        assert_eq!(m("dev2/realisation/work").as_deref(), Some("haiku"));
+        assert_eq!(m("sec/realisation/work"), None, "autre branche : modèle par défaut de l'agent");
     }
 }
