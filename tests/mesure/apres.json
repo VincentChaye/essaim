@@ -17,11 +17,11 @@
         "work": 1
       },
       "description": "3 postes, brief court",
-      "duree_ms": 501,
+      "duree_ms": 318,
       "jetons_cache": 2088,
-      "jetons_entree": 8259,
+      "jetons_entree": 9227,
       "jetons_sortie": 629,
-      "part_cache": 0.2528
+      "part_cache": 0.2263
     },
     "M2": {
       "appels": 13,
@@ -36,11 +36,11 @@
         "work": 3
       },
       "description": "7 postes d'analyse, brief détaillé",
-      "duree_ms": 802,
+      "duree_ms": 490,
       "jetons_cache": 4825,
-      "jetons_entree": 16499,
+      "jetons_entree": 18319,
       "jetons_sortie": 1401,
-      "part_cache": 0.2924
+      "part_cache": 0.2634
     },
     "M3": {
       "appels": 13,
@@ -55,11 +55,11 @@
         "work": 3
       },
       "description": "7 postes dont 2 de réalisation",
-      "duree_ms": 810,
+      "duree_ms": 533,
       "jetons_cache": 4825,
-      "jetons_entree": 16570,
+      "jetons_entree": 18388,
       "jetons_sortie": 1401,
-      "part_cache": 0.2912
+      "part_cache": 0.2624
     },
     "M4": {
       "appels": 24,
@@ -74,11 +74,11 @@
         "work": 6
       },
       "description": "7 postes, revue rejetée, relance demandée par l'humain, sorties volumineuses (troncature)",
-      "duree_ms": 1831,
+      "duree_ms": 1037,
       "jetons_cache": 9650,
-      "jetons_entree": 53249,
+      "jetons_entree": 56739,
       "jetons_sortie": 66929,
-      "part_cache": 0.1812
+      "part_cache": 0.1701
     }
   }
 }

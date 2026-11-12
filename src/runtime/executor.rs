@@ -294,6 +294,9 @@ pub async fn run_local(
     // Arrêt demandé : on n'envoie le prompt d'arrêt qu'une fois, puis on compte le délai de grâce.
     let mut stopping = false;
     let mut got_result = false;
+    // Réinitialisation de la fenêtre de quota, telle que `claude` l'annonce en cours d'appel : elle date la
+    // pause quand le message de limite ne porte qu'une heure en clair (« resets 5:40pm »).
+    let mut window_reset: Option<u64> = None;
     let started = tokio::time::Instant::now();
     // Attente de l'humain déjà retirée du délai (voir `WaitProbe`).
     let mut credited = Duration::ZERO;
@@ -308,6 +311,7 @@ pub async fn run_local(
                     match &ev {
                         ClaudeEvent::Init { session_id, .. } if !session_id.is_empty() => res.session_id = Some(session_id.clone()),
                         ClaudeEvent::Init { .. } => res.session_id = None,
+                        ClaudeEvent::RateLimit { resets_at: Some(t), .. } => window_reset = Some(*t),
                         ClaudeEvent::Result { text, is_error, tokens, cached, duration_ms, structured, .. } => {
                             got_result = true;
                             res = NodeResult {
@@ -394,6 +398,10 @@ pub async fn run_local(
     if res.is_error {
         let err = proc.stderr_text().await;
         res.limit = usage_limit(&res.output).or_else(|| usage_limit(&err));
+        // Message sans horodatage : l'heure annoncée par l'événement de quota, si elle est encore à venir.
+        if let Some(l) = &mut res.limit {
+            l.resets_at = l.resets_at.or(window_reset.filter(|&t| t > crate::runtime::pause::now_s()));
+        }
         // Plafond de budget épuisé : dit explicitement, sinon le poste paraît avoir raté son travail.
         // Pas de rejeu : seul un `max_budget_usd` plus haut changerait quelque chose.
         if res.limit.is_none() && (budget_exhausted(&res.output) || budget_exhausted(&err)) {

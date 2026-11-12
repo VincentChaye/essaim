@@ -17,12 +17,23 @@ use tokio::task::JoinSet;
 /// Taille conservée (début+fin) du texte d'un résultat d'un tour précédent dans l'historique du poste.
 const OLD_ROUND_CHARS: usize = 2000;
 
-/// Exécute des affectations par lots sans chevauchement de fichiers, l'un après l'autre (les affectations
-/// sans périmètre — de l'analyse — vont toutes dans le premier lot). Un lot qui n'aboutit pas arrête les
-/// suivants : on ne construit pas sur une base cassée, sauf si l'humain a dit de continuer sans ce poste.
+/// Exécute des affectations vague après vague (`Assignment::stage`) : une vague ne démarre que quand la
+/// précédente est terminée, ce qui laisse un poste construire sur le résultat d'un autre. Dans une vague, les
+/// affectations partent par lots sans chevauchement de fichiers, l'un après l'autre (celles sans périmètre —
+/// de l'analyse — vont toutes dans le premier lot). Un lot qui n'aboutit pas arrête tout ce qui suit : on ne
+/// construit pas sur une base cassée, sauf si l'humain a dit de continuer sans ce poste.
 /// Renvoie les affectations menées (avec leur résultat) et celles jamais démarrées.
 async fn run_batch(sh: &Arc<Shared>, from: usize, phase: Phase, todo: Vec<Assignment>) -> (Vec<(Assignment, SeatOut)>, Vec<Assignment>) {
-    let lots = scope::batches(&todo.iter().map(|a| a.scope.clone()).collect::<Vec<_>>());
+    let mut stages: Vec<u32> = todo.iter().map(|a| a.stage).collect();
+    stages.sort_unstable();
+    stages.dedup();
+    // Lots dans l'ordre d'exécution, en indices de `todo`.
+    let mut lots: Vec<Vec<usize>> = vec![];
+    for st in stages {
+        let wave: Vec<usize> = (0..todo.len()).filter(|&n| todo[n].stage == st).collect();
+        let scopes: Vec<Vec<String>> = wave.iter().map(|&n| todo[n].scope.clone()).collect();
+        lots.extend(scope::batches(&scopes).into_iter().map(|lot| lot.into_iter().map(|k| wave[k]).collect()));
+    }
     let mut outs: Vec<Option<SeatOut>> = (0..todo.len()).map(|_| None).collect();
     let mut started = vec![false; todo.len()];
     for lot in lots {

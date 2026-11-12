@@ -521,7 +521,11 @@ pub fn usage_limit(text: &str) -> Option<UsageLimit> {
     let low = text.to_lowercase();
     let hit = LIMIT_PATTERNS.iter().any(|p| low.contains(p))
         // « limit reached … resets at … » : formulation longue, des deux morceaux ensemble seulement.
-        || (low.contains("limit reached") && (low.contains("reset") || low.contains("try again")));
+        || (low.contains("limit reached") && (low.contains("reset") || low.contains("try again")))
+        // `claude` 2.1.322 : « You've hit your 5-hour limit · resets 5:40pm (Europe/Paris) » (de même pour la
+        // limite hebdomadaire). L'heure n'y est pas un horodatage : elle vient de l'événement de quota, sinon
+        // l'attente se fait à l'aveugle.
+        || (low.contains("hit your") && low.contains("limit") && low.contains("reset"));
     hit.then(|| UsageLimit { resets_at: epoch_in(text) })
 }
 
@@ -976,6 +980,9 @@ mod tests {
         // Forme réelle du flux `claude -p` : message puis epoch, séparés par une barre verticale.
         assert_eq!(usage_limit("Claude AI usage limit reached|1761580800"), Some(UsageLimit { resets_at: Some(1_761_580_800) }));
         assert_eq!(usage_limit("5-hour limit reached"), Some(UsageLimit { resets_at: None }));
+        assert_eq!(usage_limit("You've hit your 5-hour limit · resets 5:40pm (Europe/Paris)"), Some(UsageLimit { resets_at: None }), "message de claude 2.1.322");
+        assert_eq!(usage_limit("You’ve hit your weekly limit · resets Mon 9am"), Some(UsageLimit { resets_at: None }));
+        assert!(usage_limit("the API may hit your rate limit").is_none(), "sans annonce de réinitialisation : pas une pause");
         assert_eq!(usage_limit("Limit reached. Your limit will reset at 3pm."), Some(UsageLimit { resets_at: None }));
         assert!(usage_limit("API Error: 429 {\"type\":\"rate_limit_error\"}").is_some());
         assert_eq!(usage_limit("retry at 1761580800000").map(|l| l.resets_at), None, "sans message de limite : pas une pause");

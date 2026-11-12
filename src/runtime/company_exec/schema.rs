@@ -11,33 +11,25 @@ use serde_json::{Value, json};
 /// Modèles qu'un délégant peut choisir pour un poste (du moins cher au plus capable).
 pub(super) const MODELS: [&str; 3] = ["haiku", "sonnet", "opus"];
 
-/// Schéma de sortie des appels de travail et de rapport. Avec un gabarit, `report` est remplacé par un champ
-/// obligatoire par section : la forme de la réponse est celle que le délégant a demandée.
+/// Schéma de sortie des appels de travail et de rapport, **le même pour tous les postes et tous les appels**.
 ///
-/// Aucune borne `maxLength` n'est posée dans le schéma : `claude` valide la sortie structurée et renvoie une
-/// erreur d'outil au moindre dépassement (« must NOT have more than N characters »), que le modèle ne sait pas
-/// éviter — il compte mal les caractères. L'appel partait alors en boucle d'erreurs puis échouait sans rien
-/// rendre. Les tailles restent annoncées dans le prompt (budget) et appliquées à la lecture, par troncature.
-pub(super) fn outcome_schema(sections: &[Section]) -> String {
-    let mut v = outcome_base();
-    if !sections.is_empty() {
-        let props: serde_json::Map<String, Value> = sections
-            .iter()
-            .map(|s| (s.key.clone(), json!({"type": "string", "description": format!("{} (about {} chars, cut past that)", s.expect, s.max_chars)})))
-            .collect();
-        v["properties"].as_object_mut().map(|p| p.remove("report"));
-        v["properties"]["sections"] = json!({"type": "object", "properties": props, "required": sections.iter().map(|s| s.key.clone()).collect::<Vec<_>>()});
-        v["required"] = json!(["status", "sections"]);
-    }
-    v.to_string()
-}
-
-fn outcome_base() -> Value {
+/// `claude` présente ce schéma au modèle comme un outil (`StructuredOutput`), et les outils ouvrent le
+/// préfixe que le cache de prompt partage entre les appels. Mesuré sur `claude` 2.1.322 : outils et prompt
+/// système commun font environ 6 000 jetons ; avec un schéma propre à chaque appel (un champ par section
+/// demandée) ils étaient réécrits dans le cache à chaque appel, avec un schéma constant ils y sont relus.
+/// Les sections voulues par le délégant sont donc décrites dans le prompt (`sections_hint`) et rendues dans
+/// `sections`, une entrée par clé ; le schéma n'en nomme aucune.
+///
+/// Aucune borne `maxLength` non plus : `claude` valide la sortie structurée et renvoie une erreur d'outil au
+/// moindre dépassement (« must NOT have more than N characters »), que le modèle ne sait pas éviter — il
+/// compte mal les caractères. Les tailles sont annoncées dans le prompt et appliquées à la lecture.
+pub(super) fn outcome_schema() -> String {
     json!({
         "type": "object",
         "properties": {
             "status": {"type": "string", "enum": ["done", "blocked", "failed"]},
-            "report": {"type": "string"},
+            "report": {"type": "string", "description": "your answer, when the task asks for no sections"},
+            "sections": {"type": "object", "additionalProperties": {"type": "string"}, "description": "when the task asks for sections: one entry per section, under the key the task gives"},
             "blockers": {
                 "type": "array",
                 "items": {
@@ -51,8 +43,9 @@ fn outcome_base() -> Value {
                 }
             }
         },
-        "required": ["status", "report"]
+        "required": ["status"]
     })
+    .to_string()
 }
 
 /// Lit le résultat d'un appel de travail/rapport. `None` : sortie structurée absente ou illisible.
@@ -77,8 +70,16 @@ pub(super) fn parse_outcome(r: &NodeResult, sections: &[Section]) -> Option<Outc
         .map(|b| Blocker { kind: text(&b["kind"]).chars().take(20).collect(), detail: text(&b["detail"]), needs: text(&b["needs"]) })
         .filter(|b| !b.detail.is_empty())
         .collect();
+    let filled = |s: &Section| !text(&v["sections"][&s.key]).is_empty();
     let report = if sections.is_empty() {
-        text(&v["report"])
+        // Rapport libre. Le schéma n'impose plus `report` : une réponse rangée dans `sections` est reprise telle quelle.
+        Some(text(&v["report"])).filter(|t| !t.is_empty()).unwrap_or_else(|| {
+            let parts = v["sections"].as_object().into_iter().flatten().map(|(k, x)| format!("### {k}\n{}", text(x)));
+            parts.collect::<Vec<_>>().join("\n\n")
+        })
+    } else if !sections.iter().any(filled) && !text(&v["report"]).is_empty() {
+        // Sections demandées, réponse rendue d'un bloc dans `report` : gardée, dans le budget total du gabarit.
+        truncate_middle(&text(&v["report"]), sections.iter().map(|s| s.max_chars).sum())
     } else {
         // Sections dans l'ordre voulu par le délégant ; une section vide reste visible (« — »),
         // une section trop longue est tronquée (le budget du délégant tient, sans erreur d'outil).
@@ -111,10 +112,12 @@ pub(super) fn node_status(kind: Kind, r: &NodeResult, sections: &[Section]) -> N
     }
 }
 
-/// Schéma JSON de la délégation : `to` restreint aux ids des subordonnés directs.
-/// `context` : des pointeurs (fichiers, notes, URL) plutôt que des copies. `scope` : facultatif, il ne sert
-/// qu'à ordonner les travaux qui toucheraient les mêmes fichiers.
-pub(super) fn delegation_schema(kid_ids: &[String]) -> String {
+/// Schéma JSON de la délégation, **le même pour tous les postes** (voir `outcome_schema` : un schéma constant
+/// laisse le cache de prompt servir le préfixe commun). `to` n'est donc pas restreint ici aux subordonnés
+/// directs : la fiche de poste les nomme, et `parse_assignments` écarte tout autre destinataire.
+/// `stage` : la vague, c'est-à-dire l'ordre entre subordonnés (1 d'abord). `context` : des pointeurs (fichiers, notes, URL) plutôt que
+/// des copies. `scope` : facultatif, il ne sert qu'à ordonner les travaux qui toucheraient les mêmes fichiers.
+pub(super) fn delegation_schema() -> String {
     json!({
         "type": "object",
         "properties": {
@@ -124,8 +127,9 @@ pub(super) fn delegation_schema(kid_ids: &[String]) -> String {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "to": {"type": "string", "enum": kid_ids},
+                        "to": {"type": "string", "description": "id of one of your direct subordinates"},
                         "task": {"type": "string"},
+                        "stage": {"type": "integer", "description": "1 = starts first (default); a later stage starts once every earlier stage is finished"},
                         "context": {"type": "array", "items": {"type": "string"}, "description": "pointers: project paths (optionally path:line-line), mission notes, URLs"},
                         "scope": {"type": "array", "items": {"type": "string"}, "description": "file patterns this subordinate will modify"},
                         "model": {"type": "string", "enum": MODELS},
@@ -192,7 +196,44 @@ fn with_context(task: &str, a: &Value) -> String {
     format!("{task}\n\nContext pointers from your supervisor (read what you need, look up the rest yourself):\n- {}", pointers.join("\n- "))
 }
 
-/// Lit la sortie structurée : ignore les destinataires inconnus, regroupe les affectations d'un même poste en étapes.
+/// Deux vagues qui se suivent et ne mobilisent qu'un seul et même subordonné n'en font qu'une : ses affectations
+/// deviennent des étapes successives, ce qui donne le même ordre. Sans cela une branche (manager, puis ses
+/// subordonnés) referait délégation et rapport à chaque vague — mesuré sur une mission réelle : 36 appels au
+/// lieu des 16 estimés, un supérieur ayant donné trois vagues au même manager.
+/// `sorted` : affectations triées par vague, au plus une par (poste, vague).
+fn merge_solo_stages(sorted: Vec<Assignment>) -> Vec<Assignment> {
+    // Vagues qui ne portent qu'une affectation.
+    let solo = |stage: u32| sorted.iter().filter(|a| a.stage == stage).count() == 1;
+    let mut out: Vec<Assignment> = vec![];
+    for a in &sorted {
+        // `last.stage` reste celui de la première vague fusionnée : seule, elle aussi, par construction.
+        let merge = out.last().is_some_and(|last| last.to == a.to && solo(last.stage) && solo(a.stage));
+        match out.last_mut() {
+            Some(last) if merge => {
+                last.steps.extend(a.steps.iter().cloned());
+                last.task.push_str("\n\n");
+                last.task.push_str(&a.task);
+                last.model = last.model.clone().or_else(|| a.model.clone());
+                if last.sections.is_empty() {
+                    last.sections = a.sections.clone();
+                }
+                for m in &a.scope {
+                    if !last.scope.contains(m) {
+                        last.scope.push(m.clone());
+                    }
+                }
+            }
+            _ => out.push(a.clone()),
+        }
+    }
+    out
+}
+
+/// Vague la plus tardive acceptée d'un délégant (au-delà, la valeur est ramenée à cette borne).
+const MAX_STAGE: u64 = 20;
+
+/// Lit la sortie structurée : ignore les destinataires inconnus, regroupe les affectations d'un même poste et
+/// d'une même vague en étapes, et rend les affectations dans l'ordre des vagues (`stage`).
 /// `parent_scope` : périmètre du délégant. Le périmètre ne donne plus de droits : il sert à ne pas faire
 /// travailler deux postes sur les mêmes fichiers en même temps. Les motifs hors du périmètre du délégant sont
 /// écartés. Sans motif valide, un poste qui réalise (ou qui dirige une branche) hérite du périmètre du
@@ -223,10 +264,13 @@ pub(super) fn parse_assignments(v: &Value, c: &Company, kids: &[usize], parent_s
         }));
         let model = a["model"].as_str().map(str::trim).filter(|m| MODELS.contains(m)).map(String::from);
         let step = with_context(task.trim(), a);
-        // Plusieurs affectations au même subordonné = plusieurs **étapes successives**, pas une tâche
-        // fusionnée : chacune repart d'une session neuve, ce qui garde les contextes petits. `task` reste
-        // leur concaténation, pour les rapports et l'historique du supérieur.
-        match out.iter_mut().find(|x| x.to == idx) {
+        // Vague absente, nulle ou illisible : la première.
+        let stage = a["stage"].as_u64().unwrap_or(1).clamp(1, MAX_STAGE) as u32;
+        // Plusieurs affectations au même subordonné dans la même vague = plusieurs **étapes successives**,
+        // pas une tâche fusionnée : chacune repart d'une session neuve, ce qui garde les contextes petits.
+        // `task` reste leur concaténation, pour les rapports et l'historique du supérieur. D'une vague à
+        // l'autre, le même poste reçoit des affectations distinctes : d'autres travaillent entre les deux.
+        match out.iter_mut().find(|x| x.to == idx && x.stage == stage) {
             Some(x) => {
                 x.model = x.model.clone().or(model);
                 if x.sections.is_empty() {
@@ -241,11 +285,33 @@ pub(super) fn parse_assignments(v: &Value, c: &Company, kids: &[usize], parent_s
                     }
                 }
             }
-            None => out.push(Assignment { sections, to: idx, steps: vec![step], task: task.trim().to_string(), scope: sc, model }),
+            None => out.push(Assignment { sections, to: idx, stage, steps: vec![step], task: task.trim().to_string(), scope: sc, model }),
         }
     }
     if out.is_empty() {
-        bail!("no valid delegation to a direct subordinate");
+        let ids: Vec<&str> = kids.iter().map(|&k| c.seats[k].id.as_str()).collect();
+        bail!("no valid delegation to a direct subordinate (`to` must be one of: {})", ids.join(", "));
+    }
+    // Tri stable : dans une vague, l'ordre d'écriture du délégant est conservé.
+    out.sort_by_key(|a| a.stage);
+    let out = merge_solo_stages(out);
+    // Plusieurs vagues : chaque poste apprend que sa tâche n'est qu'une part d'un ensemble ordonné. Sans cela il
+    // se déclare bloqué pour un travail prévu plus tard (« tests non lancés »), ce qui arrête les vagues suivantes.
+    let mut stages: Vec<u32> = out.iter().map(|a| a.stage).collect();
+    stages.dedup();
+    let mut out = out;
+    if stages.len() > 1 {
+        for a in &mut out {
+            let rank = stages.iter().position(|&s| s == a.stage).map_or(1, |k| k + 1);
+            let note = if rank < stages.len() {
+                format!("\n\n(Stage {rank} of {} in your supervisor's plan. Work it keeps for a later stage is not yours now: do not start it, and do not report \"blocked\" because it is still to come — judge \"done\" on this task alone.)", stages.len())
+            } else {
+                format!("\n\n(Stage {rank} of {}, the last, in your supervisor's plan: the earlier stages are finished, build on their results.)", stages.len())
+            };
+            for step in &mut a.steps {
+                step.push_str(&note);
+            }
+        }
     }
     Ok(out)
 }

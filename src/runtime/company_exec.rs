@@ -156,6 +156,10 @@ impl Section {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Assignment {
     pub to: usize,
+    /// Vague du travail chez le délégant (1 = la première). Toutes les affectations d'une vague sont
+    /// terminées avant que la suivante démarre : c'est ainsi qu'un poste construit sur le résultat d'un
+    /// autre (une spécification, puis la réalisation, puis une relecture) dans une seule délégation.
+    pub stage: u32,
     /// Gabarit de réponse voulu par le délégant (vide = rapport libre).
     pub sections: Vec<Section>,
     /// Les étapes confiées à ce poste, dans l'ordre, telles que le délégant les a écrites. Une feuille
@@ -405,11 +409,17 @@ reports_to = "ciso"
         interrupt_once: Vec<&'static str>,
         /// Ces postes confient DEUX étapes successives à chacun de leurs subordonnés mobilisés.
         two_steps: Vec<&'static str>,
+        /// (poste délégant, destinataire, vague) : le délégant place ce destinataire dans cette vague (sinon la première).
+        stages: Vec<(&'static str, &'static str, u32)>,
+        /// (poste délégant, destinataire, vague) : une affectation de plus pour ce destinataire, dans cette vague.
+        again: Vec<(&'static str, &'static str, u32)>,
     }
 
-    fn enum_ids(schema: &str) -> Vec<String> {
-        let v: Value = serde_json::from_str(schema).unwrap();
-        v["properties"]["assignments"]["items"]["properties"]["to"]["enum"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect()
+    /// Subordonnés directs du poste, lus dans sa fiche (« - id · titre… ») : le schéma de délégation est le
+    /// même pour tous les postes, il ne les nomme pas.
+    fn kid_ids(system: &str) -> Vec<String> {
+        let Some(rest) = system.split("Your direct subordinates (you delegate only to them):\n").nth(1) else { return vec![] };
+        rest.lines().map_while(|l| l.strip_prefix("- ")).filter_map(|l| l.split(" · ").next()).map(String::from).collect()
     }
 
     /// Périmètre du délégant, lu dans son prompt (« Your file scope: `a`, `b`. »).
@@ -447,9 +457,9 @@ reports_to = "ciso"
                 // Identifiant : « poste/phase/type », avec un suffixe d'étape (« work@2 ») et de reprise (« work#7 »).
                 let parts: Vec<&str> = job.id.split('/').collect();
                 let (seat, brut) = (parts[0].to_string(), parts[2]);
-                let resumed = brut.contains('#');
+                let resumed = job.spec.resume.is_some();
                 let kind = brut.split(['@', '#']).next().unwrap_or(brut).to_string();
-                // Identifiant sans le suffixe de reprise : c'est lui que les scénarios désignent.
+                // Identifiant sans le suffixe de reprise ou de rappel : c'est lui que les scénarios désignent.
                 let base = job.id.split('#').next().unwrap_or(&job.id).to_string();
                 let session = Some(format!("sid-{seat}"));
                 if b.limit_once.contains(&base.as_str()) && first_time(&p.limited, &base) {
@@ -490,7 +500,7 @@ reports_to = "ciso"
                         ..Default::default()
                     },
                     "delegate" => {
-                        let ids = enum_ids(job.spec.json_schema.as_deref().unwrap());
+                        let ids = kid_ids(job.spec.append_system_prompt.as_deref().unwrap_or_default());
                         let parent = parent_scope(&job.spec.prompt);
                         let dir = parent.first().map(|s| s.trim_end_matches("/**").to_string()).filter(|s| s != "**").unwrap_or_else(|| "src".into());
                         let picked: Vec<String> = match b.only.iter().find(|(s, _)| *s == seat) {
@@ -503,6 +513,9 @@ reports_to = "ciso"
                                 let mut a = json!({"to": k, "task": format!("task for {k}")});
                                 if let Some((_, _, m)) = b.models.iter().find(|(from, to, _)| *from == seat && to == k) {
                                     a["model"] = json!(m);
+                                }
+                                if let Some((_, _, st)) = b.stages.iter().find(|(from, to, _)| *from == seat && to == k) {
+                                    a["stage"] = json!(st);
                                 }
                                 if b.context.contains(&seat.as_str()) {
                                     a["context"] = json!([format!("src/{k}.rs:10-40"), "https://exemple.fr/doc"]);
@@ -533,6 +546,11 @@ reports_to = "ciso"
                         } else {
                             items
                         };
+                        // Le même subordonné rappelé dans une vague ultérieure (une relecture après la réalisation).
+                        let mut items = items;
+                        for (_, to, st) in b.again.iter().filter(|(from, _, _)| *from == seat) {
+                            items.push(json!({"to": to, "task": format!("suite pour {to}"), "stage": st}));
+                        }
                         NodeResult { structured: Some(json!({"assignments": items})), output: "{}".into(), session_id: session, ..Default::default() }
                     }
                     "work" | "report" => {
@@ -648,13 +666,16 @@ reports_to = "ciso"
         assert_eq!(secs.len(), 2);
         assert_ne!(secs[0].key, secs[1].key, "clés uniques");
         assert_eq!((secs[0].max_chars, secs[1].max_chars), (MAX_SECTION_CHARS, MIN_SECTION_CHARS), "tailles bornées");
-        let v: serde_json::Value = serde_json::from_str(&schema::outcome_schema(&secs)).unwrap();
-        assert!(v["properties"]["report"].is_null());
-        let champ = &v["properties"]["sections"]["properties"][&secs[0].key];
-        // Aucune borne dans le schéma : elle ferait échouer l'outil `StructuredOutput` au moindre dépassement.
-        assert!(champ["maxLength"].is_null(), "taille jamais imposée par le schéma");
-        assert!(champ["description"].as_str().unwrap().contains("1000 chars"), "budget annoncé au modèle");
-        assert_eq!(v["required"], json!(["status", "sections"]));
+        let v: serde_json::Value = serde_json::from_str(&schema::outcome_schema()).unwrap();
+        // Le schéma ne nomme aucune section : il reste le même d'un appel à l'autre (cache de prompt), et le
+        // gabarit du délégant est décrit dans le prompt.
+        assert!(v["properties"]["sections"]["properties"].is_null(), "aucune section nommée dans le schéma");
+        assert_eq!(v["properties"]["sections"]["additionalProperties"]["type"], "string");
+        // Aucune borne non plus : elle ferait échouer l'outil `StructuredOutput` au moindre dépassement.
+        assert!(!schema::outcome_schema().contains("maxLength"), "taille jamais imposée par le schéma");
+        let hint = work_prompt("t", &secs, None, true, false);
+        assert!(hint.contains(&format!("`{}`", secs[0].key)) && hint.contains("1000 chars"), "clé et budget annoncés au modèle : {hint}");
+        assert_eq!(v["required"], json!(["status"]));
         // Plus de statut « question » : une question se pose à l'humain par l'outil, pendant la tâche.
         assert_eq!(v["properties"]["status"]["enum"], json!(["done", "blocked", "failed"]));
         let r = NodeResult { structured: Some(json!({"status": "done", "sections": {secs[0].key.clone(): "r1"}})), ..Default::default() };
@@ -667,6 +688,11 @@ reports_to = "ciso"
         assert!(coupe.contains("chars omitted"), "section trop longue tronquée : {coupe}");
         assert!(coupe.chars().count() < 300, "budget tenu après troncature");
         assert!(Section::template((0..10).map(|i| (format!("s{i}"), String::new(), None))).len() <= MAX_SECTIONS);
+        // Le schéma n'impose plus la forme : une réponse rendue dans l'autre champ est gardée, jamais perdue.
+        let lu = |v: Value, secs: &[Section]| parse_outcome(&NodeResult { structured: Some(v), ..Default::default() }, secs).unwrap().report;
+        assert_eq!(lu(json!({"status": "done", "report": "tout d'un bloc"}), &secs), "tout d'un bloc", "sections demandées, réponse dans `report`");
+        assert_eq!(lu(json!({"status": "done", "sections": {"a": "x", "b": "y"}}), &[]), "### a\nx\n\n### b\ny", "rapport libre, réponse dans `sections`");
+        assert_eq!(lu(json!({"status": "done", "report": "r", "sections": {"a": "x"}}), &[]), "r", "rapport libre : `report` prime");
     }
 
     #[test]
@@ -682,13 +708,15 @@ reports_to = "ciso"
         assert_eq!((o.status, o.blockers[0].detail.as_str()), (Status::Failed, "boum"));
     }
 
+    /// Le schéma est présenté au modèle comme un outil, et les outils ouvrent le préfixe que le cache de prompt
+    /// partage entre les appels : un schéma propre à chaque poste ferait réécrire ce préfixe à chaque appel.
     #[test]
-    fn schema_restreint_aux_subordonnes_directs() {
-        let v: Value = serde_json::from_str(&delegation_schema(&["cto".to_string(), "ciso".to_string()])).unwrap();
+    fn schemas_constants_d_un_poste_a_l_autre() {
+        let v: Value = serde_json::from_str(&delegation_schema()).unwrap();
         let item = &v["properties"]["assignments"]["items"];
-        assert_eq!(item["properties"]["to"]["enum"], json!(["cto", "ciso"]));
-        assert_eq!(item["required"], json!(["to", "task"]), "le périmètre et le contexte sont facultatifs");
-        assert!(item["properties"]["context"].is_object() && item["properties"]["scope"].is_object());
+        assert!(item["properties"]["to"]["enum"].is_null(), "aucun identifiant de poste dans le schéma");
+        assert_eq!(item["required"], json!(["to", "task"]), "le périmètre, le contexte et la vague sont facultatifs");
+        assert!(item["properties"]["context"].is_object() && item["properties"]["scope"].is_object() && item["properties"]["stage"].is_object());
         let r: Value = serde_json::from_str(&review_schema()).unwrap();
         assert_eq!(r["required"], json!(["accepted", "findings"]));
         assert!(r["properties"]["assignments"].is_null(), "la revue constate, elle ne relance rien");
@@ -713,8 +741,66 @@ reports_to = "ciso"
         assert_eq!(a[0].steps[1], "étape 2");
         assert_eq!(a[0].task, "étape 1\n\nétape 2", "la tâche rappelée au supérieur ne porte pas les pointeurs");
         assert_eq!(a[0].scope, vec!["src/api/**", "docs/api.md"]);
-        assert!(parse_assignments(&json!({"assignments": [{"to": "x", "task": "y"}]}), &c, &kids, &all).is_err());
+        // Le schéma ne restreint plus `to` : un destinataire inconnu est refusé ici, et l'erreur rendue au
+        // délégant nomme ceux qui sont permis.
+        let err = parse_assignments(&json!({"assignments": [{"to": "x", "task": "y"}]}), &c, &kids, &all).unwrap_err().to_string();
+        assert!(err.contains("cto, ciso"), "{err}");
         assert!(parse_assignments(&json!({}), &c, &kids, &all).is_err());
+    }
+
+    #[test]
+    fn lecture_des_vagues() {
+        let c = company();
+        let kids = c.children(c.root().unwrap());
+        let all = vec!["**".to_string()];
+        let v = json!({"assignments": [
+            {"to": "cto", "task": "réaliser", "stage": 2},
+            {"to": "ciso", "task": "exigences"},
+            {"to": "ciso", "task": "exigences, suite", "stage": 1},
+            {"to": "ciso", "task": "relire", "stage": 3},
+            {"to": "cto", "task": "sans vague lisible", "stage": "bientôt"},
+            {"to": "cto", "task": "trop loin", "stage": 900},
+        ]});
+        let a = parse_assignments(&v, &c, &kids, &all).unwrap();
+        let vu: Vec<(&str, u32, usize)> = a.iter().map(|x| (c.seats[x.to].id.as_str(), x.stage, x.steps.len())).collect();
+        // Rangées par vague ; même poste et même vague = étapes ; même poste dans deux vagues = deux affectations.
+        assert_eq!(vu, vec![("ciso", 1, 2), ("cto", 1, 1), ("cto", 2, 1), ("ciso", 3, 1), ("cto", 20, 1)], "vague absente ou illisible : la première ; vague bornée");
+        // Chaque poste sait où se place sa tâche : sans cela il se dit bloqué pour un travail prévu plus tard.
+        assert!(a[0].steps.iter().all(|s| s.contains("(Stage 1 of 4")) && a[0].steps[0].contains("do not report \"blocked\""), "{:?}", a[0].steps);
+        assert!(a[4].steps[0].contains("(Stage 4 of 4, the last"), "le rang compte les vagues utilisées, pas leur numéro : {}", a[4].steps[0]);
+        assert!(!a[0].task.contains("Stage"), "la tâche rappelée au supérieur reste celle qu'il a écrite");
+        // Une seule vague : rien n'est ajouté.
+        let a = parse_assignments(&json!({"assignments": [{"to": "cto", "task": "t", "stage": 3}]}), &c, &kids, &all).unwrap();
+        assert_eq!(a[0].steps, vec!["t"]);
+    }
+
+    /// Des vagues successives pour un seul et même subordonné ne sont que des étapes : une seule descente de sa
+    /// branche, au lieu d'une délégation et d'un rapport par vague à chaque niveau.
+    #[test]
+    fn vagues_d_un_seul_subordonne_fusionnees_en_etapes() {
+        let c = company();
+        let kids = c.children(c.root().unwrap());
+        let all = vec!["**".to_string()];
+        let lu = |v: Value| -> Vec<(String, u32, usize)> { parse_assignments(&v, &c, &kids, &all).unwrap().iter().map(|x| (c.seats[x.to].id.clone(), x.stage, x.steps.len())).collect() };
+        let a = parse_assignments(&json!({"assignments": [
+            {"to": "cto", "task": "écrire", "stage": 1, "scope": ["src/**"]},
+            {"to": "cto", "task": "tester", "stage": 2, "scope": ["tests/**"]},
+            {"to": "cto", "task": "vérifier", "stage": 3},
+        ]}), &c, &kids, &all).unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].steps, vec!["écrire", "tester", "vérifier"], "dans l'ordre des vagues, sans note de vague : il n'en reste qu'une");
+        // Périmètres réunis ; la troisième affectation, sans périmètre, apporte celui du délégant (`**`).
+        assert_eq!((a[0].task.as_str(), a[0].scope.clone()), ("écrire\n\ntester\n\nvérifier", vec!["src/**".to_string(), "tests/**".to_string(), "**".to_string()]));
+        // Dès qu'un autre poste intervient entre deux, l'ordre entre postes compte : les vagues restent.
+        let v = json!({"assignments": [
+            {"to": "cto", "task": "a", "stage": 1}, {"to": "cto", "task": "b", "stage": 2},
+            {"to": "ciso", "task": "relire", "stage": 3},
+            {"to": "cto", "task": "corriger", "stage": 4}, {"to": "cto", "task": "clore", "stage": 5},
+        ]});
+        assert_eq!(lu(v), vec![("cto".to_string(), 1, 2), ("ciso".to_string(), 3, 1), ("cto".to_string(), 4, 2)]);
+        // Une vague partagée avec un autre poste n'est pas fusionnée avec la suivante.
+        let v = json!({"assignments": [{"to": "ciso", "task": "a", "stage": 1}, {"to": "cto", "task": "b", "stage": 1}, {"to": "cto", "task": "c", "stage": 2}]});
+        assert_eq!(lu(v), vec![("ciso".to_string(), 1, 1), ("cto".to_string(), 1, 1), ("cto".to_string(), 2, 1)]);
     }
 
     /// Le périmètre ne donne plus de droits : il ordonne les travaux. Hors de celui du délégant, il est écarté.
@@ -1114,8 +1200,11 @@ reports_to = "ciso"
         assert_eq!(reqs[0].kind, AskKind::Review);
         assert!(reqs[0].questions[0].text.contains("critère X non atteint"));
         let started = p.started();
-        assert_eq!(started.iter().filter(|id| *id == "ceo/realisation/review").count(), 2, "revue, descente corrective, nouvelle revue");
-        let delegations: Vec<String> = p.prompts.lock().unwrap().iter().filter(|(id, _, _)| id == "ceo/realisation/delegate").map(|(_, pr, _)| pr.clone()).collect();
+        // Les appels de la descente corrective sont des nœuds distincts (« …/review#n ») : leur coût s'ajoute
+        // à celui des premiers au lieu de l'écraser.
+        assert_eq!(started.iter().filter(|id| id.starts_with("ceo/realisation/review")).count(), 2, "revue, descente corrective, nouvelle revue");
+        assert_eq!(started.iter().collect::<std::collections::BTreeSet<_>>().len(), started.len(), "aucun nom de nœud en double : {started:?}");
+        let delegations: Vec<String> = p.prompts.lock().unwrap().iter().filter(|(id, _, _)| id.starts_with("ceo/realisation/delegate")).map(|(_, pr, _)| pr.clone()).collect();
         assert_eq!(delegations.len(), 2);
         assert!(delegations[1].contains("critère X non atteint") && delegations[1].contains("priorité au critère X") && delegations[1].contains("assign only what is needed"), "{}", delegations[1]);
         assert_eq!(started.iter().filter(|id| *id == "ceo/realisation/report").count(), 1, "un seul rapport final");
@@ -1214,6 +1303,46 @@ reports_to = "ciso"
         let tl = p.timeline.lock().unwrap().clone();
         let (s1, e1, s2, e2) = chrono(&tl, "dev1/realisation/work", "dev2/realisation/work");
         assert!(e1 < s2 || e2 < s1, "même périmètre : l'un après l'autre ({tl:?})");
+    }
+
+    /// Une seule délégation, mais un ordre entre subordonnés : la vague 2 ne démarre qu'une fois la vague 1
+    /// terminée (réaliser après une spécification), et un poste rappelé en vague 3 refait une descente.
+    #[tokio::test]
+    async fn les_vagues_d_une_delegation_se_suivent() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { stages: vec![("ceo", "cto", 2)], again: vec![("ceo", "ciso", 3)], ..Default::default() };
+        let (out, _) = run(&company(), p.clone(), b).await;
+        assert!(out.ok, "{out:?}");
+        let tl = p.timeline.lock().unwrap().clone();
+        let pos = |x: &str| tl.iter().position(|e| e == x).unwrap_or_else(|| panic!("absent : {x} ({tl:?})"));
+        assert!(pos("E:ciso/realisation/report") < pos("S:cto/realisation/delegate"), "vague 1 terminée avant la vague 2 ({tl:?})");
+        // Vague 3 : le CISO est rappelé. Ses appels sont des nœuds distincts, sinon leur coût écraserait celui des premiers.
+        let rappels: Vec<&String> = tl.iter().filter(|e| e.starts_with("S:ciso/realisation/delegate#") || e.starts_with("S:sec/realisation/work#") || e.starts_with("S:ciso/realisation/report#")).collect();
+        assert_eq!(rappels.len(), 3, "délégation, travail et rapport de la vague 3 ({tl:?})");
+        assert!(pos("E:cto/realisation/report") < pos(rappels[0]), "vague 2 terminée avant la vague 3 ({tl:?})");
+        assert!(p.prompts.lock().unwrap().iter().any(|(id, pr, _)| id.starts_with("ciso/realisation/delegate#") && pr.contains("suite pour ciso")), "la vague 3 porte sa propre tâche");
+        // Aucun appel de plus pour le délégant : une délégation, une revue, un rapport.
+        let started = p.started();
+        assert_eq!(started.iter().filter(|id| id.starts_with("ceo/realisation/delegate")).count(), 1, "une seule délégation du boss");
+        assert_eq!(started.len() as u32, BASE_CALLS + 3, "{started:?}");
+    }
+
+    #[tokio::test]
+    async fn une_vague_en_echec_arrete_les_suivantes() {
+        let p = Arc::new(Probe::default());
+        let b = Behavior { stages: vec![("ceo", "cto", 2)], fail: vec!["sec/realisation/work"], ..Default::default() };
+        let (out, _) = run(&company(), p.clone(), b).await;
+        assert!(!out.ok);
+        let started = p.started();
+        assert!(!started.iter().any(|id| id.starts_with("cto/") || id.starts_with("dev")), "on ne construit pas sur une vague cassée : {started:?}");
+        let restes = out.realisation.map(|r| r.blockers).unwrap_or_default();
+        assert!(restes.iter().any(|b| b.detail.contains("not started")), "{restes:?}");
+    }
+
+    #[test]
+    fn la_delegation_dit_qu_elle_est_unique_et_comment_ordonner() {
+        let d = delegate_prompt("t", &["**".to_string()]);
+        assert!(d.contains("ONLY delegation") && d.contains("`stage`") && d.contains("shared notes"), "{d}");
     }
 
     #[tokio::test]

@@ -159,7 +159,7 @@ pub(super) fn plan_prompt(outline: &[String]) -> String {
 
 pub(super) fn delegate_prompt(task: &str, scope: &[String]) -> String {
     let mut out = format!(
-        "Task received from your supervisor:\n{task}\n\nSplit it among your direct subordinates: involve only those who are useful, and give each a self-contained, precise task that does not overlap with the others. You may look at the project first if it helps you split well.\n\nYour subordinates see neither the brief nor the task you received: what you write is ALL they get. So each task must stand alone — objective, the constraints that apply, how to tell it is done — and carry only what that subordinate needs."
+        "Task received from your supervisor:\n{task}\n\nSplit it among your direct subordinates: involve only those who are useful, and give each a self-contained, precise task that does not overlap with the others. You may look at the project first if it helps you split well.\n\nThis is your ONLY delegation for this task: nobody calls you back to hand out a next part, and whatever you assign to nobody is never done. So assign now everything the task needs, from its first part to its last — when the task lists several steps, all of them, not just the first. Order the work with `stage`: stage 1 starts first; work that needs another subordinate's result (building after a specification, reviewing after the build) takes a later stage and starts once every earlier stage is finished. Within a stage your subordinates work at the same time. Stages order DIFFERENT subordinates and each one makes a whole branch delegate and report again, so use as few as the order really needs; successive work for the same subordinate goes in one stage, as several assignments. A later stage does not receive the earlier results: have the earlier subordinate write its deliverable to a file of the shared notes, and give that path in the `context` of the later one.\n\nYour subordinates see neither the brief nor the task you received: what you write is ALL they get. So each task must stand alone — objective, the constraints that apply, how to tell it is done — and carry only what that subordinate needs."
     );
     // Des pointeurs plutôt que des copies : le subordonné lit ce qu'il lui faut, au lieu que le contenu
     // traverse chaque niveau de la hiérarchie (et soit relu à chaque tour d'outil).
@@ -169,7 +169,7 @@ pub(super) fn delegate_prompt(task: &str, scope: &[String]) -> String {
     // Une session longue coûte tours × contexte moyen, donc son coût croît avec le carré de sa
     // durée : six étapes dans une seule session coûtent plusieurs fois les mêmes six en six sessions.
     out.push_str(
-        " One assignment = ONE step, small enough to end in a single coherent commit. If a subordinate's work needs several successive steps, give it SEVERAL assignments, one per step, in order: they run one after the other, each starting from a clean session. Never pack a sequence of steps into one assignment — a session that accumulates everything costs several times the same work split into steps.",
+        " One assignment = ONE step, small enough to end in a single coherent commit. If a subordinate's work needs several successive steps, give it SEVERAL assignments of the same stage, one per step, in order: they run one after the other, each starting from a clean session. Never pack a sequence of steps into one assignment — a session that accumulates everything costs several times the same work split into steps.",
     );
     out.push_str(&format!(
         "\n\nYour file scope: `{}`. For each subordinate that will modify files, give a `scope`: project-relative file patterns (e.g. `src/api/**`, `docs/guide.md`), ALL included in yours. It only serves to run non-overlapping work in parallel: two subordinates whose scopes overlap run one after the other, so prefer disjoint scopes. Omit `scope` for a subordinate that only analyses.",
@@ -177,7 +177,7 @@ pub(super) fn delegate_prompt(task: &str, scope: &[String]) -> String {
     ));
     out.push_str(" For each subordinate also give `sections`: the answer template you want back, 2 to 6 sections (`name`, `expect` = what it must contain, `max_chars` 100 to 1000). You decide what you need, so make it match your own plan for using the answer; keep it tight.");
     out.push_str(MODEL_ADVICE);
-    out.push_str(" Answer only through the structured output.");
+    out.push_str("\n\nBefore answering, check that every part of the task is assigned to someone, at some stage. Answer only through the structured output.");
     out
 }
 
@@ -187,7 +187,7 @@ fn sections_hint(sections: &[Section]) -> String {
         return String::new();
     }
     let mut out = String::from(
-        "\n\nYour supervisor wants the answer in these sections (one structured field each). The size is a budget: condense, keep the substance, never pad — anything past it is cut, so put what matters first and last.\n",
+        "\n\nYour supervisor wants the answer in these sections: one entry of `sections` each, under the key shown, and no `report`. The size is a budget: condense, keep the substance, never pad — anything past it is cut, so put what matters first and last.\n",
     );
     for s in sections {
         out.push_str(&format!("- `{}` ({}, about {} chars): {}\n", s.key, s.title, s.max_chars, s.expect));

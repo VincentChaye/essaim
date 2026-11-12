@@ -77,6 +77,9 @@ pub(super) struct Shared {
     pub(super) cost: Mutex<u64>,
     /// Modèle choisi par les délégants : pour une feuille son propre modèle, sinon le défaut des feuilles de sa branche.
     pub(super) hints: Mutex<BTreeMap<usize, String>>,
+    /// Nœuds déjà terminés. Un poste rappelé par son supérieur (vague suivante, descente corrective) refait les
+    /// mêmes types d'appel : son nouveau nœud prend alors un nom distinct, pour ne pas écraser le coût du premier.
+    pub(super) closed: Mutex<std::collections::BTreeSet<String>>,
     /// L'humain a demandé l'arrêt de la mission en réponse à une demande : plus aucun appel ne part.
     pub(super) halted: AtomicBool,
 }
@@ -265,12 +268,17 @@ impl Shared {
         let base = format!("{}/{}/{}", seat.id, phase.key(), kind.key());
         // Une étape numérotée est un nœud nommé (« …/work@2 ») ; une reprise ou une réponse prend le
         // numéro d'appel, pour ne pas écraser le coût affiché du premier.
-        let id = match (step, resume.is_some()) {
+        let mut id = match (step, resume.is_some()) {
             (Some(k), false) => format!("{base}@{}", k + 1),
             (Some(k), true) => format!("{base}@{}#{n}", k + 1),
             (None, true) => format!("{base}#{n}"),
             (None, false) => base,
         };
+        // Même poste, même type d'appel, une seconde fois (vague suivante, descente corrective) : nœud distinct.
+        // Un appel rejoué après une pause garde son nom, son nœud n'ayant jamais été clos.
+        if self.closed.lock().unwrap_or_else(PoisonError::into_inner).contains(&id) {
+            id = format!("{id}#{n}");
+        }
         let builds = seat.builds || self.company.seats.len() == 1;
         let verb = match (kind, phase) {
             (Kind::Work, _) if resume.is_some() => "resumes",
@@ -331,13 +339,13 @@ impl Shared {
             Err(e) => (NodeStatus::Failed(e.to_string()), 0),
         };
         *cost_guard(&self.cost) += used;
+        self.closed.lock().unwrap_or_else(PoisonError::into_inner).insert(id.clone());
         emit(&self.tx, RunEvent::NodeFinished { id, status, tokens: used });
         res
     }
 
     /// Délégation avec un nouvel essai si la sortie structurée est absente ou inutilisable.
     pub(super) async fn delegate(self: &Arc<Self>, i: usize, phase: Phase, task: &str, kids: &[usize], sc: &[String]) -> Result<Vec<Assignment>> {
-        let ids: Vec<String> = kids.iter().map(|&k| self.company.seats[k].id.clone()).collect();
         let mut last = anyhow::anyhow!("delegation failed");
         // Second essai dans la même session : le modèle a déjà la tâche et sa propre réponse en contexte,
         // on lui redemande seulement de corriger la forme au lieu de tout renvoyer.
@@ -348,7 +356,7 @@ impl Shared {
                 (_, Some(_)) => retry_note(&last.to_string()),
                 _ => format!("{}{}", delegate_prompt(task, sc), retry_note(&last.to_string())),
             };
-            let r = self.call(i, phase, Kind::Delegate, prompt, Some(delegation_schema(&ids)), kids, sc, &[], again.clone(), None).await;
+            let r = self.call(i, phase, Kind::Delegate, prompt, Some(delegation_schema()), kids, sc, &[], again.clone(), None).await;
             match r {
                 Ok(res) if !res.is_error => {
                     again = res.session_id.clone();
@@ -376,7 +384,7 @@ impl Shared {
         let mut salvage = String::new();
         let mut session = None;
         for _ in 0..2 {
-            match self.call(i, phase, kind, prompt.clone(), Some(outcome_schema(sections)), kids, sc, sections, resume.clone(), step).await {
+            match self.call(i, phase, kind, prompt.clone(), Some(outcome_schema()), kids, sc, sections, resume.clone(), step).await {
                 Ok(r) => {
                     if let Some(o) = parse_outcome(&r, sections) {
                         return o;

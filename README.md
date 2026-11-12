@@ -88,7 +88,8 @@ Un run peut s'arrêter en pause au lieu d'échouer, et reprendre plus tard — m
 - **Limite d'abonnement atteinte** : le run se met en pause tout seul. Le message de limite n'est pas traité comme une
   erreur du poste : aucun poste n'est marqué en échec, l'appel refusé ne compte pas dans le plafond d'appels, et il est
   rejoué tel quel à la reprise. L'onglet Run et la barre d'onglets affichent `⏸` avec l'heure de reprise, lue dans le
-  message de `claude` ; le run repart seul à cette heure (sans heure annoncée, il retente au bout de 10 minutes).
+  message de `claude` ou, s'il ne donne qu'une heure en clair, dans son relevé de quota ; le run repart seul à cette
+  heure (sans heure connue, il retente au bout de 10 minutes).
 - **À la main** : `p` dans l'onglet Run met en pause ou reprend. Aucun nouvel appel ne part, et les agents **déjà
   en vol sont arrêtés** : un prompt prioritaire leur est poussé dans leur session (« n'entreprends plus rien, termine
   proprement l'action en cours, rends un bilan court »). Mesuré sur `claude` 2.1.316 : l'agent finit son action en
@@ -303,6 +304,14 @@ par la fiche de poste de chaque agent, pas par ses droits : tous les postes ont 
    les feuilles travaillent, puis chaque supérieur synthétise les résultats de sa branche. Le boss relit le résultat
    contre l'objectif et rend le rapport (`rapport.md`).
 
+   Un supérieur ne délègue qu'**une fois** : il distribue d'un coup tout le travail de sa tâche, et l'ordonne par
+   **vagues** (`stage`). La vague 1 part d'abord ; un travail qui a besoin du résultat d'un autre poste (réaliser
+   après une spécification, relire après la réalisation) prend une vague ultérieure, qui ne démarre qu'une fois la
+   précédente terminée. Dans une vague, les postes travaillent en parallèle. Le résultat d'une vague passe à la
+   suivante par les notes partagées : le premier poste y écrit son livrable, le suivant en reçoit le chemin.
+   Chaque vague refait délégation et rapport dans la branche qu'elle mobilise : des vagues successives qui ne
+   s'adressent qu'à un seul et même subordonné sont donc ramenées à des étapes d'une seule descente.
+
 La réalisation a lieu pour toute entreprise, avec ou sans poste ⚒.
 
 ### Droits des agents
@@ -347,7 +356,8 @@ subordonné lit lui-même ce qu'on lui indique, et va chercher seul ce qui lui m
 
 Les livrables longs vont dans le dossier partagé `.essaim/missions/<id>/notes/` (`notes/<poste>.md`) : le poste ne
 remonte qu'un résumé court avec le chemin. Les périmètres ne sont plus des règles de permission : ils servent à
-l'ordonnancement, deux affectations dont les périmètres se chevauchent étant exécutées l'une après l'autre.
+l'ordonnancement, deux affectations d'une même vague dont les périmètres se chevauchent étant exécutées l'une après
+l'autre.
 
 ### Missions liées
 
@@ -512,7 +522,8 @@ Quand un supérieur confie **plusieurs affectations au même subordonné**, ce n
 **étapes successives** : le poste les exécute l'une après l'autre, et **chaque étape est un appel `claude` neuf**.
 Son contexte ne porte donc que l'étape en cours, au lieu d'accumuler tout le travail précédent.
 
-- Chaque étape est un nœud distinct dans le journal et dans le coût (`dev1/realisation/work@1`, `@2`…).
+- Chaque étape est un nœud distinct dans le journal et dans le coût (`dev1/realisation/work@1`, `@2`…). Un poste
+  rappelé dans une vague ultérieure, ou par une descente corrective, a lui aussi des nœuds distincts (`…/work#12`).
 - Chaque étape sait où elle en est (« Step 2 of 3 ») et reçoit la consigne de **ne pas refaire ni auditer** les
   précédentes, ni commencer les suivantes — sans quoi une session neuve relit le projet pour « vérifier ».
 - Une étape qui n'aboutit pas **arrête les suivantes** : on ne construit pas sur une base cassée.
@@ -546,14 +557,30 @@ jetons d'entrée composés par essaim ; `avant.json` → `apres.json`) :
 
 | mission | appels avant → après | jetons d'entrée avant → après | |
 |---|---|---|---|
-| M3 — 7 postes, plan + réalisation | 21 → **13** | 23 329 → **16 570** | même travail, −38 % d'appels |
-| M1 — 3 postes | 6 → 7 | 5 540 → 8 259 | avant : conception seule ; après : plan **et** réalisation |
-| M2 — 7 postes | 12 → 13 | 13 277 → 16 499 | idem |
-| M4 — 7 postes, revue rejetée | 21 → 24 | 43 617 → 53 249 | la relance demandée par l'humain refait une descente complète |
+| M3 — 7 postes, plan + réalisation | 21 → **13** | 23 329 → **18 388** | même travail, −38 % d'appels |
+| M1 — 3 postes | 6 → 7 | 5 540 → 9 227 | avant : conception seule ; après : plan **et** réalisation |
+| M2 — 7 postes | 12 → 13 | 13 277 → 18 319 | idem |
+| M4 — 7 postes, revue rejetée | 21 → 24 | 43 617 → 56 739 | la relance demandée par l'humain refait une descente complète |
 
 Seule M3 compare le même travail des deux côtés. M1 et M2 n'avaient pas de poste ⚒ : l'ancien moteur s'arrêtait au
 plan, le nouveau fait aussi la réalisation. Le prix à payer est une fiche de poste plus longue (règles de demande à
-l'humain, notes partagées) : 150 à 250 jetons d'entrée de plus par appel sur ce harnais.
+l'humain, notes partagées, vagues de la délégation) : 290 à 400 jetons d'entrée de plus par appel sur ce harnais.
+
+### Le socle de chaque appel, relu dans le cache
+
+Chaque appel `claude` commence par un socle d'environ **6 000 jetons** : la description des outils et le prompt
+système commun (mesuré sur `claude` 2.1.322, tous outils donnés). Ce socle ne dépend pas du poste. Le cache de prompt
+le partage donc d'un appel à l'autre, à une condition : qu'il soit identique au jeton près.
+
+`claude` présente le schéma de sortie structurée au modèle comme un outil. Un schéma propre à chaque appel (les
+identifiants des subordonnés, un champ par section demandée) modifiait ce socle, qui était alors **réécrit** dans le
+cache à chaque appel au lieu d'y être relu. essaim n'utilise plus que trois schémas constants (travail et rapport,
+délégation, revue) ; les subordonnés permis sont nommés dans la fiche de poste et les sections voulues dans le prompt.
+
+Mesure sur une mission réelle à 9 postes (16 appels) : au premier tour, 13 appels relisent le socle (6 100 jetons lus
+au lieu d'être écrits), contre 3 appels sur 10 avant. Un jeton lu compte ×0,1 et un jeton écrit ×1,25 : le gain est
+d'environ 7 000 jetons pondérés par appel concerné. Restent écrits : le premier appel de chaque couple (schéma,
+modèle), et la part propre au poste (fiche de poste, tâche), de 3 000 à 4 500 jetons.
 
 ### Garde-fous contre un poste qui s'emballe
 

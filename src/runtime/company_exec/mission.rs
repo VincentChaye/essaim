@@ -45,6 +45,7 @@ pub(super) async fn run_phase(
         calls,
         cost: Mutex::new(0),
         hints: Mutex::new(Default::default()),
+        closed: Mutex::new(Default::default()),
         halted: AtomicBool::new(false),
     });
     let out: SeatOut = match phase {
@@ -64,7 +65,7 @@ pub(super) async fn run_phase(
 }
 
 fn realisation_task(plan: &str) -> String {
-    format!("Here is the plan of the mission, written by you and approved by the human:\n{plan}\n\nLead its realisation: split the work across your company.")
+    format!("Here is the plan of the mission, written by you and approved by the human:\n{plan}\n\nLead its realisation: hand out the WHOLE plan across your company in this one delegation, every step of it down to the last, each at its `stage`. A step of the plan that you assign to nobody is never carried out.")
 }
 
 /// Note affichée quand la réalisation est refusée au point de contrôle : le run est « terminé » (code 0)

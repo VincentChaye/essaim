@@ -82,7 +82,8 @@ emit() {
   exit 0
 }
 
-kids=$(printf %s "$schema" | sed -n 's/.*"to":{[^}]*"enum":\[\([^]]*\)\].*/\1/p' | tr -d '"' | tr ',' ' ')
+# Subordonnés directs : lus dans la fiche de poste (« - id · titre »), le schéma de délégation ne les nomme pas.
+kids=$(printf '%s\n' "$sys" | sed -n '/^Your direct subordinates/,/^[^-]/s/^- \([a-z0-9-]*\) · .*/\1/p' | tr '\n' ' ')
 parent=$(printf %s "$prompt" | sed -n 's/.*Your file scope: `\([^`]*\)`.*/\1/p' | head -1)
 dir=${parent%/\*\*}
 case "$dir" in ''|'**') dir=src ;; esac
